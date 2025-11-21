@@ -1,0 +1,24 @@
+{
+    "Header": {
+        "Comment": "All values are metric (mm)",
+        "CreationDate": "2025-11-21T10:51:30Z",
+        "GenerationSoftware": {
+            "Application": "Fusion Electronics",
+            "Vendor": "Autodesk",
+            "Version": "9.7.0"
+        },
+        "Part": "Single"
+    },
+    "Overall": {
+        "BoardThickness": 1.1978,
+        "LayerNumber": 4,
+        "Name": {
+            "ProjectId": "PCB v45"
+        },
+        "Owner": "Bela Erlinghagen <bela@erlinghagen.org>",
+        "Size": {
+            "X": 133.931209,
+            "Y": 183.7743
+        }
+    }
+}
