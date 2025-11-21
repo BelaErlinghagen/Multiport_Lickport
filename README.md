@@ -4,7 +4,7 @@ The Lick-O-Tron Lickport and the PORTMASTER connectivity board are the two major
 The design, assembly and usage of both modules are explained below in detail. Files to recreate the two modules can be found in their respective folders.
 
 ### Credit
-The Lick-O-Tron and the PORTMASTER were conceptualized and designed by Bela Erlinghagen, with the support of Trace Robbins and Ben Escribano.
+The Lick-O-Tron and the PORTMASTER were conceptualized and designed by Bela Erlinghagen, with extensive support by Trace Robbins (https://github.com/R-Trace) and Ben Escribano (https://github.com/BenjaminEscribano) from the iBehave CADRE (Website: https://ibehave.nrw/ibots-platform/cadre/ , Github: https://github.com/iBehave-CADRE).
 
 ## The Lick-O-Tron Lickport
 The idea behind the Lick-O-Tron was to create a lickport for behavioral mouse experiments that can:
@@ -17,4 +17,4 @@ The idea behind the Lick-O-Tron was to create a lickport for behavioral mouse ex
 
 ## The PORTMASTER
 
-In order to control 
+In order to control up to 16 Lick-O-Tron lickports, the PORTMASTER was designed: two Arduino Mega Microcontroller which are connected within the Multiport-Setup to the Computer via serial connection. The 
