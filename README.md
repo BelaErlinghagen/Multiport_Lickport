@@ -16,13 +16,10 @@ The idea behind the Lick-O-Tron was to create a lickport for behavioral mouse ex
 ### Design
 
 <p align="middle">
-  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronFront.png" width="200" />
-  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronBack.png" width="200" /> 
-  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronCase.png" width="200" />
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronFront.png" width="250" />
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronBack.png" width="250" /> 
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronCase.png" width="250" />
 </p>
-
-
-<img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronFront.png" alt="Alt Text" width="300">
 
 The Lick-O-Tron contains three submodules: one Arduino proMicro and two MOSFET relay modules. The Arduino proMicro, as well as the
 
