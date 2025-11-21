@@ -22,8 +22,8 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
   <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronFront.png" width="250" />
   <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronBack.png" width="250" /> 
   <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronCase.png" width="250" />
-  <Figure 1: 3D CAD models for the Lick-O-Tron (Left: Front, Middle: Back, Right: Case).>
 </p>
+ <i align = "middle" >Figure 1: 3D CAD models for the Lick-O-Tron (Left: Front, Middle: Back, Right: Case).</i> 
 
 
 
