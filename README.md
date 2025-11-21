@@ -27,10 +27,9 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
   <i>Figure 1: 3D CAD models for the Lick-O-Tron (Left: Front, Middle: Back, Right: Case).</i>
 </center>
 
-
-
-
 ### Assembly
+
+
 
 ### Usage
 
