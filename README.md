@@ -13,8 +13,21 @@ The idea behind the Lick-O-Tron was to create a lickport for behavioral mouse ex
 2) Be connected to two peristaltic pumps which can independently eject precise volumes of liquids.
 3) Allow for flexible control of a LED that is located next to the needle.
 
+### Design
+
+### Assembly
+
+### Usage
+
+
 
 
 ## The PORTMASTER
 
 In order to control up to 16 Lick-O-Tron lickports, the PORTMASTER was designed: two Arduino Mega Microcontroller which are connected within the Multiport-Setup to the Computer via serial connection. The 
+
+### Design
+
+### Assembly
+
+### Usage
