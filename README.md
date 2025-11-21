@@ -21,7 +21,8 @@ The idea behind the Lick-O-Tron was to create a lickport for behavioral mouse ex
   <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronCase.png" width="250" />
 </p>
 
-The Lick-O-Tron contains three submodules: one Arduino proMicro and two MOSFET relay modules. The Arduino proMicro, as well as the
+The Lick-O-Tron contains three submodules: one Arduino proMicro and two MOSFET relay modules. The Arduino proMicro, as well as the power outlets of the MOSFET relay modules recieve power via the main connector (8 pin plug). 
+The Arduino's job is to register licks via a capacitive sensor (a needle that is connected to the single pin at the bottom of the Lick-O-Tron). This is achieved with the code found in ![site]() It then transmits binary data about lick events to the Arduino Megas that are housed on the PORTMASTER.
 
 ### Assembly
 
