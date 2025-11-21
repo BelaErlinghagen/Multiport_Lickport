@@ -15,7 +15,9 @@ The idea behind the Lick-O-Tron was to create a lickport for behavioral mouse ex
 
 ### Design
 
-![alt text](https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronFront.png width="200")
+![alt text]( width="200")
+
+[<img src="[image.png](https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronFront.png)" width="250"/>]([image.png](https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronFront.png))
 
 ### Assembly
 
