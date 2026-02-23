@@ -33,10 +33,15 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
 | :---------- | ----------: | :---------- | ----------: |
 | Joy It Pro Micro | 1 | Joy It | 4250236822907 |
 | MOSFET Relay Module | 2 | tbd | tbd |
-| Mini Peristaltik Pump | 1 (up to 2) | Whadda | 5410329730017 |
+| Mini Peristaltic Pump | 1 (up to 2) | Whadda | 5410329730017 |
+| Lick-O-Tron PCB | 1 | Eurocircuits | None: see Folder in Repo |
+| Lick-O-Tron Case Parts | 1 each | 3D Printed | None: see Folder in Repo |
 | LED (white) | 1 | TRU Components | 2050004902785 |
 | 10 MOhm Resistor | 1 | TRU Components | 2050004926057 |
 | 470 Ohm Resistor | 1 | TRU Components | 4016139313023 |
+| M3 Screws | 4 | Toolcraft | 4064161107578 |
+| M3 Nuts | 4 | SWG Hox | 4053056028951 |
+| Sterican Canula | 2 | Roth | - |
 
 
 ### Usage
