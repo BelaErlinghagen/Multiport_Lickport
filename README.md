@@ -28,7 +28,7 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
 </center>
 
 ### Assembly
-#### Lick-O-Tron Module
+#### Parts
 | Item | Quantity | Manufactured by | EAN |
 | :---------- | ----------: | :---------- | ----------: |
 | Joy It Pro Micro | 1 | Joy It | 4250236822907 |
