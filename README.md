@@ -33,9 +33,10 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
 | :---------- | ----------: | :---------- | ----------: |
 | Joy It Pro Micro | 1 | Joy It | 4250236822907 |
 | MOSFET Relay Module | 2 | tbd | tbd |
-| white LED | 1 | tbd | tbd |
-| 10MOhm Resistor | 1 | tbd | tbd |
-| 470kOhm Resistor | 1 | TRU Components | 4016139313023 |
+| Mini Peristaltik Pump | 1 (up to 2) | Whadda | 5410329730017 |
+| LED (white) | 1 | TRU Components | 2050004902785 |
+| 10 MOhm Resistor | 1 | TRU Components | 2050004926057 |
+| 470 Ohm Resistor | 1 | TRU Components | 4016139313023 |
 
 
 ### Usage
