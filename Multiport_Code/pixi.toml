@@ -1,0 +1,10 @@
+[workspace]
+authors = ["BelaErlinghagen <bela-erl@proton.me>"]
+channels = ["conda-forge"]
+name = "Multiport_Code"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
