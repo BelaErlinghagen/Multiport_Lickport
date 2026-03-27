@@ -17,9 +17,21 @@ def initialize_serial_connections():
 
 def read_serial():
     data = []
+    #start = time.time()
+    data.append(time.time())
     for ser in shared_states.serial:
-        line = ser.readline().decode("utf-8").strip()
-        data.append(line)
+        predecode = ser.readline()
+        if str(predecode)[2] == "S" and str(predecode) != "0" and str(predecode)[-2] == "n":
+            line = predecode.decode("utf-8").strip()
+        extracted = []
+        try:
+            values = line.split(":")[2].split(",")
+            for value in values:
+                extracted.append(int(value))
+        except: pass
+        data.append(extracted)
+    #end = time.time()
+    #print(end - start)
     return data
 
 def LED_switch(id, on_off):
