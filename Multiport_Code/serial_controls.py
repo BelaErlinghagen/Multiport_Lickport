@@ -19,16 +19,22 @@ def read_serial():
     data = []
     #start = time.time()
     data.append(time.time())
-    for ser in shared_states.serial:
+    for item in range(len(shared_states.serial)):
+        ser = shared_states.serial[item]
+        lookup = shared_states.lookup_tables[item]
         predecode = ser.readline()
+        line = ""
         if str(predecode)[2] == "S" and str(predecode) != "0" and str(predecode)[-2] == "n":
-            line = predecode.decode("utf-8").strip()
+            line = predecode.decode("utf-8", "ignore").strip()
+        else: break
         extracted = []
         try:
             values = line.split(":")[2].split(",")
             for value in values:
-                extracted.append(int(value))
-        except: pass
+                if int(value) != 0:
+                    extracted.append(int(lookup[int(value)]))
+                else: extracted.append(int(value))
+        except Exception as e: print(e) 
         data.append(extracted)
     #end = time.time()
     #print(end - start)
@@ -37,16 +43,25 @@ def read_serial():
 def serial_object_mapping(input_id):
     if input_id <= 8:
         serial_object = shared_states.serial[0]
-        new_id = 1
+        new_id = list(shared_states.lookup_tables[0].keys())[list(shared_states.lookup_tables[0].values()).index(input_id)]
     elif input_id >= 9:
-        serial_object = shared_states.serial[0] 
+        serial_object = shared_states.serial[1]
+        new_id = list(shared_states.lookup_tables[1].keys())[list(shared_states.lookup_tables[1].values()).index(input_id)] 
         
     else: return input_id
 
     return serial_object, new_id
 
 def LED_switch(id, on_off):
-    pass
+    """
+    Turn on/off LED: params = id, on_off (bool -> True = On, False = Off)
+    """
+    ser, new_id = serial_object_mapping(id)
+    if on_off:
+        ser.write(f"LED:{new_id}:ON".encode("utf-8"))
+    else: 
+        ser.write(f"LED:{new_id}:OFF".encode("utf-8"))
+
 
 def pump_trigger(id, on_off, time):
     pass
@@ -57,5 +72,10 @@ if __name__ == "__main__":
     while True:
         output = read_serial()
         print(output)
-        #command = input(">>> ")
-        #print(command)
+        command = input(">>> ")
+        if "LED" in command:
+            parts = command.split(":")
+            if parts[2] == "ON":
+                LED_switch(int(parts[1]), True)
+            else:
+                LED_switch(int(parts[1]), False)
