@@ -34,6 +34,17 @@ def read_serial():
     #print(end - start)
     return data
 
+def serial_object_mapping(input_id):
+    if input_id <= 8:
+        serial_object = shared_states.serial[0]
+        new_id = 1
+    elif input_id >= 9:
+        serial_object = shared_states.serial[0] 
+        
+    else: return input_id
+
+    return serial_object, new_id
+
 def LED_switch(id, on_off):
     pass
 
