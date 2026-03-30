@@ -82,19 +82,52 @@ class SerialControls:
     def _writer_loop(self):
         """
         Runs in a separate thread.
-        Checks both write queues and sends commands to the respective Arduino.
+        Checks write queue and sends commands to the respective Arduino.
         """
         while self.running:
             sent = False
-            
+
             try:
-                cmd = self.write_queue.get_nowait()
-                if cmd:
-                    self.serial_arduino1.write((cmd + '\r\n').encode('utf-8'))
-                    self.serial_arduino1.flush()
-                    sent = True
+                cmd_parts = self.write_queue.get_nowait()
+                command_string = ":".join(cmd_parts)
+                print(f"Processing: {command_string}")
+                ### find the correct serial object
+                if command_string:
+                    if len(cmd_parts) >= 2:
+                        input_id = int(cmd_parts[1])
+                        
+                        # Get the correct serial object and mapped ID
+                        serial_object, new_id = self._serial_object_mapping(input_id)
+                        
+                        # Reconstruct the command with the NEW mapped ID
+                        # cmd_parts[0] is "LED", cmd_parts[2] is "ON"
+                        final_command = f"{cmd_parts[0]}:{new_id}:{cmd_parts[2]}"
+                        
+                        print(f"Sending to {serial_object.port}: {final_command}")
+                        serial_object.write((final_command + '\r\n').encode('utf-8'))
+                        serial_object.flush()
+                        sent = True
             except queue.Empty:
-                pass
+                print(f"[WARN] Command too short: {cmd_parts}")
+    
+    def send_command(self, command_string):
+        """
+        Takes command in the format:
+        MODE(LED/MOS):MODULE_ID:ON/OFF:(IF MOS: LENGTH) or
+        BNC:ID:PULSE:DURATION_ms
+        Queues the command to be executed.
+        """
+        if not self.running:
+            pass
+
+        try:
+            parts = command_string.split(":")
+            if len(parts) < 2:
+                print(f"[WARN] Invalid command format: {command_string}")
+                return
+            self.write_queue.put(parts)
+        except Exception as e:
+            print(f"[ERROR in send_command] {e}")
 
     def read_serial(self):
         """
@@ -144,3 +177,5 @@ if __name__ == "__main__":
         # 1. Get synchronized data instantly
         timestamp, active_pin = controls.read_serial()
         print(timestamp, active_pin)
+        cmd = input(">>> ")
+        controls.send_command(cmd)
