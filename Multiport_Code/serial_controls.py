@@ -34,6 +34,7 @@ class SerialControls:
 
         self.reader_arduino1.start()
         self.reader_arduino2.start()
+        self.writer_thread.start()
     
     def _serial_object_mapping(self, input_id):
         if input_id <= 8:
@@ -85,30 +86,46 @@ class SerialControls:
         Checks write queue and sends commands to the respective Arduino.
         """
         while self.running:
-            sent = False
-
             try:
+                # Try to get an item from the queue without blocking
                 cmd_parts = self.write_queue.get_nowait()
+                
+                # Ensure we have valid data
+                if not cmd_parts or len(cmd_parts) < 3:
+                    print(f"[WARN] Invalid command format: {cmd_parts}")
+                    continue
+                
                 command_string = ":".join(cmd_parts)
                 print(f"Processing: {command_string}")
-                ### find the correct serial object
-                if command_string:
-                    if len(cmd_parts) >= 2:
-                        input_id = int(cmd_parts[1])
-                        
-                        # Get the correct serial object and mapped ID
-                        serial_object, new_id = self._serial_object_mapping(input_id)
-                        
-                        # Reconstruct the command with the NEW mapped ID
-                        # cmd_parts[0] is "LED", cmd_parts[2] is "ON"
-                        final_command = f"{cmd_parts[0]}:{new_id}:{cmd_parts[2]}"
-                        
-                        print(f"Sending to {serial_object.port}: {final_command}")
-                        serial_object.write((final_command + '\r\n').encode('utf-8'))
-                        serial_object.flush()
-                        sent = True
+                
+                # Extract input_id (assuming it's the second element)
+                try:
+                    input_id = int(cmd_parts[1])
+                except ValueError:
+                    print(f"[ERROR] Invalid input_id: {cmd_parts[1]}")
+                    continue
+                
+                # Get the correct serial object and mapped ID
+                serial_object, new_id = self._serial_object_mapping(input_id)
+                
+                # Reconstruct the command with the NEW mapped ID
+                if len(cmd_parts) == 3:
+                    final_command = f"{cmd_parts[0]}:{new_id}:{cmd_parts[2]}"
+                elif len(cmd_parts) == 4:
+                    final_command = f"{cmd_parts[0]}:{new_id}:{cmd_parts[2]}:{cmd_parts[3]}"
+                
+                print(f"Sending to {serial_object.port}: {final_command}")
+                serial_object.write((final_command + '\r\n').encode('utf-8'))
+                serial_object.flush()
+                
             except queue.Empty:
-                print(f"[WARN] Command too short: {cmd_parts}")
+                # No items in the queue - just continue the loop
+                # Optional: Add a small sleep to prevent CPU spinning
+                import time
+                time.sleep(0.01)
+            except Exception as e:
+                # Handle any other unexpected errors
+                print(f"[ERROR] Unexpected error in writer loop: {e}")
     
     def send_command(self, command_string):
         """
@@ -149,26 +166,6 @@ class SerialControls:
         if self.serial_arduino2: self.serial_arduino2.close()
 
 
-def LED_switch(id, on_off):
-    """
-    Turn on/off LED: params = id, on_off (bool -> True = On, False = Off)
-    """
-    ser, new_id = serial_object_mapping(id)
-    print(ser)
-    if on_off:
-        command = f"LED:{new_id}:ON\r\n"
-        
-    else: 
-        command = f"LED:{new_id}:OFF\r\n"
-    print(f"Sending: {command.strip()}")
-    ser.write(command.encode("utf-8"))
-    ser.flush()
-    time.sleep(0.01)
-
-
-def pump_trigger(id, on_off, time):
-    pass
-
 if __name__ == "__main__":
     controls = SerialControls()
 
@@ -179,3 +176,4 @@ if __name__ == "__main__":
         print(timestamp, active_pin)
         cmd = input(">>> ")
         controls.send_command(cmd)
+        time.sleep(0.1)
