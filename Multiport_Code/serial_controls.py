@@ -7,7 +7,7 @@ import queue
 
 class SerialControls:
     def __init__(self, baudrate = 115200):
-        print("Initializing")
+        print("Initializing Serial Communication.")
         self.serial_arduino1 = serial.Serial(shared_states.serial_ports[0], baudrate, timeout = 1)
         self.serial_arduino2 = serial.Serial(shared_states.serial_ports[1], baudrate, timeout = 1)
         print("[INFO] Serial connections initialized.")
