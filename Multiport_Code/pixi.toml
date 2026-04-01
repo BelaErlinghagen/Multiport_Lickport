@@ -15,10 +15,11 @@ cuda = "12.0"
 pyserial = "==3.4"
 python = "3.12.*"
 pytorch-gpu = "*"
+numpy = ">=1.20, <2"
+
 
 [pypi-dependencies]
 pypylon = ">=26.2.1, <27"
-deeplabcut-live = ">=1.1.0, <2"
-torch = { version = ">=2.5.1", index = "https://download.pytorch.org/whl/cu124" }
-torchvision = { version = ">=0.20.1", index = "https://download.pytorch.org/whl/cu124" }
+deeplabcut-live = { version = ">=1.1.0, <2", extras = ["pytorch"] }
+
 
