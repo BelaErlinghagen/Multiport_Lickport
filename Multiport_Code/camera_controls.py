@@ -1,5 +1,5 @@
 from pypylon import pylon
-from multiprocessing import Process
+from threading import Thread
 import numpy as np
 import time
 
@@ -9,7 +9,7 @@ class TrackingCamera:
         self.camera_on = False
         self.camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
         self.current_image = np.array([])
-        self.camera_process = Process(target=self.retrieve_images, args=([self.camera,]))
+        self.camera_process = Thread(target=self.retrieve_images, args=([self.camera,]))
         self.camera_process.start()
         time.sleep(2)
         print("Camera is fetching images.")
@@ -17,7 +17,8 @@ class TrackingCamera:
         
     def retrieve_images(self, camera):
         camera.Open()
-        camera.StartGrabbing()
+        numberOfImagesToGrab = 100
+        camera.StartGrabbingMax(numberOfImagesToGrab)
         self.camera_on = True
         while camera.IsGrabbing():
             grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
