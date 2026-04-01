@@ -1,36 +1,33 @@
 from pypylon import pylon
 from multiprocessing import Process
+import numpy as np
+import time
 
 class TrackingCamera:
     def __init__(self):
         print("Initializing Camera.")
         self.camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+        self.current_image = np.array([])
         self.camera_process = Process(target=self.retrieve_images, args=([self.camera,]))
+        self.camera_process.start()
+        time.sleep(2)
         print("Camera is fetching images.")
+        
         
     def retrieve_images(self, camera):
         camera.Open()
-        # demonstrate some feature access
-        new_width = camera.Width.Value - camera.Width.Inc
-        if new_width >= camera.Width.Min:
-            camera.Width.Value = new_width
-
-        numberOfImagesToGrab = 100
-        camera.StartGrabbingMax(numberOfImagesToGrab)
-
+        camera.StartGrabbing()
+        self.camera_on = True
         while camera.IsGrabbing():
             grabResult = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
-
             if grabResult.GrabSucceeded():
-                # Access the image data.
-                print("SizeX: ", grabResult.Width)
-                print("SizeY: ", grabResult.Height)
-                img = grabResult.Array
-                print("Gray value of first pixel: ", img[0, 0])
-
+                self.current_image = grabResult.Array
             grabResult.Release()
         camera.Close()
+        self.camera_on = False
 
 
 if __name__ == "__main__":
     camera = TrackingCamera()
+    while  camera.camera_on:
+        print(camera.current_image)
