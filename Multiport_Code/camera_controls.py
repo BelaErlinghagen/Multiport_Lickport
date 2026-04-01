@@ -6,6 +6,7 @@ import time
 class TrackingCamera:
     def __init__(self):
         print("Initializing Camera.")
+        self.camera_on = False
         self.camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
         self.current_image = np.array([])
         self.camera_process = Process(target=self.retrieve_images, args=([self.camera,]))
