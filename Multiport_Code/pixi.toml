@@ -21,5 +21,7 @@ numpy = ">=1.20, <2"
 [pypi-dependencies]
 pypylon = ">=26.2.1, <27"
 deeplabcut-live = { version = ">=1.1.0, <2", extras = ["pytorch"] }
+pyqt5 = ">=5.15.11, <6"
+pyqtgraph = ">=0.14.0, <0.15"
 
 
