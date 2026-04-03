@@ -1,9 +1,12 @@
 # gui_plotter.py
 import sys
+import os
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+from shared_states import IMG_SIZE
 import time
 import numpy as np
 from collections import deque
-from multiprocessing import Queue
+from multiprocessing import Queue, shared_memory
 
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
@@ -96,7 +99,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- Center Image ---
         self.image_item = pg.ImageItem()
-        cmap = pg.colormap.get("inferno")
+        cmap = pg.colormap.get("CET-C5")
         self.image_item.setLookupTable(cmap.getLookupTable())
         self.image_item.setLevels([0, 1])
 
@@ -146,7 +149,7 @@ class MainWindow(QtWidgets.QMainWindow):
         center_x = w / 2
         center_y = h / 2
         radius = min(w, h) * 0.45
-        img_size = min(w, h) * 0.7
+        img_size = min(w, h) * 0.85
 
         # Center image
         self.image_proxy.setPos(center_x - img_size/2, center_y - img_size/2)
@@ -200,10 +203,26 @@ class MainWindow(QtWidgets.QMainWindow):
 # -----------------------------
 # Run plotter process
 # -----------------------------
-def run_plotter(queue: Queue, shared_image):
+def run_plotter(queue: Queue, shared_image_name):
     import sys
     from PyQt5 import QtWidgets
     app = QtWidgets.QApplication(sys.argv)
+    existing_shm = shared_memory.SharedMemory(name=shared_image_name)
+    shared_image = np.ndarray((IMG_SIZE, IMG_SIZE), dtype=np.float32, buffer=existing_shm.buf)
     win = MainWindow(queue, shared_image)
     win.show()
     sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    from multiprocessing import Queue
+    import numpy as np
+    from multiprocessing import shared_memory
+
+    shm = shared_memory.SharedMemory(create=True, size=IMG_SIZE*IMG_SIZE*4)
+    shape = (IMG_SIZE,IMG_SIZE)
+    arr = np.ndarray(shape, dtype=np.float32, buffer=shm.buf)
+
+    q = Queue()
+    run_plotter(q, shm.name)
+    shm.close()
+    shm.unlink() 
