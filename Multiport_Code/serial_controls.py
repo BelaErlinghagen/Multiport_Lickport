@@ -165,6 +165,17 @@ class SerialControls:
         if self.serial_arduino1: self.serial_arduino1.close()
         if self.serial_arduino2: self.serial_arduino2.close()
 
+def sensor_process(sensor_array):
+    from serial_controls import SerialControls
+    ser_machine = SerialControls()
+    while True:
+        timestamp, active_pin = ser_machine.read_serial()
+        active = active_pin[0] + active_pin[1]
+        for i in range(16):
+            sensor_array[i] = 1 if (i+1) in active else 0
+        time.sleep(0.01)
+
+
 
 if __name__ == "__main__":
     controls = SerialControls()

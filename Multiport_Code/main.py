@@ -1,71 +1,34 @@
-from multiprocessing import Process, Queue, shared_memory, set_start_method
-import time
+# main.py
+from multiprocessing import Process, Array
 import numpy as np
-from plotting_functions import run_plotter
-from serial_controls import SerialControls
 from camera_controls import TrackingCamera
-import shared_states as s
+from plotting_functions import run_gui
+from serial_controls import sensor_process
+from shared_states import IMG_HEIGHT, IMG_WIDTH
 
-NUM_SENSORS = 16
 
-def camera_process(shm_name):
-    existing_shm = shared_memory.SharedMemory(name=shm_name)
-    shared_image = np.ndarray((s.IMG_SIZE, s.IMG_SIZE), dtype=np.float32, buffer=existing_shm.buf)
+def main():
+    cam_shape = (IMG_HEIGHT, IMG_WIDTH)
+    cam_size = int(np.prod(cam_shape))
+    shared_image = Array('f', cam_size)        # shared camera
+    sensor_array = Array('i', 16)             # shared sensors
+
+    # Start camera
     camera = TrackingCamera(shared_image)
-    try:
-        camera.run()
-    finally:
-        camera.stop()
-        existing_shm.close()
-
-def serial_process(queue):
-    serial_controller = SerialControls()
-    try:
-        while True:
-            timestamp, active_pin = serial_controller.read_serial()
-            pin_list = active_pin[0] + active_pin[1]
-            if not queue.full():
-                queue.put(pin_list)
-            time.sleep(0.01)
-    except KeyboardInterrupt:
-        pass
-
-if __name__ == "__main__":
-    try:
-        set_start_method("spawn")
-    except RuntimeError:
-        pass
-
-    shm = shared_memory.SharedMemory(create=True, size=s.IMG_SIZE*s.IMG_SIZE*4)
-    shape = (s.IMG_SIZE, s.IMG_SIZE)
-    shared_image = np.ndarray(shape, dtype=np.float32, buffer=shm.buf)
-    queue = Queue(maxsize=5)
-
-    gui_process = Process(target=run_plotter, args=(queue, shm.name))
-    gui_process.start()
-
-    cam_proc = Process(target=camera_process, args=(shm.name,))
+    cam_proc = Process(target=camera.run)
     cam_proc.start()
 
-    serial_proc = Process(target=serial_process, args=(queue,))
-    serial_proc.start()
+    # Start sensor simulation
+    sensor_proc = Process(target=sensor_process, args=(sensor_array,))
+    sensor_proc.start()
 
-    try:
-        cumulative_counts = [0] * NUM_SENSORS
-        while True:
-            try:
-                active = queue.get(timeout=0.05)
-                for sid in active:
-                    cumulative_counts[sid-1] += 1
-            except:
-                pass
-    except KeyboardInterrupt:
-        print("Stopping...")
-        gui_process.terminate()
-        gui_process.join()
-        cam_proc.terminate()
-        cam_proc.join()
-        serial_proc.terminate()
-        serial_proc.join()
-        shm.close()
-        shm.unlink()
+    # Start GUI
+    run_gui(shared_image, sensor_array, cam_shape)
+
+    # Clean up (never reached unless GUI closes)
+    camera.stop()
+    cam_proc.terminate()
+    sensor_proc.terminate()
+
+if __name__ == "__main__":
+    main()
