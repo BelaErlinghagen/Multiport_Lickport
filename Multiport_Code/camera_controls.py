@@ -1,28 +1,28 @@
 import time
 from pypylon import pylon
 from shared_states import IMG_HEIGHT, IMG_WIDTH
+import numpy as np
 
 class TrackingCamera:
-    def __init__(self, shared_image, dlc_queue, plotting_shape):
+    def __init__(self, frame_queue, dlc_queue, plotting_shape):
         print("Initializing Camera.")
-        self.camera = pylon.InstantCamera(
+        self.cam = pylon.InstantCamera(
             pylon.TlFactory.GetInstance().CreateFirstDevice()
         )
-        self.shared_image = shared_image
+        self.shared_image_queue = frame_queue
         self.dlc_input = dlc_queue
         self.shape = plotting_shape
-        self.camera_on = False
         time.sleep(2)
         print("Camera is ready.")
 
-    def run(self):
-        self.camera.Open()
+    def run(self, running_flag):
+        self.cam.Open()
         self.camera_on = True
-        self.camera.Gain.SetValue(48.0)
-        self.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        self.cam.Gain.SetValue(10.0)
+        self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
 
-        while self.camera.IsGrabbing() and self.camera_on:
-            grabResult = self.camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+        while self.cam.IsGrabbing() and running_flag.value:
+            grabResult = self.cam.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
             if grabResult.GrabSucceeded():
                 img = grabResult.Array
                 start_x = (IMG_WIDTH - IMG_HEIGHT) // 2
@@ -37,22 +37,30 @@ class TrackingCamera:
                 step_h = IMG_HEIGHT // target_h
                 step_w = IMG_HEIGHT // target_w
                 downsampled = cropped_img[::step_h, ::step_w][:target_h, :target_w]
-                print(downsampled)
-                self.shared_image[:] = downsampled.flatten()
+                if self.shared_image_queue.full():
+                    try:
+                        self.shared_image_queue.get_nowait()
+                    except:pass
+                self.shared_image_queue.put(downsampled.astype(np.uint8))
+                #print(np.mean(downsampled))
             grabResult.Release()
+            time.sleep(0.01)
 
-        self.camera_on = False
-        self.camera.Close()
+        self.cam.Close()
 
     def stop(self):
         self.camera_on = False
 
-if __name__ == "__main__":
-    from multiprocessing import Queue, Array
-    import numpy as np
-    cam_shape = (400, 400)
-    cam_size = int(np.prod(cam_shape))
-    dlc_queue = Queue()
-    shared_image = Array('f', cam_size) 
+def camera_process(shared_image, dlc_queue, cam_shape, running_flag):
     camera = TrackingCamera(shared_image, dlc_queue, cam_shape)
-    camera.run()
+    camera.run(running_flag)
+
+if __name__ == "__main__":
+    from multiprocessing import Queue, Array, Value
+    cam_shape = (200, 200)
+    cam_size = int(np.prod(cam_shape))
+    dlc_queue = Queue(maxsize=2)
+    camera_running = Value('b', True)  
+    frame_queue = Queue(maxsize=2)
+    sensor_array = Array('i', 16)    
+    camera_process(frame_queue, dlc_queue, cam_shape, camera_running)

@@ -62,21 +62,36 @@ class SensorWidget(QtWidgets.QWidget):
 
 
 class CameraWidget(QtWidgets.QLabel):
-    def __init__(self, shared_image, shape):
+    def __init__(self, frame_queue, shape):
         super().__init__()
-        self.shared_image = shared_image
+        self.frame_queue = frame_queue
         self.shape = shape
         self.setAlignment(QtCore.Qt.AlignCenter)
         self.setText("Waiting for camera...")
         self.setStyleSheet("background-color: #2b2b2b; color: white;")
 
     def update_image(self):
-        frame = np.array(self.shared_image[:], dtype=np.float32).reshape(self.shape)
-        img = ((frame - frame.min()) / (frame.ptp() + 1e-5) * 255).astype(np.uint8)
-        height, width = img.shape
-        qimg = QtGui.QImage(img.data, width, height, width, QtGui.QImage.Format_Grayscale8)
+        frame = None
+        while not self.frame_queue.empty():
+            try:
+                frame = self.frame_queue.get_nowait()
+            except:
+                break
+
+        if frame is None:
+            return
+        #print(np.mean(frame))
+        height, width = self.shape
+        qimg = QtGui.QImage(frame.data, width, height, width, QtGui.QImage.Format_Grayscale8)
         pixmap = QtGui.QPixmap.fromImage(qimg)
-        self.setPixmap(pixmap.scaled(self.size(), QtCore.Qt.KeepAspectRatio))
+
+        scaled = pixmap.scaled(
+            self.width(),
+            self.height(),
+            QtCore.Qt.KeepAspectRatio,
+            QtCore.Qt.FastTransformation
+        )
+        self.setPixmap(scaled)
 
 
 def run_gui(shared_image, sensor_array, shape):
@@ -95,7 +110,7 @@ def run_gui(shared_image, sensor_array, shape):
             layout.setContentsMargins(4, 4, 4, 4)
             layout.setSpacing(4)
 
-            self.camera_widget.setMaximumHeight(500)
+            self.camera_widget.setMinimumHeight(500)
             self.sensor_widget.setMinimumHeight(220)
 
             layout.addWidget(self.camera_widget)

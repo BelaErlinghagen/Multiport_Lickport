@@ -1,21 +1,22 @@
 # main.py
-from multiprocessing import Process, Array, Queue
+from multiprocessing import Process, Array, Queue, Value
 import numpy as np
-from camera_controls import TrackingCamera
+from camera_controls import camera_process
 from plotting_functions import run_gui
 from serial_controls import sensor_process
+import shared_states as st
 
 
 def main():
-    cam_shape = (400, 400)
+    cam_shape = (300, 300)
     cam_size = int(np.prod(cam_shape))
     dlc_queue = Queue()
-    shared_image = Array('f', cam_size)        # shared camera
-    sensor_array = Array('i', 16)             # shared sensors
+    frame_queue = Queue(maxsize=2)        # shared camera
+    sensor_array = Array('i', 16)               # shared sensors
+    camera_running = Value('b', True)             
 
     # Start camera
-    camera = TrackingCamera(shared_image, dlc_queue, cam_shape)
-    cam_proc = Process(target=camera.run)
+    cam_proc = Process(target=camera_process, args = (frame_queue, dlc_queue, cam_shape,camera_running,))
     cam_proc.start()
 
     # Start sensor grabbing
@@ -23,12 +24,13 @@ def main():
     sensor_proc.start()
 
     # Start GUI
-    run_gui(shared_image, sensor_array, cam_shape)
+    run_gui(frame_queue, sensor_array, cam_shape)
 
     # Clean up (never reached unless GUI closes)
-    camera.stop()
     cam_proc.terminate()
     sensor_proc.terminate()
 
 if __name__ == "__main__":
+    import multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
     main()
