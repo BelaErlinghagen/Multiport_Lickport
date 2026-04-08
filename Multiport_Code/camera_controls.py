@@ -17,7 +17,6 @@ class TrackingCamera:
 
     def run(self, running_flag):
         self.cam.Open()
-        self.camera_on = True
         self.cam.Gain.SetValue(10.0)
         self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
 
@@ -47,9 +46,6 @@ class TrackingCamera:
             time.sleep(0.01)
 
         self.cam.Close()
-
-    def stop(self):
-        self.camera_on = False
 
 def camera_process(shared_image, dlc_queue, cam_shape, running_flag):
     camera = TrackingCamera(shared_image, dlc_queue, cam_shape)

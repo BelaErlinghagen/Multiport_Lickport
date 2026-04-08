@@ -4,14 +4,13 @@ import numpy as np
 from camera_controls import camera_process
 from plotting_functions import run_gui
 from serial_controls import sensor_process
-import shared_states as st
 
 
 def main():
     cam_shape = (300, 300)
-    cam_size = int(np.prod(cam_shape))
-    dlc_queue = Queue()
-    frame_queue = Queue(maxsize=2)        # shared camera
+    timestamp_value = Queue(maxsize=2)
+    dlc_queue = Queue(maxsize=2)            # shared camera image original cropped
+    frame_queue = Queue(maxsize=2)        # shared camera image downsampled
     sensor_array = Array('i', 16)               # shared sensors
     camera_running = Value('b', True)             
 
@@ -20,7 +19,7 @@ def main():
     cam_proc.start()
 
     # Start sensor grabbing
-    sensor_proc = Process(target=sensor_process, args=(sensor_array,))
+    sensor_proc = Process(target=sensor_process, args=(sensor_array, timestamp_value,))
     sensor_proc.start()
 
     # Start GUI

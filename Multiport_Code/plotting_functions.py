@@ -1,5 +1,3 @@
-# gui.py
-import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 class SensorWidget(QtWidgets.QWidget):
