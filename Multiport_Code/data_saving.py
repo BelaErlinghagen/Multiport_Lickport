@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import os
 from time import sleep
+from threading import Thread
 
 class data_saver:
     def __init__(self, camera_data, sensor_data, dlc_data, timestamp_queue):
@@ -9,9 +10,10 @@ class data_saver:
         self.sensor_data = sensor_data
         self.dlc_data = dlc_data
         self.timestamp = timestamp_queue
+        self.running = True
         print("Data saver launched.")
 
-    def start_saving(self, cohort_id, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag, running_flag):
+    def start_saving(self, cohort_id, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag):
         from shared_states import data_path
 
         cohort_path = data_path + f"/{cohort_id}"
@@ -27,23 +29,51 @@ class data_saver:
         except Exception as e:
             print(f"Folder Creation Error: {e}")
 
-        print(f"Saving Data for {mouse_id}, Session: {session_id} at {data_path}")
-
-        while running_flag:
-            print(self.timestamp.get())
-            if camera_flag:
-                print("Saving Camera")
-            elif sensor_flag:
-                print("Saving Sensor")
-            elif dlc_flag:
-                print("Saving DLC")
+        print(f"Saving Data for {mouse_id} in Cohort {cohort_id}, Session: {session_id} at {data_path}")
+        # saving loop, constantly checking if data should still be saved
+        loop = True
+        while loop:
+            if not self.running:
+                #wrap up saving
+                loop = False
+            try:
+                current_timestamp = self.timestamp.get(timeout= 0.05)
+            except:
+                current_timestamp = None
+                print("Dropped Timestamp: Timeout reached.")
+            print(current_timestamp)
+            #if camera_flag:
+                #print("Saving Camera")
+            #elif sensor_flag:
+                #print("Saving Sensor")
+            #elif dlc_flag:
+                #print("Saving DLC")
             sleep(0.05)
 
 
     
 def saving_process(camera_data, sensor_data, dlc_data, timestamp_queue, cohort_id, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag, running_flag):
     saver = data_saver(camera_data, sensor_data, dlc_data, timestamp_queue)
-    saver.start_saving(cohort_id, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag, running_flag)
+    # constantly checking if the running_flag changes
+    running_process = False
+    while True:
+        if running_process == False and running_flag.value:
+            print("Saving now...")
+            running_process = True
+            saver.running = True
+            # move mouse id and so on in here so that it can be flexibly deployed
+            Thread(
+                target=saver.start_saving,
+                args=(cohort_id, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag),
+                daemon=True
+            ).start()
+            print("Started Process")
+        elif running_process == True and running_flag.value == False:
+            print("Saving done.")
+            saver.running = False
+            running_process = False
+        sleep(0.05)
+            
 
 
 if __name__ == "__main__":
@@ -62,6 +92,7 @@ if __name__ == "__main__":
     saving_proc = Process(target=saving_process, args=(None, sensor_array, None, timestamp_queue, "Test_Cohort", "Test_Mouse", "Test_Session", False, saving_sensor_data, False,  running_flag,))
     saving_proc.start()
     while True:
+        print(running_flag.value)
         command = input(">>> ")
         if command == "Sensor On":
             saving_sensor_data.value = True
@@ -69,7 +100,8 @@ if __name__ == "__main__":
             saving_sensor_data.value = False
         elif command == "Saving On":
             running_flag.value = True
- 
         elif command == "Saving Off":
             running_flag.value = False
+        elif command == "End":
             saving_proc.terminate()
+            break
