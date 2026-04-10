@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
-from time import sleep, time
+from time import sleep
 from datetime import datetime
 from threading import Thread
 

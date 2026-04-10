@@ -1,75 +1,100 @@
 from PyQt5 import QtWidgets, QtGui, QtCore
 
+
+# =========================================================
+# SENSOR WIDGET
+# =========================================================
 class SensorWidget(QtWidgets.QWidget):
     def __init__(self, sensor_array, num_sensors=16):
         super().__init__()
+
+        self.sensor_array = sensor_array
         self.num_sensors = num_sensors
         self.counts = [0] * num_sensors
-        self.sensor_array = sensor_array
 
-        layout = QtWidgets.QGridLayout()
-        layout.setSpacing(4)
-        self.labels = []
+        self.setMinimumHeight(220)
+        self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
 
-        for i in range(num_sensors):
-            label = QtWidgets.QLabel(f"S{i+1}: 0")
-            label.setAlignment(QtCore.Qt.AlignCenter)
-            label.setFixedHeight(32)
-            label.setStyleSheet("""
-                QLabel {
-                    font-size: 14px;
-                    color: white;
-                    background-color: #444;
-                    border: 1px solid #666;
-                    border-radius: 4px;
-                }
-            """)
-            self.labels.append(label)
-            layout.addWidget(label, i // 4, i % 4)
+    def update_from_shared(self):
+        for i in range(self.num_sensors):
+            if int(self.sensor_array[i]) == 1:
+                self.counts[i] += 1
 
-        self.setLayout(layout)
+        self.update()
 
-    def update_sensors(self):
-        active_list = [i+1 for i, val in enumerate(self.sensor_array) if val==1]
-        active_set = set(active_list)
+    def _color(self, v, vmin, vmax):
+        if vmax == vmin:
+            r = 0.0
+        else:
+            r = (v - vmin) / (vmax - vmin)
+
+        c1 = QtGui.QColor("#3a3a3a")
+        c2 = QtGui.QColor("#ffffff")
+
+        return QtGui.QColor(
+            int(c1.red()   + r * (c2.red()   - c1.red())),
+            int(c1.green() + r * (c2.green() - c1.green())),
+            int(c1.blue()  + r * (c2.blue()  - c1.blue()))
+        )
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        cols = 4
+        rows = 4
+
+        w = self.width()
+        h = self.height()
+
+        cw = w / cols
+        ch = h / rows
+
+        vmin = min(self.counts)
+        vmax = max(self.counts)
 
         for i in range(self.num_sensors):
-            label = self.labels[i]
-            if (i + 1) in active_set:
-                self.counts[i] += 1
-                label.setStyleSheet("""
-                    QLabel {
-                        font-size: 14px;
-                        color: white;
-                        background-color: #007BFF;
-                        border: 1px solid #66B2FF;
-                        border-radius: 4px;
-                    }
-                """)
-            else:
-                label.setStyleSheet("""
-                    QLabel {
-                        font-size: 14px;
-                        color: white;
-                        background-color: #444;
-                        border: 1px solid #666;
-                        border-radius: 4px;
-                    }
-                """)
-            label.setText(f"S{i+1}: {self.counts[i]}")
+            r = i // cols
+            c = i % cols
+
+            rect = QtCore.QRectF(
+                c * cw + 4,
+                r * ch + 4,
+                cw - 8,
+                ch - 8
+            )
+
+            val = self.counts[i]
+            color = self._color(val, vmin, vmax)
+
+            painter.setPen(QtGui.QColor("#222"))
+            painter.setBrush(color)
+            painter.drawRoundedRect(rect, 8, 8)
+
+            painter.setPen(QtGui.QColor("#000" if color.lightness() > 150 else "#fff"))
+            painter.drawText(
+                rect,
+                QtCore.Qt.AlignCenter,
+                f"S{i+1}\n{val}"
+            )
 
 
+# =========================================================
+# CAMERA WIDGET
+# =========================================================
 class CameraWidget(QtWidgets.QLabel):
     def __init__(self, frame_queue, shape):
         super().__init__()
+
         self.frame_queue = frame_queue
         self.shape = shape
+
         self.setAlignment(QtCore.Qt.AlignCenter)
         self.setText("Waiting for camera...")
-        self.setStyleSheet("background-color: #2b2b2b; color: white;")
 
-    def update_image(self):
+    def update_from_shared(self):
         frame = None
+
         while not self.frame_queue.empty():
             try:
                 frame = self.frame_queue.get_nowait()
@@ -78,58 +103,141 @@ class CameraWidget(QtWidgets.QLabel):
 
         if frame is None:
             return
-        #print(np.mean(frame))
-        height, width = self.shape
-        qimg = QtGui.QImage(frame.data, width, height, width, QtGui.QImage.Format_Grayscale8)
+
+        h, w = self.shape
+
+        qimg = QtGui.QImage(
+            frame.data,
+            w,
+            h,
+            w,
+            QtGui.QImage.Format_Grayscale8
+        )
+
         pixmap = QtGui.QPixmap.fromImage(qimg)
 
-        scaled = pixmap.scaled(
-            self.width(),
-            self.height(),
-            QtCore.Qt.KeepAspectRatio,
-            QtCore.Qt.FastTransformation
+        self.setPixmap(
+            pixmap.scaled(
+                self.width(),
+                self.height(),
+                QtCore.Qt.KeepAspectRatio,
+                QtCore.Qt.FastTransformation
+            )
         )
-        self.setPixmap(scaled)
 
 
+# =========================================================
+# MAIN GUI
+# =========================================================
 def run_gui(shared_image, sensor_array, shape):
-    app = QtWidgets.QApplication([])
-    from PyQt5.QtCore import QTimer
 
-    class MainWindow(QtWidgets.QWidget):
+    app = QtWidgets.QApplication([])
+
+    class MainWindow(QtWidgets.QMainWindow):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("Tracking UI")
 
-            self.camera_widget = CameraWidget(shared_image, shape)
-            self.sensor_widget = SensorWidget(sensor_array)
+            self.setWindowTitle("MultiportGUI")
 
-            layout = QtWidgets.QVBoxLayout()
-            layout.setContentsMargins(4, 4, 4, 4)
-            layout.setSpacing(4)
+            # ---------------- LEFT SIDE (TABS) ----------------
+            self.tabs = QtWidgets.QTabWidget()
+            self.tabs.setDocumentMode(True)
+            self.tabs.tabBar().setMouseTracking(False)
 
-            self.camera_widget.setMinimumHeight(500)
-            self.sensor_widget.setMinimumHeight(220)
+            self.tabs.setSizePolicy(
+                QtWidgets.QSizePolicy.Expanding,
+                QtWidgets.QSizePolicy.Expanding
+            )
 
-            layout.addWidget(self.camera_widget)
-            layout.addWidget(self.sensor_widget)
-            self.setLayout(layout)
+            # Page 1
+            page_clean = QtWidgets.QWidget()
+            l1 = QtWidgets.QVBoxLayout(page_clean)
+            l1.addWidget(QtWidgets.QLabel("Serial Device Controls"))
+            l1.addWidget(QtWidgets.QPushButton("Connect"))
+            l1.addWidget(QtWidgets.QPushButton("Disconnect"))
+            l1.addWidget(QtWidgets.QPushButton("Send Test"))
+            l1.addStretch()
 
-            screen = QtWidgets.QApplication.primaryScreen().geometry()
-            width = screen.width() // 2
-            height = screen.height()
-            self.setGeometry(width, 0, width, height)
-            self.setFixedSize(width, height)
-            self.setStyleSheet("QWidget {background-color: #2b2b2b;}")
+            # Page 2
+            page_protocol = QtWidgets.QWidget()
+            l2 = QtWidgets.QVBoxLayout(page_protocol)
+            l2.addWidget(QtWidgets.QLineEdit())
+            l2.addWidget(QtWidgets.QTextEdit())
 
-            self.timer = QTimer()
-            self.timer.timeout.connect(self.update_ui)
-            self.timer.start(50)
+            # Page 3
+            page_experiment = QtWidgets.QWidget()
+            l3 = QtWidgets.QVBoxLayout(page_experiment)
+            l3.addWidget(QtWidgets.QComboBox())
+            l3.addWidget(QtWidgets.QPushButton("Start"))
+            l3.addWidget(QtWidgets.QPushButton("Stop"))
 
-        def update_ui(self):
-            self.camera_widget.update_image()
-            self.sensor_widget.update_sensors()
+            self.tabs.addTab(page_clean, "Cleaning")
+            self.tabs.addTab(page_protocol, "Protocol")
+            self.tabs.addTab(page_experiment, "Experiment")
+
+            # LEFT PANEL
+            left = QtWidgets.QWidget()
+            left_layout = QtWidgets.QVBoxLayout(left)
+            left_layout.setContentsMargins(0, 0, 0, 0)
+            left_layout.setSpacing(0)
+            left_layout.addWidget(self.tabs)
+
+            # ---------------- RIGHT SIDE ----------------
+            self.camera = CameraWidget(shared_image, shape)
+            self.sensors = SensorWidget(sensor_array)
+
+            right = QtWidgets.QWidget()
+            right_layout = QtWidgets.QVBoxLayout(right)
+            right_layout.addWidget(self.camera)
+            right_layout.addWidget(self.sensors)
+
+            # ---------------- FIXED 60/40 SPLIT ----------------
+            root = QtWidgets.QWidget()
+            root_layout = QtWidgets.QHBoxLayout(root)
+
+            root_layout.addWidget(left, 3)   # 60%
+            root_layout.addWidget(right, 2)  # 40%
+
+            root_layout.setContentsMargins(0, 0, 0, 0)
+            root_layout.setSpacing(0)
+
+            self.setCentralWidget(root)
+
+            # ---------------- STYLE ----------------
+            self.setStyleSheet("""
+                QWidget { background:#2b2b2b; color:#eee; }
+
+                QPushButton {
+                    background:#3a3a3a;
+                    border-radius:4px;
+                    padding:6px;
+                }
+
+                QPushButton:hover {
+                    background:#4a4a4a;
+                }
+
+                QTabBar::tab {
+                    padding:8px;
+                    margin:2px;
+                    background:#3a3a3a;
+                }
+
+                QTabBar::tab:selected {
+                    background:#4a4a4a;
+                }
+            """)
+
+            # ---------------- TIMERS ----------------
+            self.camera_timer = QtCore.QTimer()
+            self.camera_timer.timeout.connect(self.camera.update_from_shared)
+            self.camera_timer.start(50)
+
+            self.sensor_timer = QtCore.QTimer()
+            self.sensor_timer.timeout.connect(self.sensors.update_from_shared)
+            self.sensor_timer.start(80)
 
     window = MainWindow()
     window.show()
+    QtCore.QTimer.singleShot(50, window.showMaximized)
     app.exec_()
