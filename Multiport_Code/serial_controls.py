@@ -165,10 +165,18 @@ class SerialControls:
         if self.serial_arduino1: self.serial_arduino1.close()
         if self.serial_arduino2: self.serial_arduino2.close()
 
-def sensor_process(sensor_array, timestamp_value):
+def sensor_process(sensor_array, timestamp_value, command_queue=None):
     from serial_controls import SerialControls
     ser_machine = SerialControls()
     while True:
+        # Drain any pending GUI commands and forward them to the Arduino
+        if command_queue is not None:
+            while not command_queue.empty():
+                try:
+                    cmd = command_queue.get_nowait()
+                    ser_machine.send_command(cmd)
+                except Exception:
+                    pass
         timestamp, active_pin = ser_machine.read_serial()
         active = active_pin[0] + active_pin[1]
         for i in range(16):
