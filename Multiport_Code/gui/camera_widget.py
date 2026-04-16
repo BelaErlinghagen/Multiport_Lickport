@@ -1,11 +1,23 @@
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 
-class CameraWidget(QtWidgets.QWidget):
-    """Live camera preview drawn via paintEvent.
+class CameraWidget(QtWidgets.QOpenGLWidget):
+    """Live camera preview rendered via QOpenGLWidget.
 
-    Using QWidget + paintEvent (instead of QLabel.setPixmap) avoids the
-    background-erase repaint cascade that caused left-panel flicker.
+    Inheriting from QOpenGLWidget (rather than QWidget) has one critical
+    side-effect: Qt switches the *entire host window* into OpenGL compositing
+    mode.  In that mode:
+      1. All regular widgets in the window are painted into a shared off-screen
+         framebuffer object (FBO).
+      2. This widget's own FBO is composited on top.
+      3. The combined result is presented to the screen in a single
+         eglSwapBuffers call — atomic and vsync-synchronized.
+
+    Under XWayland/Wayland (the user's GNOME setup) the xcb-based software
+    path pushes dirty regions to the X server immediately and unsynchronised,
+    which lets the Wayland compositor see intermediate window states and
+    produce visible flicker.  The GL path eliminates this because nothing
+    is shown until the swap is complete.
     """
 
     def __init__(self, frame_queue, shape):
@@ -13,7 +25,6 @@ class CameraWidget(QtWidgets.QWidget):
         self._pixmap = None
         self.frame_queue = frame_queue
         self.shape = shape
-        self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
         self.setMinimumSize(200, 150)
 
     def update_from_shared(self):
@@ -35,7 +46,12 @@ class CameraWidget(QtWidgets.QWidget):
         self._pixmap = QtGui.QPixmap.fromImage(qimg)
         self.update()
 
-    def paintEvent(self, event):
+    def paintGL(self):
+        """Paint the current frame using QPainter on the OpenGL surface.
+
+        QPainter works on QOpenGLWidget via Qt's OpenGL 2D paint engine.
+        painter.end() must be called explicitly before returning.
+        """
         painter = QtGui.QPainter(self)
         painter.fillRect(self.rect(), QtGui.QColor("#111"))
         if self._pixmap:
@@ -52,3 +68,4 @@ class CameraWidget(QtWidgets.QWidget):
             painter.drawText(
                 self.rect(), QtCore.Qt.AlignCenter, "Waiting for camera…"
             )
+        painter.end()

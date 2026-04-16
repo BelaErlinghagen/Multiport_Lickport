@@ -23,8 +23,14 @@ def main():
     sensor_proc = Process(target=sensor_process, args=(sensor_array, timestamp_value, command_queue))
     sensor_proc.start()
 
-    # Start GUI
-    run_gui(frame_queue, sensor_array, cam_shape, command_queue)
+    # Start GUI — pass shared data objects so ExperimentPage can wire saving
+    data_sources = {
+        "frame_queue":     frame_queue,
+        "sensor_array":    sensor_array,
+        "dlc_queue":       dlc_queue,
+        "timestamp_value": timestamp_value,
+    }
+    run_gui(frame_queue, sensor_array, cam_shape, command_queue, data_sources)
 
     # Clean up after GUI closes — signal camera to stop cleanly first so
     # Pylon releases the USB device before the process is force-killed.

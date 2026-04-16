@@ -2,7 +2,7 @@
 # Imports widgets from the gui/ subpackage and builds the main window.
 from PyQt5 import QtWidgets, QtGui, QtCore
 
-from gui import CameraWidget, SensorWidget, CleaningPage
+from gui import CameraWidget, SensorWidget, CleaningPage, ExperimentPage
 
 
 class _OpaqueWidget(QtWidgets.QWidget):
@@ -16,14 +16,51 @@ class _OpaqueWidget(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # WA_OpaquePaintEvent: Qt skips its own background pre-fill before paintEvent.
+        # WA_NoSystemBackground: X11 server does not clear the window on expose events.
+        # Both are needed — they control two separate layers of the paint pipeline.
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
+        self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
 
     def paintEvent(self, event):
         QtGui.QPainter(self).fillRect(event.rect(), self._BG)
 
 
-def run_gui(shared_image, sensor_array, shape, command_queue):
+def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None):
     app = QtWidgets.QApplication([])
+
+    # ── Dark theme via Fusion style + QPalette ────────────────────────────────
+    # Using a global QWidget stylesheet rule ("QWidget { background: ... }") forces
+    # autoFillBackground=True on every widget, which causes Qt/X11 to clear every
+    # container's background before painting its children — the cascade that creates
+    # the visible flicker. The correct approach is to set a dark QPalette and let
+    # the Fusion style handle background fills internally without the cascade.
+    app.setStyle("Fusion")
+    _pal = QtGui.QPalette()
+    for _role, _hex in [
+        (QtGui.QPalette.Window,          "#2b2b2b"),
+        (QtGui.QPalette.WindowText,      "#eeeeee"),
+        (QtGui.QPalette.Base,            "#2b2b2b"),
+        (QtGui.QPalette.AlternateBase,   "#333333"),
+        (QtGui.QPalette.ToolTipBase,     "#2b2b2b"),
+        (QtGui.QPalette.ToolTipText,     "#eeeeee"),
+        (QtGui.QPalette.Text,            "#eeeeee"),
+        (QtGui.QPalette.Button,          "#3a3a3a"),
+        (QtGui.QPalette.ButtonText,      "#eeeeee"),
+        (QtGui.QPalette.BrightText,      "#ffffff"),
+        (QtGui.QPalette.Link,            "#0078d7"),
+        (QtGui.QPalette.Highlight,       "#005a99"),
+        (QtGui.QPalette.HighlightedText, "#ffffff"),
+    ]:
+        _pal.setColor(_role, QtGui.QColor(_hex))
+    for _role, _hex in [
+        (QtGui.QPalette.WindowText, "#555555"),
+        (QtGui.QPalette.Text,       "#555555"),
+        (QtGui.QPalette.ButtonText, "#555555"),
+        (QtGui.QPalette.Button,     "#2e2e2e"),
+    ]:
+        _pal.setColor(QtGui.QPalette.Disabled, _role, QtGui.QColor(_hex))
+    app.setPalette(_pal)
 
     class MainWindow(QtWidgets.QMainWindow):
         def __init__(self):
@@ -34,6 +71,7 @@ def run_gui(shared_image, sensor_array, shape, command_queue):
             # ── LEFT: tab panel ───────────────────────────────────
             self.tabs = QtWidgets.QTabWidget()
             self.tabs.setDocumentMode(True)
+            self.tabs.tabBar().setExpanding(True)
             self.tabs.tabBar().setMouseTracking(False)
             self.tabs.setSizePolicy(
                 QtWidgets.QSizePolicy.Expanding,
@@ -42,18 +80,14 @@ def run_gui(shared_image, sensor_array, shape, command_queue):
 
             page_clean = CleaningPage(command_queue)
 
-            page_protocol = QtWidgets.QWidget()
+            page_protocol = _OpaqueWidget()
             l2 = QtWidgets.QVBoxLayout(page_protocol)
             l2.addWidget(QtWidgets.QLineEdit())
             l2.addWidget(QtWidgets.QTextEdit())
 
-            page_experiment = QtWidgets.QWidget()
-            l3 = QtWidgets.QVBoxLayout(page_experiment)
-            l3.addWidget(QtWidgets.QComboBox())
-            l3.addWidget(QtWidgets.QPushButton("Start"))
-            l3.addWidget(QtWidgets.QPushButton("Stop"))
+            page_experiment = ExperimentPage(data_sources or {})
 
-            self.tabs.addTab(page_clean, "Cleaning")
+            self.tabs.addTab(page_clean, "Cleaning/Testing")
             self.tabs.addTab(page_protocol, "Protocol")
             self.tabs.addTab(page_experiment, "Experiment")
 
@@ -80,7 +114,13 @@ def run_gui(shared_image, sensor_array, shape, command_queue):
             # ── ROOT: 60/40 split ─────────────────────────────────
             root = _OpaqueWidget()
             root_layout = QtWidgets.QHBoxLayout(root)
+            divider = QtWidgets.QFrame()
+            divider.setFrameShape(QtWidgets.QFrame.VLine)
+            divider.setFixedWidth(1)
+            divider.setStyleSheet("QFrame { background: #444; }")
+
             root_layout.addWidget(left, 3)   # 60 %
+            root_layout.addWidget(divider)
             root_layout.addWidget(right, 2)  # 40 %
             root_layout.setContentsMargins(0, 0, 0, 0)
             root_layout.setSpacing(0)
@@ -88,9 +128,10 @@ def run_gui(shared_image, sensor_array, shape, command_queue):
             self.setCentralWidget(root)
 
             # ── Style ─────────────────────────────────────────────
+            # Note: QWidget { background } is intentionally absent.
+            # The dark palette set above handles container backgrounds without
+            # triggering autoFillBackground on every widget (the flicker cause).
             self.setStyleSheet("""
-                QWidget { background: #2b2b2b; color: #eee; }
-
                 QPushButton {
                     background: #3a3a3a;
                     border-radius: 4px;

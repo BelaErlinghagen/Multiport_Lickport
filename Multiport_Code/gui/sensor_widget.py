@@ -22,12 +22,22 @@ class SensorWidget(QtWidgets.QWidget):
         self.update()
 
     def update_from_shared(self):
-        self.active = set()
+        # Collect the currently active sensors.
+        new_active = set()
         for i in range(self.num_sensors):
             if int(self.sensor_array[i]) == 1:
+                new_active.add(i)
+
+        # Only schedule a repaint when something actually changed — either the set
+        # of active sensors is different, or counts are still accumulating (active
+        # sensors exist). Avoids 80 ms unconditional repaints when the setup is idle.
+        if new_active or new_active != self.active:
+            for i in new_active:
                 self.counts[i] += 1
-                self.active.add(i)
-        self.update()
+            self.active = new_active
+            self.update()
+        else:
+            self.active = new_active
 
     def _heat_color(self, v, vmin, vmax):
         """Greyscale ramp from dark grey (vmin) to white (vmax)."""

@@ -4,18 +4,25 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 
 
 class CleaningPage(QtWidgets.QWidget):
-    """Cleaning / testing panel with four sections:
+    """Cleaning / testing panel.
 
-    1. Manual controls  — ALL OFF, LED toggles, pump pulses, BNC pulses
-    2. Automated cycle  — sequential pump cleaning (≤3 active at once)
-    3. Beamer           — placeholder (hardware not yet connected)
-    4. Screens          — placeholder (hardware not yet connected)
+    Section order (top → bottom):
+      1. Beamer        — placeholder, hardware not yet connected
+      2. Screens       — placeholder, hardware not yet connected
+      3. ALL OFF safety button  ← sits directly above LED controls
+      4. LEDs          — manual toggle controls
+      5. Pumps         — manual pulse controls
+      6. BNC           — manual pulse controls
+      7. Automated Cleaning Cycle
     """
 
     _BTN_SIZE = 44   # px, square grid buttons
 
     def __init__(self, command_queue):
         super().__init__()
+        # WA_OpaquePaintEvent: Qt skips its background pre-fill before paintEvent.
+        # Our paintEvent then fills every pixel, so the widget is never uninitialized.
+        self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
         self.command_queue = command_queue
         self.led_state = {i: False for i in range(1, 17)}
 
@@ -26,23 +33,68 @@ class CleaningPage(QtWidgets.QWidget):
         self._cleaning_timer = QtCore.QTimer(self)
         self._cleaning_timer.timeout.connect(self._cleaning_tick)
 
-        # Wrap content in a scroll area so nothing gets clipped on small screens
-        scroll = QtWidgets.QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea { border: none; }")
-
-        outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
-
-        content = QtWidgets.QWidget()
-        scroll.setWidget(content)
-        root = QtWidgets.QVBoxLayout(content)
+        # Root layout fills the entire widget — no scroll area
+        root = QtWidgets.QVBoxLayout(self)
         root.setSpacing(10)
         root.setContentsMargins(10, 10, 10, 10)
 
-        # ── 1. ALL OFF ────────────────────────────────────────────
+        # ── 1. Beamer (placeholder) ───────────────────────────────
+        root.addWidget(self._section_label("Beamer"))
+
+        beamer_status_row = QtWidgets.QHBoxLayout()
+        beamer_dot = QtWidgets.QLabel("●")
+        beamer_dot.setStyleSheet("color:#666; font-size:14px;")
+        beamer_status_row.addWidget(beamer_dot)
+        beamer_status_row.addWidget(QtWidgets.QLabel("Not connected"))
+        beamer_status_row.addStretch()
+        beamer_connect = QtWidgets.QPushButton("Connect")
+        beamer_connect.setEnabled(False)
+        beamer_status_row.addWidget(beamer_connect)
+        root.addLayout(beamer_status_row)
+
+        beamer_ctrl_row = QtWidgets.QHBoxLayout()
+        beamer_ctrl_row.addWidget(QtWidgets.QLabel("Pattern:"))
+        beamer_pattern = QtWidgets.QComboBox()
+        beamer_pattern.addItems(["Solid white", "Checkerboard", "Gradient", "Dark"])
+        beamer_pattern.setEnabled(False)
+        beamer_ctrl_row.addWidget(beamer_pattern)
+        beamer_test = QtWidgets.QPushButton("Test Pattern")
+        beamer_test.setEnabled(False)
+        beamer_ctrl_row.addWidget(beamer_test)
+        root.addLayout(beamer_ctrl_row)
+        root.addWidget(self._separator())
+
+        # ── 3. Screens (placeholder) ──────────────────────────────
+        root.addWidget(self._section_label("Screens"))
+
+        screens_status_row = QtWidgets.QHBoxLayout()
+        screens_dot = QtWidgets.QLabel("●")
+        screens_dot.setStyleSheet("color:#666; font-size:14px;")
+        screens_status_row.addWidget(screens_dot)
+        screens_status_row.addWidget(QtWidgets.QLabel("Not connected  (2 screens)"))
+        screens_status_row.addStretch()
+        screens_connect = QtWidgets.QPushButton("Connect")
+        screens_connect.setEnabled(False)
+        screens_status_row.addWidget(screens_connect)
+        root.addLayout(screens_status_row)
+
+        for screen_num in range(1, 3):
+            screen_row = QtWidgets.QHBoxLayout()
+            screen_row.addWidget(QtWidgets.QLabel(f"Screen {screen_num}:"))
+            screen_pattern = QtWidgets.QComboBox()
+            screen_pattern.addItems(
+                ["Blank", "Grating 45°", "Grating 90°", "Noise", "Full flash"]
+            )
+            screen_pattern.setEnabled(False)
+            screen_row.addWidget(screen_pattern)
+            screen_test = QtWidgets.QPushButton("Test")
+            screen_test.setEnabled(False)
+            screen_row.addWidget(screen_test)
+            root.addLayout(screen_row)
+
+        root.addWidget(self._separator())
+
+        # ── 4. ALL OFF + LEDs ─────────────────────────────────────
         all_off_btn = QtWidgets.QPushButton("ALL OFF")
         all_off_btn.setFixedHeight(36)
         all_off_btn.setStyleSheet(
@@ -51,9 +103,7 @@ class CleaningPage(QtWidgets.QWidget):
         )
         all_off_btn.clicked.connect(self._all_off)
         root.addWidget(all_off_btn)
-        root.addWidget(self._separator())
 
-        # ── 2. LEDs ───────────────────────────────────────────────
         root.addWidget(self._section_label("LEDs"))
         self._led_buttons: dict = {}
         led_grid = self._make_grid()
@@ -67,7 +117,7 @@ class CleaningPage(QtWidgets.QWidget):
         root.addLayout(led_grid)
         root.addWidget(self._separator())
 
-        # ── 3. Pumps — manual pulse ───────────────────────────────
+        # ── 5. Pumps — manual pulse ───────────────────────────────
         pump_header = QtWidgets.QHBoxLayout()
         pump_header.addWidget(self._section_label("Pumps — Manual Pulse"))
         pump_header.addStretch()
@@ -88,7 +138,7 @@ class CleaningPage(QtWidgets.QWidget):
         root.addLayout(pump_grid)
         root.addWidget(self._separator())
 
-        # ── 4. BNC ────────────────────────────────────────────────
+        # ── 6. BNC ────────────────────────────────────────────────
         bnc_header = QtWidgets.QHBoxLayout()
         bnc_header.addWidget(self._section_label("BNC"))
         bnc_header.addStretch()
@@ -109,7 +159,7 @@ class CleaningPage(QtWidgets.QWidget):
         root.addLayout(bnc_row)
         root.addWidget(self._separator())
 
-        # ── 5. Automated Cleaning Cycle ───────────────────────────
+        # ── 7. Automated Cleaning Cycle ───────────────────────────
         root.addWidget(self._section_label("Automated Cleaning Cycle"))
 
         # Duration slider
@@ -164,63 +214,13 @@ class CleaningPage(QtWidgets.QWidget):
         self._clean_status = QtWidgets.QLabel("")
         self._clean_status.setStyleSheet("color:#aaa; font-size:10px;")
         root.addWidget(self._clean_status)
-        root.addWidget(self._separator())
-
-        # ── 6. Beamer (placeholder) ───────────────────────────────
-        root.addWidget(self._section_label("Beamer"))
-
-        beamer_status_row = QtWidgets.QHBoxLayout()
-        beamer_dot = QtWidgets.QLabel("●")
-        beamer_dot.setStyleSheet("color:#666; font-size:14px;")
-        beamer_status_row.addWidget(beamer_dot)
-        beamer_status_row.addWidget(QtWidgets.QLabel("Not connected"))
-        beamer_status_row.addStretch()
-        beamer_connect = QtWidgets.QPushButton("Connect")
-        beamer_connect.setEnabled(False)
-        beamer_status_row.addWidget(beamer_connect)
-        root.addLayout(beamer_status_row)
-
-        beamer_ctrl_row = QtWidgets.QHBoxLayout()
-        beamer_ctrl_row.addWidget(QtWidgets.QLabel("Pattern:"))
-        beamer_pattern = QtWidgets.QComboBox()
-        beamer_pattern.addItems(["Solid white", "Checkerboard", "Gradient", "Dark"])
-        beamer_pattern.setEnabled(False)
-        beamer_ctrl_row.addWidget(beamer_pattern)
-        beamer_test = QtWidgets.QPushButton("Test Pattern")
-        beamer_test.setEnabled(False)
-        beamer_ctrl_row.addWidget(beamer_test)
-        root.addLayout(beamer_ctrl_row)
-        root.addWidget(self._separator())
-
-        # ── 7. Screens (placeholder) ──────────────────────────────
-        root.addWidget(self._section_label("Screens"))
-
-        screens_status_row = QtWidgets.QHBoxLayout()
-        screens_dot = QtWidgets.QLabel("●")
-        screens_dot.setStyleSheet("color:#666; font-size:14px;")
-        screens_status_row.addWidget(screens_dot)
-        screens_status_row.addWidget(QtWidgets.QLabel("Not connected  (2 screens)"))
-        screens_status_row.addStretch()
-        screens_connect = QtWidgets.QPushButton("Connect")
-        screens_connect.setEnabled(False)
-        screens_status_row.addWidget(screens_connect)
-        root.addLayout(screens_status_row)
-
-        for screen_num in range(1, 3):
-            screen_row = QtWidgets.QHBoxLayout()
-            screen_row.addWidget(QtWidgets.QLabel(f"Screen {screen_num}:"))
-            screen_pattern = QtWidgets.QComboBox()
-            screen_pattern.addItems(
-                ["Blank", "Grating 45°", "Grating 90°", "Noise", "Full flash"]
-            )
-            screen_pattern.setEnabled(False)
-            screen_row.addWidget(screen_pattern)
-            screen_test = QtWidgets.QPushButton("Test")
-            screen_test.setEnabled(False)
-            screen_row.addWidget(screen_test)
-            root.addLayout(screen_row)
 
         root.addStretch()
+
+    # ── Background ────────────────────────────────────────────────
+
+    def paintEvent(self, event):
+        QtGui.QPainter(self).fillRect(event.rect(), QtGui.QColor("#2b2b2b"))
 
     # ── Layout helpers ────────────────────────────────────────────
 
