@@ -1,3 +1,4 @@
+import json
 import os
 from multiprocessing import Process, Value
 
@@ -12,8 +13,9 @@ class ExperimentPage(QtWidgets.QWidget):
     Section order (top → bottom):
       1. Experiment Info  — Cohort / Mouse / Session editable comboboxes
                             (auto-populated by scanning data_path from shared_states)
-      2. Recording        — Start/Stop buttons + Camera/Sensor/DLC checkboxes
-                            (wired to data_saving.saving_process)
+      2. Recording        — Session duration, Start/Stop buttons,
+                            Camera/Sensor/DLC checkboxes,
+                            wired to data_saving.saving_process + state machine
       3. Protocol         — placeholder
     """
 
@@ -23,17 +25,31 @@ class ExperimentPage(QtWidgets.QWidget):
         # Our paintEvent fills every pixel, so the widget is never uninitialized.
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
 
-        # Keys expected: frame_queue, sensor_array, dlc_queue, timestamp_value
         self._data_sources = data_sources
-        self._saving_proc = None
-        # All Value objects must be kept alive as instance attrs for the
-        # duration of the saving process.  If they go out of scope the GC
-        # calls sem_unlink, destroying the POSIX semaphore before the spawned
-        # child can open it — causing FileNotFoundError in SemLock._rebuild.
+
+        # State-machine flags (Value objects from main.py via data_sources).
+        # Stored as instance attrs so the GC does not destroy them while in use.
+        self._sm_active    = data_sources.get("sm_active")
+        self._sm_stop      = data_sources.get("sm_stop")
+        self._session_done = data_sources.get("session_done")
+        self._protocol_queue   = data_sources.get("protocol_queue")
+        self._loaded_protocol  = None   # dict set by _browse_protocol()
+
+        # Saving-process handles.  All Value objects must be kept alive here:
+        # if they go out of scope the GC calls sem_unlink, destroying the POSIX
+        # semaphore before the spawned child can open it (FileNotFoundError in
+        # SemLock._rebuild).
+        self._saving_proc    = None
         self._saving_running = None
-        self._cam_flag    = None
-        self._sensor_flag = None
-        self._dlc_flag    = None
+        self._cam_flag       = None
+        self._sensor_flag    = None
+        self._dlc_flag       = None
+
+        # Timer that polls session_done so recording stops automatically when
+        # the state machine finishes the session.
+        self._sm_done_timer = QtCore.QTimer(self)
+        self._sm_done_timer.setInterval(500)   # check every 500 ms
+        self._sm_done_timer.timeout.connect(self._check_session_done)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setSpacing(12)
@@ -61,9 +77,44 @@ class ExperimentPage(QtWidgets.QWidget):
 
         root.addWidget(self._separator())
 
-        # ── 2. Recording ─────────────────────────────────────────
+        # ── 2. Selected Protocol ──────────────────────────────────
+        root.addWidget(self._section_label("Selected Protocol"))
+
+        proto_row = QtWidgets.QHBoxLayout()
+        self._proto_path_lbl = QtWidgets.QLabel("No protocol selected")
+        self._proto_path_lbl.setStyleSheet("color:#888; font-size:10px;")
+        self._proto_path_lbl.setWordWrap(True)
+        proto_browse_btn = QtWidgets.QPushButton("Browse…")
+        proto_browse_btn.setFixedWidth(70)
+        proto_browse_btn.clicked.connect(self._browse_protocol)
+        proto_row.addWidget(self._proto_path_lbl, 1)
+        proto_row.addWidget(proto_browse_btn)
+        root.addLayout(proto_row)
+
+        # Summary box (hidden until a protocol is loaded)
+        self._proto_summary = QtWidgets.QFrame()
+        self._proto_summary.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self._proto_summary.setStyleSheet(
+            "QFrame { background:#222; border:1px solid #444; border-radius:4px; }"
+        )
+        summary_layout = QtWidgets.QVBoxLayout(self._proto_summary)
+        summary_layout.setContentsMargins(8, 6, 8, 6)
+        summary_layout.setSpacing(2)
+        self._sum_session = QtWidgets.QLabel()
+        self._sum_rewards = QtWidgets.QLabel()
+        self._sum_trial   = QtWidgets.QLabel()
+        for lbl in (self._sum_session, self._sum_rewards, self._sum_trial):
+            lbl.setStyleSheet("color:#ccc; font-size:10px;")
+            summary_layout.addWidget(lbl)
+        self._proto_summary.setVisible(False)
+        root.addWidget(self._proto_summary)
+
+        root.addWidget(self._separator())
+
+        # ── 3. Recording ─────────────────────────────────────────
         root.addWidget(self._section_label("Recording"))
 
+        # Data-stream checkboxes
         flag_row = QtWidgets.QHBoxLayout()
         self._cam_chk    = QtWidgets.QCheckBox("Camera")
         self._sensor_chk = QtWidgets.QCheckBox("Sensors")
@@ -75,6 +126,7 @@ class ExperimentPage(QtWidgets.QWidget):
         flag_row.addStretch()
         root.addLayout(flag_row)
 
+        # Start / Stop buttons
         btn_row = QtWidgets.QHBoxLayout()
 
         self._start_btn = QtWidgets.QPushButton("START RECORDING")
@@ -103,16 +155,6 @@ class ExperimentPage(QtWidgets.QWidget):
         self._rec_status = QtWidgets.QLabel("Idle")
         self._rec_status.setStyleSheet("color:#aaa; font-size:10px;")
         root.addWidget(self._rec_status)
-
-        root.addWidget(self._separator())
-
-        # ── 3. Protocol (placeholder) ─────────────────────────────
-        root.addWidget(self._section_label("Protocol"))
-
-        proto_lbl = QtWidgets.QLabel("Protocol editor — not yet implemented")
-        proto_lbl.setStyleSheet("color:#666; font-style:italic;")
-        proto_lbl.setAlignment(QtCore.Qt.AlignCenter)
-        root.addWidget(proto_lbl)
 
         root.addStretch()
 
@@ -210,6 +252,62 @@ class ExperimentPage(QtWidgets.QWidget):
                   self._cam_chk, self._sensor_chk, self._dlc_chk):
             w.setEnabled(enabled)
 
+    def _browse_protocol(self):
+        """Open a file dialog to pick a protocol JSON; load and show a summary."""
+        try:
+            from shared_states import protocols_path
+            start_dir = protocols_path
+        except Exception:
+            start_dir = ""
+
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select Protocol", start_dir, "JSON (*.json)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r") as fh:
+                self._loaded_protocol = json.load(fh)
+        except Exception as exc:
+            self._proto_path_lbl.setText(f"Error loading: {exc}")
+            self._proto_summary.setVisible(False)
+            return
+
+        self._proto_path_lbl.setText(path)
+        self._show_protocol_summary()
+
+    def _show_protocol_summary(self):
+        """Populate and reveal the summary box from self._loaded_protocol."""
+        d = self._loaded_protocol
+        if d is None:
+            self._proto_summary.setVisible(False)
+            return
+
+        # Session line
+        sess = d.get("session", {})
+        s_type   = sess.get("type", "?")
+        s_length = sess.get("length", "?")
+        unit     = "s" if s_type == "time" else "trials"
+        self._sum_session.setText(f"Session: {s_type},  {s_length} {unit}")
+
+        # Rewards line
+        rew  = d.get("rewards", {})
+        cnt  = rew.get("count", "?")
+        dist = rew.get("distribution", {}).get("type", "?")
+        self._sum_rewards.setText(f"Rewards: {cnt}  ({dist} distribution)")
+
+        # Trial line
+        trial    = d.get("trial", {})
+        t_type   = trial.get("end_type", "?")
+        if t_type == "time":
+            t_detail = f"{trial.get('duration_s', '?')} s per trial"
+        else:
+            t_detail = f"{trial.get('required_collections', '?')} collections per trial"
+        self._sum_trial.setText(f"Trial: {t_detail}")
+
+        self._proto_summary.setVisible(True)
+
     def _start_recording(self):
         cohort  = self._cohort_cb.currentText().strip()
         mouse   = self._mouse_cb.currentText().strip()
@@ -218,6 +316,20 @@ class ExperimentPage(QtWidgets.QWidget):
             self._rec_status.setText("Fill in Cohort, Mouse and Session IDs first.")
             return
 
+        if self._loaded_protocol is None:
+            self._rec_status.setText("Load a protocol first.")
+            return
+
+        # Drain any stale entry from a previous run, then push the current protocol.
+        if self._protocol_queue is not None:
+            while not self._protocol_queue.empty():
+                try:
+                    self._protocol_queue.get_nowait()
+                except Exception:
+                    pass
+            self._protocol_queue.put_nowait(self._loaded_protocol)
+
+        # Start saving process
         ds = self._data_sources
         self._saving_running = Value('b', True)
         self._cam_flag    = Value('b', self._cam_chk.isChecked())
@@ -227,9 +339,9 @@ class ExperimentPage(QtWidgets.QWidget):
         self._saving_proc = Process(
             target=saving_process,
             args=(
-                ds.get("frame_queue"),
+                ds.get("dlc_queue"),      # full-res frames for saving
                 ds.get("sensor_array"),
-                ds.get("dlc_queue"),
+                None,                     # DLC data — not yet implemented
                 ds.get("timestamp_value"),
                 cohort, mouse, session,
                 self._cam_flag, self._sensor_flag, self._dlc_flag,
@@ -239,12 +351,24 @@ class ExperimentPage(QtWidgets.QWidget):
         )
         self._saving_proc.start()
 
+        # Activate the state machine (it will read protocol from the queue)
+        if self._sm_active is not None:
+            self._sm_active.value = True
+
+        # Poll every 500 ms to detect when the SM signals session complete
+        self._sm_done_timer.start()
+
         self._set_id_widgets_enabled(False)
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._rec_status.setText(f"Recording  {cohort} / {mouse} / {session}")
 
     def _stop_recording(self):
+        # Stop polling and halt the state machine immediately
+        self._sm_done_timer.stop()
+        if self._sm_stop is not None:
+            self._sm_stop.value = True
+
         if self._saving_running is not None:
             self._saving_running.value = False
         # Give the saving thread ~500 ms to flush the current row, then clean up
@@ -254,13 +378,24 @@ class ExperimentPage(QtWidgets.QWidget):
         if self._saving_proc and self._saving_proc.is_alive():
             self._saving_proc.terminate()
             self._saving_proc.join(timeout=1)
-        self._saving_proc     = None
-        self._saving_running  = None
-        self._cam_flag        = None
-        self._sensor_flag     = None
-        self._dlc_flag        = None
+        self._saving_proc    = None
+        self._saving_running = None
+        self._cam_flag       = None
+        self._sensor_flag    = None
+        self._dlc_flag       = None
 
         self._set_id_widgets_enabled(True)
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._rec_status.setText("Idle")
+
+    def _check_session_done(self):
+        """Called every 500 ms while recording is active.
+
+        If the state machine signals that its session ended naturally,
+        automatically stop the recording.
+        """
+        if self._session_done is not None and self._session_done.value:
+            self._sm_done_timer.stop()
+            self._rec_status.setText("Session complete — stopping recording…")
+            self._stop_recording()

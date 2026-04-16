@@ -166,6 +166,14 @@ class SerialControls:
         if self.serial_arduino2: self.serial_arduino2.close()
 
 def sensor_process(sensor_array, timestamp_value, command_queue=None):
+    # Prevent Queue feeder threads from blocking this process's atexit.
+    # Without this, terminating the process while the pipe is full causes a
+    # deadlock: main waits for this process to exit, this process waits for
+    # main to drain the queue.
+    timestamp_value.cancel_join_thread()
+    if command_queue is not None:
+        command_queue.cancel_join_thread()
+
     from serial_controls import SerialControls
     ser_machine = SerialControls()
     while True:

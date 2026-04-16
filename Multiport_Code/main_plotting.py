@@ -2,7 +2,7 @@
 # Imports widgets from the gui/ subpackage and builds the main window.
 from PyQt5 import QtWidgets, QtGui, QtCore
 
-from gui import CameraWidget, SensorWidget, CleaningPage, ExperimentPage
+from gui import CameraWidget, SensorWidget, CleaningPage, ExperimentPage, ProtocolPage
 
 
 class _OpaqueWidget(QtWidgets.QWidget):
@@ -80,10 +80,7 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
 
             page_clean = CleaningPage(command_queue)
 
-            page_protocol = _OpaqueWidget()
-            l2 = QtWidgets.QVBoxLayout(page_protocol)
-            l2.addWidget(QtWidgets.QLineEdit())
-            l2.addWidget(QtWidgets.QTextEdit())
+            page_protocol = ProtocolPage()
 
             page_experiment = ExperimentPage(data_sources or {})
 
