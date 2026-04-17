@@ -44,7 +44,6 @@ class ProtocolPage(QtWidgets.QWidget):
         "trial": {
             "end_type": "time",
             "duration_s": 30,
-            "required_collections": 1,
         },
         "beamer": None,
         "screens": None,
@@ -232,8 +231,8 @@ class ProtocolPage(QtWidgets.QWidget):
         trial_cond_row = QtWidgets.QHBoxLayout()
         trial_cond_row.addWidget(QtWidgets.QLabel("End condition:"))
         self._trial_end_combo = QtWidgets.QComboBox()
-        self._trial_end_combo.addItems(["Time", "Collections"])
-        self._trial_end_combo.setFixedWidth(120)
+        self._trial_end_combo.addItems(["Fixed time", "All rewards collected"])
+        self._trial_end_combo.setFixedWidth(160)
         trial_cond_row.addWidget(self._trial_end_combo)
         trial_cond_row.addStretch()
         sl.addLayout(trial_cond_row)
@@ -251,22 +250,6 @@ class ProtocolPage(QtWidgets.QWidget):
         tt_layout.addWidget(QtWidgets.QLabel("seconds"))
         tt_layout.addStretch()
         sl.addWidget(self._trial_time_widget)
-
-        # Collections row
-        self._trial_coll_widget = QtWidgets.QWidget()
-        tc_layout = QtWidgets.QHBoxLayout(self._trial_coll_widget)
-        tc_layout.setContentsMargins(0, 0, 0, 0)
-        tc_layout.addWidget(QtWidgets.QLabel("Required collections:"))
-        self._trial_coll_spin = QtWidgets.QSpinBox()
-        self._trial_coll_spin.setRange(1, 16)
-        self._trial_coll_spin.setValue(1)
-        self._trial_coll_spin.setFixedWidth(60)
-        tc_layout.addWidget(self._trial_coll_spin)
-        self._trial_coll_note = QtWidgets.QLabel("")
-        self._trial_coll_note.setStyleSheet("color:#888; font-size:10px;")
-        tc_layout.addWidget(self._trial_coll_note)
-        tc_layout.addStretch()
-        sl.addWidget(self._trial_coll_widget)
 
         self._trial_end_combo.currentTextChanged.connect(self._update_trial_widgets)
 
@@ -315,7 +298,6 @@ class ProtocolPage(QtWidgets.QWidget):
         """Rebuild both the reward-config table and the distribution panel."""
         self._rebuild_reward_config()
         self._rebuild_dist_section()
-        self._update_trial_coll_note()
 
     def _rebuild_reward_config(self):
         """Rebuild the per-reward parameter table (duration + probability)."""
@@ -372,9 +354,10 @@ class ProtocolPage(QtWidgets.QWidget):
         n    = int(self._count_combo.currentText())
         mode = self._dist_type_combo.currentText()
 
-        self._fixed_port_combos = []
-        self._min_spacing_spin  = None
-        self._spacing_warn_lbl  = None
+        self._fixed_port_combos  = []
+        self._min_spacing_spin   = None
+        self._spacing_warn_lbl   = None
+        self._exclude_prev_chk   = None
 
         if mode == "Fixed":
             # One row per reward: "Reward N → Port [combo]"
@@ -432,6 +415,11 @@ class ProtocolPage(QtWidgets.QWidget):
             self._spacing_warn_lbl.setStyleSheet("color:#aaa; font-size:10px;")
             dist_layout.addWidget(self._spacing_warn_lbl)
 
+            self._exclude_prev_chk = QtWidgets.QCheckBox(
+                "Exclude reward locations used in previous sessions")
+            self._exclude_prev_chk.setStyleSheet("font-size:10px;")
+            dist_layout.addWidget(self._exclude_prev_chk)
+
             self._min_spacing_spin.valueChanged.connect(self._update_spacing_warning)
             self._update_spacing_warning()
 
@@ -461,16 +449,8 @@ class ProtocolPage(QtWidgets.QWidget):
             self._led_mode_combo.currentText() == self._LED_MODE_LABELS["neighbors"])
 
     def _update_trial_widgets(self):
-        is_time = self._trial_end_combo.currentText() == "Time"
-        self._trial_time_widget.setVisible(is_time)
-        self._trial_coll_widget.setVisible(not is_time)
-        self._update_trial_coll_note()
-
-    def _update_trial_coll_note(self):
-        n = int(self._count_combo.currentText())
-        if hasattr(self, "_trial_coll_spin"):
-            self._trial_coll_spin.setMaximum(n)
-            self._trial_coll_note.setText(f"(max {n}, based on reward count)")
+        self._trial_time_widget.setVisible(
+            self._trial_end_combo.currentText() == "Fixed time")
 
     # ── Protocol dict I/O ─────────────────────────────────────────────────────
 
@@ -494,14 +474,21 @@ class ProtocolPage(QtWidgets.QWidget):
             }
             dist = {"type": "fixed", "fixed_map": fixed_map, "min_spacing": 4}
         else:
-            spacing = self._min_spacing_spin.value() if self._min_spacing_spin else 4
-            dist = {"type": "random", "fixed_map": {}, "min_spacing": spacing}
+            spacing          = self._min_spacing_spin.value() if self._min_spacing_spin else 4
+            exclude_previous = (self._exclude_prev_chk.isChecked()
+                                if self._exclude_prev_chk else False)
+            dist = {
+                "type":             "random",
+                "min_spacing":      spacing,
+                "exclude_previous": exclude_previous,
+            }
 
         led_key = self._LED_MODE_KEYS.get(
             self._led_mode_combo.currentText(), "reward_only")
 
         sess_type = "time" if self._sess_type_combo.currentText() == "Time" else "trials"
-        end_type  = "time" if self._trial_end_combo.currentText() == "Time" else "collections"
+        end_type  = ("time" if self._trial_end_combo.currentText() == "Fixed time"
+                     else "all_rewards")
 
         return {
             "session": {
@@ -509,16 +496,15 @@ class ProtocolPage(QtWidgets.QWidget):
                 "length": self._sess_length_spin.value(),
             },
             "rewards": {
-                "count":        n,
-                "configs":      configs,
-                "distribution": dist,
-                "led_mode":     led_key,
+                "count":         n,
+                "configs":       configs,
+                "distribution":  dist,
+                "led_mode":      led_key,
                 "led_neighbors": self._led_neighbors_spin.value(),
             },
             "trial": {
-                "end_type":             end_type,
-                "duration_s":           self._trial_dur_spin.value(),
-                "required_collections": self._trial_coll_spin.value(),
+                "end_type":   end_type,
+                "duration_s": self._trial_dur_spin.value(),
             },
             "beamer":  None,
             "screens": None,
@@ -573,6 +559,9 @@ class ProtocolPage(QtWidgets.QWidget):
         else:
             if self._min_spacing_spin is not None:
                 self._min_spacing_spin.setValue(int(dist.get("min_spacing", 4)))
+            if self._exclude_prev_chk is not None:
+                self._exclude_prev_chk.setChecked(
+                    bool(dist.get("exclude_previous", False)))
             self._update_spacing_warning()
 
         # ── LED ──────────────────────────────────────────────────
@@ -590,12 +579,10 @@ class ProtocolPage(QtWidgets.QWidget):
         end_type = trial.get("end_type", "time")
         self._trial_end_combo.blockSignals(True)
         self._trial_end_combo.setCurrentText(
-            "Time" if end_type == "time" else "Collections")
+            "Fixed time" if end_type in ("time", "fixed") else "All rewards collected")
         self._trial_end_combo.blockSignals(False)
         self._trial_dur_spin.setValue(int(trial.get("duration_s", 30)))
-        self._trial_coll_spin.setValue(int(trial.get("required_collections", 1)))
         self._update_trial_widgets()
-        self._update_trial_coll_note()
 
     # ── File operations ───────────────────────────────────────────────────────
 

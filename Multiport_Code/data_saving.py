@@ -38,29 +38,33 @@ class data_saver:
 
         print(f"Saving Data for {mouse_id} in Cohort {cohort_id}, Session: {session_id} at {data_path}")
         # saving loop, constantly checking if data should still be saved
-        loop = True
-        dataframe = pd.DataFrame({'Timestamp':[],'Sensors':[], 'DLCStuff':[]})
-        while loop:
+        dataframe = pd.DataFrame({'Timestamp': [], 'Sensors': [], 'DLCStuff': []})
+        while True:
             if not self.running:
-                #wrap up saving
-                loop = False
-                dataframe.to_csv(f"{recording_folder}/{recording_id}_Data")
+                # Session ended — flush dataframe to disk and exit
+                dataframe.to_csv(f"{recording_folder}/{recording_id}_Data.csv")
+                break
             try:
-                current_timestamp = self.timestamp.get(timeout= 0.05)
-            except:
+                current_timestamp = self.timestamp.get(timeout=0.05)
+            except Exception:
                 current_timestamp = None
-                print("Dropped Timestamp: Timeout reached.")    
             sensor_data_copy = None
-            dlc_data_copy = None
-            if camera_flag.value:
-                np.save(f"{recording_folder}/Image_Arrays/{current_timestamp}.npy", np.array(self.camera_data.get()).copy())
-            elif sensor_flag.value:
+            dlc_data_copy    = None
+            # Each flag is checked independently so all enabled streams are captured
+            if camera_flag.value and current_timestamp is not None:
+                np.save(f"{recording_folder}/Image_Arrays/{current_timestamp}.npy",
+                        np.array(self.camera_data.get()).copy())
+            if sensor_flag.value:
                 sensor_data_copy = np.array(self.sensor_data).copy()
-            elif dlc_flag.value:
+            if dlc_flag.value:
                 dlc_data_copy = np.array(self.dlc_data).copy()
-            new_row = pd.DataFrame({'Timestamp':[current_timestamp], 'Sensors':[sensor_data_copy], 'DLCStuff':[dlc_data_copy]})
-            dataframe =  pd.concat([dataframe, new_row]).reset_index(drop=True)
-            # sampling rate = 20Hz
+            new_row = pd.DataFrame({
+                'Timestamp': [current_timestamp],
+                'Sensors':   [sensor_data_copy],
+                'DLCStuff':  [dlc_data_copy],
+            })
+            dataframe = pd.concat([dataframe, new_row]).reset_index(drop=True)
+            # sampling rate = 20 Hz
             sleep(0.05)
 
 

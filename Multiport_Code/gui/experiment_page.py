@@ -32,8 +32,9 @@ class ExperimentPage(QtWidgets.QWidget):
         self._sm_active    = data_sources.get("sm_active")
         self._sm_stop      = data_sources.get("sm_stop")
         self._session_done = data_sources.get("session_done")
-        self._protocol_queue   = data_sources.get("protocol_queue")
-        self._loaded_protocol  = None   # dict set by _browse_protocol()
+        self._protocol_queue    = data_sources.get("protocol_queue")
+        self._loaded_protocol   = None   # dict set by _browse_protocol()
+        self._loaded_protocol_path = None  # filesystem path of loaded file
 
         # Saving-process handles.  All Value objects must be kept alive here:
         # if they go out of scope the GC calls sem_unlink, destroying the POSIX
@@ -274,6 +275,7 @@ class ExperimentPage(QtWidgets.QWidget):
             self._proto_summary.setVisible(False)
             return
 
+        self._loaded_protocol_path = path
         self._proto_path_lbl.setText(path)
         self._show_protocol_summary()
 
@@ -298,12 +300,12 @@ class ExperimentPage(QtWidgets.QWidget):
         self._sum_rewards.setText(f"Rewards: {cnt}  ({dist} distribution)")
 
         # Trial line
-        trial    = d.get("trial", {})
-        t_type   = trial.get("end_type", "?")
+        trial  = d.get("trial", {})
+        t_type = trial.get("end_type", "?")
         if t_type == "time":
             t_detail = f"{trial.get('duration_s', '?')} s per trial"
         else:
-            t_detail = f"{trial.get('required_collections', '?')} collections per trial"
+            t_detail = "ends when all rewards collected"
         self._sum_trial.setText(f"Trial: {t_detail}")
 
         self._proto_summary.setVisible(True)
@@ -320,6 +322,15 @@ class ExperimentPage(QtWidgets.QWidget):
             self._rec_status.setText("Load a protocol first.")
             return
 
+        # Attach session metadata so the SM can write the mouse log.
+        protocol_to_send = dict(self._loaded_protocol)
+        protocol_to_send["_meta"] = {
+            "cohort_id":     cohort,
+            "mouse_id":      mouse,
+            "session_id":    session,
+            "protocol_path": self._loaded_protocol_path or "",
+        }
+
         # Drain any stale entry from a previous run, then push the current protocol.
         if self._protocol_queue is not None:
             while not self._protocol_queue.empty():
@@ -327,7 +338,7 @@ class ExperimentPage(QtWidgets.QWidget):
                     self._protocol_queue.get_nowait()
                 except Exception:
                     pass
-            self._protocol_queue.put_nowait(self._loaded_protocol)
+            self._protocol_queue.put_nowait(protocol_to_send)
 
         # Start saving process
         ds = self._data_sources

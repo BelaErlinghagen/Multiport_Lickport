@@ -6,21 +6,31 @@
   "rewards": {
     "count": 2,
     "configs": [
-      {"id": 1, "duration_ms": 500, "probability": 1.0},
-      {"id": 2, "duration_ms": 500, "probability": 1.0}
+      {
+        "id": 1,
+        "duration_ms": 10,
+        "probability": 1.0
+      },
+      {
+        "id": 2,
+        "duration_ms": 10,
+        "probability": 1.0
+      }
     ],
     "distribution": {
       "type": "fixed",
-      "fixed_map": {"1": 1, "2": 9},
+      "fixed_map": {
+        "1": 1,
+        "2": 14
+      },
       "min_spacing": 4
     },
     "led_mode": "reward_only",
     "led_neighbors": 1
   },
   "trial": {
-    "end_type": "time",
-    "duration_s": 30,
-    "required_collections": 1
+    "end_type": "all_rewards",
+    "duration_s": 30
   },
   "beamer": null,
   "screens": null

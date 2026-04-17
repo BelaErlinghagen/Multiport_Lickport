@@ -22,9 +22,12 @@ Session flow:
   (ITI between trials will be added in a future step)
 """
 
+import json
+import os
 import random
 import signal
 import time
+from datetime import datetime
 
 _CIRCLE_SIZE = 16   # total number of ports in the circular array
 
@@ -70,6 +73,43 @@ class StateMachine:
             self._send(f"LED:{i}:OFF")
             self._send(f"MOS:{i}:OFF:0")
 
+    # ── Mouse session log ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _mouse_json_path(protocol: dict) -> str | None:
+        """Return path to {mouse_id}.json inside the mouse folder, or None."""
+        meta = protocol.get("_meta", {})
+        cohort = meta.get("cohort_id", "")
+        mouse  = meta.get("mouse_id", "")
+        if not cohort or not mouse:
+            return None
+        try:
+            from shared_states import data_path
+        except Exception:
+            return None
+        return os.path.join(data_path, cohort, mouse, f"{mouse}.json")
+
+    @staticmethod
+    def _load_mouse_log(path: str) -> dict:
+        """Load the mouse JSON log, returning an empty skeleton on missing/corrupt file."""
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as fh:
+                    return json.load(fh)
+            except Exception:
+                pass
+        return {"sessions": []}
+
+    @staticmethod
+    def _save_mouse_log(path: str, log: dict):
+        """Write the mouse JSON log to disk, creating parent dirs if needed."""
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                json.dump(log, fh, indent=2)
+        except Exception as exc:
+            print(f"[StateMachine] WARNING: could not save mouse log: {exc}")
+
     # ── Reward location assignment ────────────────────────────────────────────
 
     def _assign_locations(self, protocol: dict) -> dict | None:
@@ -77,15 +117,38 @@ class StateMachine:
         dist = protocol["rewards"]["distribution"]
         if dist["type"] == "fixed":
             return {int(k): int(v) for k, v in dist["fixed_map"].items()}
+
+        # Collect ports to exclude when the user enabled "exclude previous locations"
+        excluded: set[int] = set()
+        if dist.get("exclude_previous", False):
+            json_path = self._mouse_json_path(protocol)
+            if json_path:
+                log = self._load_mouse_log(json_path)
+                for sess in log.get("sessions", []):
+                    excluded.update(int(p) for p in sess.get("reward_ports", []))
+                if excluded:
+                    print(f"[StateMachine] Excluding previously used ports: {sorted(excluded)}")
+
         return self._random_locations(
             protocol["rewards"]["count"],
             int(dist.get("min_spacing", 4)),
+            excluded,
         )
 
-    def _random_locations(self, count: int, min_spacing: int) -> dict | None:
-        """Randomly assign *count* rewards to ports respecting circular spacing."""
+    def _random_locations(self, count: int, min_spacing: int,
+                          excluded: set | None = None) -> dict | None:
+        """Randomly assign *count* rewards to ports respecting circular spacing.
+
+        Ports in *excluded* are never chosen.
+        """
+        excluded = excluded or set()
+        available = [p for p in range(1, _CIRCLE_SIZE + 1) if p not in excluded]
+        if len(available) < count:
+            print(f"[StateMachine] Not enough available ports "
+                  f"({len(available)} free, {count} needed after exclusions).")
+            return None
         for _ in range(2000):
-            ports = random.sample(range(1, _CIRCLE_SIZE + 1), count)
+            ports = random.sample(available, count)
             if self._check_spacing(ports, min_spacing):
                 return {i + 1: ports[i] for i in range(count)}
         return None   # infeasible with given constraints
@@ -147,10 +210,6 @@ class StateMachine:
         trial_conf  = protocol["trial"]
         end_type    = trial_conf["end_type"]
         duration    = float(trial_conf.get("duration_s", 30))
-        req_collect = min(
-            int(trial_conf.get("required_collections", len(reward_ports))),
-            len(reward_ports),
-        )
 
         collected   = set()
         trial_start = time.monotonic()
@@ -165,7 +224,7 @@ class StateMachine:
             # ── Trial end conditions ──────────────────────────────
             if end_type == "time" and time.monotonic() - trial_start >= duration:
                 break
-            if end_type == "collections" and len(collected) >= req_collect:
+            if end_type == "all_rewards" and len(collected) >= len(reward_ports):
                 break
 
             # ── Sensor polling ────────────────────────────────────
@@ -186,8 +245,7 @@ class StateMachine:
                         print(f"[StateMachine] Trial {trial_num}: "
                               f"contact at port {port} — probability miss (p={prob:.2f})")
 
-                    # LED off and mark collected regardless of probability outcome
-                    self._send(f"LED:{port}:OFF")
+                    # Mark collected; LED stays on until end of trial
                     collected.add(port)
 
             time.sleep(0.02)
@@ -207,6 +265,9 @@ class StateMachine:
 
         Assigns reward locations, then cycles through trials until the session
         end condition is met or a stop flag is raised.
+
+        Writes a session entry to {mouse_id}.json at start; updates it with the
+        end time on completion.
         """
         reward_locations = self._assign_locations(protocol)
         if reward_locations is None:
@@ -217,9 +278,37 @@ class StateMachine:
             session_done.value = True
             return
 
-        print(f"[StateMachine] Session started.  "
-              f"Reward locations: {reward_locations}")
+        reward_ports = sorted(reward_locations.values())
+        print(f"[StateMachine] Session started.  Reward locations: {reward_locations}")
 
+        # ── Write session start to mouse log ─────────────────────────────────
+        meta       = protocol.get("_meta", {})
+        session_id = meta.get("session_id", "")
+        now        = datetime.now()
+        start_str  = now.strftime("%H:%M:%S")
+        date_str   = now.strftime("%Y-%m-%d")
+
+        # Strip internal _meta key before storing the protocol in the log
+        protocol_clean = {k: v for k, v in protocol.items() if k != "_meta"}
+
+        session_entry = {
+            "session_id":    session_id,
+            "date":          date_str,
+            "start_time":    start_str,
+            "end_time":      None,
+            "protocol_path": meta.get("protocol_path", ""),
+            "protocol":      protocol_clean,
+            "reward_ports":  reward_ports,
+        }
+
+        json_path = self._mouse_json_path(protocol)
+        if json_path:
+            log = self._load_mouse_log(json_path)
+            log.setdefault("mouse_id", meta.get("mouse_id", ""))
+            log["sessions"].append(session_entry)
+            self._save_mouse_log(json_path, log)
+
+        # ── Session loop ──────────────────────────────────────────────────────
         sess_type   = protocol["session"]["type"]
         sess_length = protocol["session"]["length"]
         sess_start  = time.monotonic()
@@ -244,6 +333,17 @@ class StateMachine:
             # ITI placeholder — inter-trial interval will be added in a future step
 
         self._all_off()
+
+        # ── Update session log with end time ──────────────────────────────────
+        if json_path:
+            end_str = datetime.now().strftime("%H:%M:%S")
+            log = self._load_mouse_log(json_path)
+            for entry in reversed(log.get("sessions", [])):
+                if (entry.get("session_id") == session_id
+                        and entry.get("start_time") == start_str):
+                    entry["end_time"] = end_str
+                    break
+            self._save_mouse_log(json_path, log)
 
         if stopped:
             print(f"[StateMachine] Session stopped after {trial_num} trial(s).")
