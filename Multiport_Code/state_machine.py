@@ -18,8 +18,7 @@ Inter-process communication (all multiprocessing objects):
                                ExperimentPage can auto-stop recording.
 
 Session flow:
-  IDLE  →  (sm_active=True)  →  [TRIAL] × N  →  DONE / STOPPED  →  IDLE
-  (ITI between trials will be added in a future step)
+  IDLE  →  (sm_active=True)  →  [TRIAL → ITI] × N  →  DONE / STOPPED  →  IDLE
 """
 
 import json
@@ -42,9 +41,10 @@ class StateMachine:
         BNC:id:PULSE:duration_ms
     """
 
-    def __init__(self, command_queue, sensor_array):
+    def __init__(self, command_queue, sensor_array, pose_queue=None):
         self.command_queue = command_queue
         self.sensor_array  = sensor_array   # multiprocessing.Array('i', 16)
+        self.pose_queue    = pose_queue     # optional Queue for DLC-based ITI
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -258,6 +258,92 @@ class StateMachine:
               f"({len(collected)}/{len(reward_ports)} collected)")
         return True
 
+    # ── Intertrial interval ───────────────────────────────────────────────────
+
+    def _run_iti(self, iti_config: dict, sm_stop, sm_active) -> bool:
+        """Run the intertrial interval between two trials.
+
+        Returns True on normal completion, False if a stop flag fires.
+
+        Three modes driven by iti_config["type"]:
+          "time"          — fixed sleep
+          "fixed_region"  — wait until DLC centroid dwells inside a fixed circle
+          "random_region" — same but circle center is randomised inside a margin circle
+        """
+        import math
+        iti_type = iti_config.get("type", "time")
+
+        if iti_type == "time":
+            return self._sleep(float(iti_config.get("duration_s", 3.0)), sm_stop, sm_active)
+
+        # ── DLC-based ITI ─────────────────────────────────────────────────────
+        if iti_type == "fixed_region":
+            reg  = iti_config.get("region", {})
+            cx_n = float(reg.get("x", 0.5))
+            cy_n = float(reg.get("y", 0.5))
+            r_n  = float(reg.get("radius", 0.1))
+            dur_cfg = reg
+        else:  # random_region
+            rnd  = iti_config.get("random_region", {})
+            r_n  = float(rnd.get("radius", 0.1))
+            angle = random.uniform(0, 2 * math.pi)
+            dist  = random.uniform(0, float(rnd.get("margin_radius", 0.3)))
+            cx_n  = float(rnd.get("margin_x", 0.5)) + dist * math.cos(angle)
+            cy_n  = float(rnd.get("margin_y", 0.5)) + dist * math.sin(angle)
+            dur_cfg = rnd
+
+        dur_type = dur_cfg.get("duration_type", "fixed")
+        required_s = (float(dur_cfg.get("duration_s", 2.0)) if dur_type == "fixed"
+                      else random.uniform(0, float(dur_cfg.get("duration_max_s", 3.0))))
+
+        try:
+            from shared_states import IMG_HEIGHT
+            img_size = IMG_HEIGHT
+        except Exception:
+            img_size = 2160
+
+        cx_px = cx_n * img_size
+        cy_px = cy_n * img_size
+        r_px  = r_n  * img_size
+        _THRESH = 0.5
+        in_region_since = None
+
+        print(f"[StateMachine] ITI ({iti_type}): waiting for mouse at "
+              f"({cx_n:.2f}, {cy_n:.2f}) r={r_n:.2f} for {required_s:.1f} s")
+
+        while True:
+            if sm_stop.value or not sm_active.value:
+                return False
+
+            if self.pose_queue is not None:
+                pose = None
+                try:
+                    pose = self.pose_queue.get_nowait()
+                except Exception:
+                    pass
+
+                if pose is not None:
+                    pts = [(float(kp[0]), float(kp[1]))
+                           for kp in pose if float(kp[2]) > _THRESH]
+                    if pts:
+                        cx_e = sum(p[0] for p in pts) / len(pts)
+                        cy_e = sum(p[1] for p in pts) / len(pts)
+                        in_r = ((cx_e - cx_px) ** 2 + (cy_e - cy_px) ** 2) ** 0.5 <= r_px
+                    else:
+                        in_r = False   # no keypoints above threshold → position unknown
+
+                    now = time.monotonic()
+                    if in_r:
+                        if in_region_since is None:
+                            in_region_since = now
+                        elif now - in_region_since >= required_s:
+                            print("[StateMachine] ITI complete — mouse in region.")
+                            return True
+                    else:
+                        in_region_since = None
+
+            time.sleep(0.02)
+
     # ── Session ───────────────────────────────────────────────────────────────
 
     def run(self, protocol: dict, sm_active, sm_stop, session_done):
@@ -330,7 +416,16 @@ class StateMachine:
                 stopped = True
                 break
 
-            # ITI placeholder — inter-trial interval will be added in a future step
+            # Run ITI only if the session will continue after this trial
+            session_continues = (
+                (sess_type == "time"   and time.monotonic() - sess_start < sess_length) or
+                (sess_type == "trials" and trial_num < sess_length)
+            )
+            if session_continues:
+                iti_config = protocol.get("intertrial", {"type": "time", "duration_s": 3.0})
+                if not self._run_iti(iti_config, sm_stop, sm_active):
+                    stopped = True
+                    break
 
         self._all_off()
 
@@ -355,7 +450,8 @@ class StateMachine:
 # ── Process entry point ───────────────────────────────────────────────────────
 
 def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
-                           sensor_array, protocol_queue, session_done):
+                           sensor_array, protocol_queue, session_done,
+                           pose_sm_queue=None):
     """Long-running process that hosts the StateMachine.
 
     Lifecycle:
@@ -374,7 +470,7 @@ def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
         sm_running.value = False
     signal.signal(signal.SIGTERM, _handle_term)
 
-    machine = StateMachine(command_queue, sensor_array)
+    machine = StateMachine(command_queue, sensor_array, pose_queue=pose_sm_queue)
     print("[StateMachine] Process ready — waiting for activation.")
 
     while sm_running.value:

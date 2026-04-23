@@ -95,7 +95,14 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
             left_layout.addWidget(self.tabs)
 
             # ── RIGHT: camera + sensors ───────────────────────────
-            self.camera = CameraWidget(shared_image, shape)
+            self.camera = CameraWidget(
+                shared_image, shape,
+                pose_display_queue=(data_sources or {}).get("pose_display_queue"),
+            )
+
+            # Wire ITI region overlay: ProtocolPage → CameraWidget
+            page_protocol.overlay_changed.connect(self.camera.set_iti_overlay)
+
             self.sensors = SensorWidget(sensor_array)
 
             reset_btn = QtWidgets.QPushButton("Reset counts")

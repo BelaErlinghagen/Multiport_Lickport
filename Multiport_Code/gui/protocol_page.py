@@ -13,16 +13,24 @@ Section layout (inside a QScrollArea):
       • Beamer placeholder
       • Screens placeholder
   ── Trial ───────────────────────────────────────────────────────
+  ── Intertrial Interval ──────────────────────────────────────────
+      • Fixed time  OR  Fixed region  OR  Random region
+      • Region settings shown as live overlay on the camera preview
 """
 
 import json
 import os
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import pyqtSignal
 
 
 class ProtocolPage(QtWidgets.QWidget):
     """Full-featured protocol editor."""
+
+    # Emitted whenever the ITI region overlay should change.
+    # Carries a dict (fixed_region / random_region) or None to clear.
+    overlay_changed = pyqtSignal(object)
 
     # ── Default protocol ──────────────────────────────────────────────────────
     DEFAULT_PROTOCOL = {
@@ -44,6 +52,23 @@ class ProtocolPage(QtWidgets.QWidget):
         "trial": {
             "end_type": "time",
             "duration_s": 30,
+        },
+        "intertrial": {
+            "type": "time",
+            "duration_s": 5.0,
+            "region": {
+                "x": 0.5, "y": 0.5, "radius": 0.1,
+                "duration_type": "fixed",
+                "duration_s": 2.0,
+                "duration_max_s": 3.0,
+            },
+            "random_region": {
+                "radius": 0.1,
+                "margin_x": 0.5, "margin_y": 0.5, "margin_radius": 0.3,
+                "duration_type": "fixed",
+                "duration_s": 2.0,
+                "duration_max_s": 3.0,
+            },
         },
         "beamer": None,
         "screens": None,
@@ -69,6 +94,27 @@ class ProtocolPage(QtWidgets.QWidget):
         self._fixed_port_combos: list[QtWidgets.QComboBox] = []
         self._min_spacing_spin: QtWidgets.QSpinBox | None = None
         self._spacing_warn_lbl: QtWidgets.QLabel | None   = None
+
+        # ITI widget refs (nullable; reset each time _rebuild_iti_section runs)
+        self._iti_type_combo: QtWidgets.QComboBox | None = None        # static (set once in _build_ui)
+        self._iti_time_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_reg_x_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_reg_y_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_reg_radius_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_reg_dur_type: QtWidgets.QComboBox | None = None
+        self._iti_reg_dur_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_reg_dur_max_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_reg_dur_fixed_w: QtWidgets.QWidget | None = None
+        self._iti_reg_dur_max_w: QtWidgets.QWidget | None = None
+        self._iti_rnd_radius_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_rnd_margin_x_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_rnd_margin_y_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_rnd_margin_radius_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_rnd_dur_type: QtWidgets.QComboBox | None = None
+        self._iti_rnd_dur_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_rnd_dur_max_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._iti_rnd_dur_fixed_w: QtWidgets.QWidget | None = None
+        self._iti_rnd_dur_max_w: QtWidgets.QWidget | None = None
 
         self._build_ui()
         self._apply_protocol(self.DEFAULT_PROTOCOL)
@@ -256,6 +302,28 @@ class ProtocolPage(QtWidgets.QWidget):
         # Connect reward count and distribution type to rebuilds
         self._count_combo.currentIndexChanged.connect(self._rebuild_reward_section)
         self._dist_type_combo.currentIndexChanged.connect(self._rebuild_dist_section)
+
+        sl.addWidget(self._make_separator())
+
+        # ── Intertrial Interval ───────────────────────────────────
+        sl.addWidget(self._section_label("Intertrial Interval"))
+
+        iti_type_row = QtWidgets.QHBoxLayout()
+        iti_type_row.addWidget(QtWidgets.QLabel("Type:"))
+        self._iti_type_combo = QtWidgets.QComboBox()
+        self._iti_type_combo.addItems(["Fixed time", "Fixed region", "Random region"])
+        self._iti_type_combo.setFixedWidth(150)
+        iti_type_row.addWidget(self._iti_type_combo)
+        iti_type_row.addStretch()
+        sl.addLayout(iti_type_row)
+
+        self._iti_container = QtWidgets.QWidget()
+        self._iti_container.setLayout(QtWidgets.QVBoxLayout())
+        self._iti_container.layout().setContentsMargins(8, 2, 0, 0)
+        self._iti_container.layout().setSpacing(4)
+        sl.addWidget(self._iti_container)
+
+        self._iti_type_combo.currentTextChanged.connect(self._rebuild_iti_section)
 
         sl.addStretch()
 
@@ -452,6 +520,166 @@ class ProtocolPage(QtWidgets.QWidget):
         self._trial_time_widget.setVisible(
             self._trial_end_combo.currentText() == "Fixed time")
 
+    # ── ITI section ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_norm_spin(val: float = 0.5, lo: float = 0.0,
+                        hi: float = 1.0) -> QtWidgets.QDoubleSpinBox:
+        """Return a QDoubleSpinBox for normalised (0-1) coordinates."""
+        sb = QtWidgets.QDoubleSpinBox()
+        sb.setRange(lo, hi)
+        sb.setSingleStep(0.01)
+        sb.setDecimals(2)
+        sb.setValue(val)
+        sb.setFixedWidth(80)
+        return sb
+
+    @staticmethod
+    def _make_dur_spin(val: float = 2.0, suffix: str = " s") -> QtWidgets.QDoubleSpinBox:
+        sb = QtWidgets.QDoubleSpinBox()
+        sb.setRange(0.1, 600)
+        sb.setSingleStep(0.5)
+        sb.setDecimals(1)
+        sb.setValue(val)
+        sb.setSuffix(suffix)
+        sb.setFixedWidth(90)
+        return sb
+
+    @staticmethod
+    def _labeled_row(label: str, widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
+        """Return a QWidget containing a right-padded label + widget on one row."""
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lbl = QtWidgets.QLabel(label)
+        lbl.setFixedWidth(140)
+        lay.addWidget(lbl)
+        lay.addWidget(widget)
+        lay.addStretch()
+        return w
+
+    def _rebuild_iti_section(self):
+        """Rebuild the ITI container to match the currently selected ITI type."""
+        self._clear_widget(self._iti_container)
+        layout = self._iti_container.layout()
+
+        # Reset all nullable refs
+        (self._iti_time_spin, self._iti_reg_x_spin, self._iti_reg_y_spin,
+         self._iti_reg_radius_spin, self._iti_reg_dur_type, self._iti_reg_dur_spin,
+         self._iti_reg_dur_max_spin, self._iti_reg_dur_fixed_w, self._iti_reg_dur_max_w,
+         self._iti_rnd_radius_spin, self._iti_rnd_margin_x_spin, self._iti_rnd_margin_y_spin,
+         self._iti_rnd_margin_radius_spin, self._iti_rnd_dur_type, self._iti_rnd_dur_spin,
+         self._iti_rnd_dur_max_spin, self._iti_rnd_dur_fixed_w,
+         self._iti_rnd_dur_max_w) = (None,) * 18
+
+        iti_type = self._iti_type_combo.currentText() if self._iti_type_combo else "Fixed time"
+
+        if iti_type == "Fixed time":
+            self._iti_time_spin = self._make_dur_spin(5.0)
+            layout.addWidget(self._labeled_row("Duration:", self._iti_time_spin))
+            self._iti_time_spin.valueChanged.connect(self._emit_overlay)
+
+        elif iti_type == "Fixed region":
+            self._iti_reg_x_spin      = self._make_norm_spin(0.5)
+            self._iti_reg_y_spin      = self._make_norm_spin(0.5)
+            self._iti_reg_radius_spin = self._make_norm_spin(0.10, 0.01, 0.5)
+            layout.addWidget(self._labeled_row("Position X (0–1):", self._iti_reg_x_spin))
+            layout.addWidget(self._labeled_row("Position Y (0–1):", self._iti_reg_y_spin))
+            layout.addWidget(self._labeled_row("Radius (0–0.5):",   self._iti_reg_radius_spin))
+
+            layout.addWidget(self._sublabel("Dwell time"))
+            self._iti_reg_dur_type = QtWidgets.QComboBox()
+            self._iti_reg_dur_type.addItems(["Fixed", "Random (0 – max)"])
+            self._iti_reg_dur_type.setFixedWidth(160)
+            layout.addWidget(self._labeled_row("Duration type:", self._iti_reg_dur_type))
+
+            self._iti_reg_dur_spin     = self._make_dur_spin(2.0)
+            self._iti_reg_dur_max_spin = self._make_dur_spin(3.0)
+            self._iti_reg_dur_fixed_w  = self._labeled_row("Duration:", self._iti_reg_dur_spin)
+            self._iti_reg_dur_max_w    = self._labeled_row("Max duration:", self._iti_reg_dur_max_spin)
+            layout.addWidget(self._iti_reg_dur_fixed_w)
+            layout.addWidget(self._iti_reg_dur_max_w)
+
+            self._iti_reg_dur_type.currentTextChanged.connect(self._update_iti_dur_visibility)
+            for w in (self._iti_reg_x_spin, self._iti_reg_y_spin, self._iti_reg_radius_spin,
+                      self._iti_reg_dur_spin, self._iti_reg_dur_max_spin):
+                w.valueChanged.connect(self._emit_overlay)
+            self._update_iti_dur_visibility()
+
+        else:  # Random region
+            self._iti_rnd_radius_spin       = self._make_norm_spin(0.10, 0.01, 0.5)
+            layout.addWidget(self._labeled_row("Target radius (0–0.5):", self._iti_rnd_radius_spin))
+
+            layout.addWidget(self._sublabel("Margin circle (where target center can fall)"))
+            self._iti_rnd_margin_x_spin      = self._make_norm_spin(0.5)
+            self._iti_rnd_margin_y_spin      = self._make_norm_spin(0.5)
+            self._iti_rnd_margin_radius_spin = self._make_norm_spin(0.30, 0.01, 1.0)
+            layout.addWidget(self._labeled_row("Margin center X:", self._iti_rnd_margin_x_spin))
+            layout.addWidget(self._labeled_row("Margin center Y:", self._iti_rnd_margin_y_spin))
+            layout.addWidget(self._labeled_row("Margin radius:",   self._iti_rnd_margin_radius_spin))
+
+            layout.addWidget(self._sublabel("Dwell time"))
+            self._iti_rnd_dur_type = QtWidgets.QComboBox()
+            self._iti_rnd_dur_type.addItems(["Fixed", "Random (0 – max)"])
+            self._iti_rnd_dur_type.setFixedWidth(160)
+            layout.addWidget(self._labeled_row("Duration type:", self._iti_rnd_dur_type))
+
+            self._iti_rnd_dur_spin     = self._make_dur_spin(2.0)
+            self._iti_rnd_dur_max_spin = self._make_dur_spin(3.0)
+            self._iti_rnd_dur_fixed_w  = self._labeled_row("Duration:", self._iti_rnd_dur_spin)
+            self._iti_rnd_dur_max_w    = self._labeled_row("Max duration:", self._iti_rnd_dur_max_spin)
+            layout.addWidget(self._iti_rnd_dur_fixed_w)
+            layout.addWidget(self._iti_rnd_dur_max_w)
+
+            self._iti_rnd_dur_type.currentTextChanged.connect(self._update_iti_dur_visibility)
+            for w in (self._iti_rnd_radius_spin, self._iti_rnd_margin_x_spin,
+                      self._iti_rnd_margin_y_spin, self._iti_rnd_margin_radius_spin,
+                      self._iti_rnd_dur_spin, self._iti_rnd_dur_max_spin):
+                w.valueChanged.connect(self._emit_overlay)
+            self._update_iti_dur_visibility()
+
+        self._emit_overlay()
+
+    def _update_iti_dur_visibility(self):
+        """Show either the fixed or max-duration row based on the dwell-type combo."""
+        # Fixed region
+        if self._iti_reg_dur_type is not None:
+            fixed = self._iti_reg_dur_type.currentText() == "Fixed"
+            if self._iti_reg_dur_fixed_w:
+                self._iti_reg_dur_fixed_w.setVisible(fixed)
+            if self._iti_reg_dur_max_w:
+                self._iti_reg_dur_max_w.setVisible(not fixed)
+        # Random region
+        if self._iti_rnd_dur_type is not None:
+            fixed = self._iti_rnd_dur_type.currentText() == "Fixed"
+            if self._iti_rnd_dur_fixed_w:
+                self._iti_rnd_dur_fixed_w.setVisible(fixed)
+            if self._iti_rnd_dur_max_w:
+                self._iti_rnd_dur_max_w.setVisible(not fixed)
+
+    def _emit_overlay(self, *_):
+        """Emit overlay_changed signal so CameraWidget can draw the ITI region."""
+        if self._iti_type_combo is None:
+            return
+        iti_type = self._iti_type_combo.currentText()
+        if iti_type == "Fixed time":
+            self.overlay_changed.emit(None)
+        elif iti_type == "Fixed region" and self._iti_reg_x_spin is not None:
+            self.overlay_changed.emit({
+                "type":   "fixed_region",
+                "x":      self._iti_reg_x_spin.value(),
+                "y":      self._iti_reg_y_spin.value(),
+                "radius": self._iti_reg_radius_spin.value(),
+            })
+        elif iti_type == "Random region" and self._iti_rnd_radius_spin is not None:
+            self.overlay_changed.emit({
+                "type":          "random_region",
+                "radius":        self._iti_rnd_radius_spin.value(),
+                "margin_x":      self._iti_rnd_margin_x_spin.value(),
+                "margin_y":      self._iti_rnd_margin_y_spin.value(),
+                "margin_radius": self._iti_rnd_margin_radius_spin.value(),
+            })
+
     # ── Protocol dict I/O ─────────────────────────────────────────────────────
 
     def build_protocol_dict(self) -> dict:
@@ -490,6 +718,41 @@ class ProtocolPage(QtWidgets.QWidget):
         end_type  = ("time" if self._trial_end_combo.currentText() == "Fixed time"
                      else "all_rewards")
 
+        # ── Intertrial ────────────────────────────────────────────
+        iti_type = self._iti_type_combo.currentText() if self._iti_type_combo else "Fixed time"
+        # Always include all three sub-configs so round-trips preserve values
+        # when the user switches type and back.
+        def _get(spin, fallback):
+            return spin.value() if spin is not None else fallback
+
+        iti = {
+            "type":      {"Fixed time": "time",
+                          "Fixed region": "fixed_region",
+                          "Random region": "random_region"}.get(iti_type, "time"),
+            "duration_s": _get(self._iti_time_spin, 5.0),
+            "region": {
+                "x":            _get(self._iti_reg_x_spin, 0.5),
+                "y":            _get(self._iti_reg_y_spin, 0.5),
+                "radius":       _get(self._iti_reg_radius_spin, 0.1),
+                "duration_type": ("fixed" if (self._iti_reg_dur_type is None or
+                                              self._iti_reg_dur_type.currentText() == "Fixed")
+                                  else "random"),
+                "duration_s":     _get(self._iti_reg_dur_spin, 2.0),
+                "duration_max_s": _get(self._iti_reg_dur_max_spin, 3.0),
+            },
+            "random_region": {
+                "radius":        _get(self._iti_rnd_radius_spin, 0.1),
+                "margin_x":      _get(self._iti_rnd_margin_x_spin, 0.5),
+                "margin_y":      _get(self._iti_rnd_margin_y_spin, 0.5),
+                "margin_radius": _get(self._iti_rnd_margin_radius_spin, 0.3),
+                "duration_type": ("fixed" if (self._iti_rnd_dur_type is None or
+                                              self._iti_rnd_dur_type.currentText() == "Fixed")
+                                  else "random"),
+                "duration_s":     _get(self._iti_rnd_dur_spin, 2.0),
+                "duration_max_s": _get(self._iti_rnd_dur_max_spin, 3.0),
+            },
+        }
+
         return {
             "session": {
                 "type":   sess_type,
@@ -506,6 +769,7 @@ class ProtocolPage(QtWidgets.QWidget):
                 "end_type":   end_type,
                 "duration_s": self._trial_dur_spin.value(),
             },
+            "intertrial": iti,
             "beamer":  None,
             "screens": None,
         }
@@ -583,6 +847,41 @@ class ProtocolPage(QtWidgets.QWidget):
         self._trial_end_combo.blockSignals(False)
         self._trial_dur_spin.setValue(int(trial.get("duration_s", 30)))
         self._update_trial_widgets()
+
+        # ── Intertrial ───────────────────────────────────────────
+        iti = d.get("intertrial", self.DEFAULT_PROTOCOL["intertrial"])
+        _iti_label = {"time": "Fixed time", "fixed_region": "Fixed region",
+                      "random_region": "Random region"}.get(iti.get("type", "time"), "Fixed time")
+        self._iti_type_combo.blockSignals(True)
+        self._iti_type_combo.setCurrentText(_iti_label)
+        self._iti_type_combo.blockSignals(False)
+        self._rebuild_iti_section()   # builds sub-widgets for the selected type
+
+        # Populate sub-widgets from dict (they exist now that _rebuild ran)
+        reg = iti.get("region", {})
+        rnd = iti.get("random_region", {})
+        if self._iti_time_spin is not None:
+            self._iti_time_spin.setValue(float(iti.get("duration_s", 5.0)))
+        if self._iti_reg_x_spin is not None:
+            self._iti_reg_x_spin.setValue(float(reg.get("x", 0.5)))
+            self._iti_reg_y_spin.setValue(float(reg.get("y", 0.5)))
+            self._iti_reg_radius_spin.setValue(float(reg.get("radius", 0.1)))
+            self._iti_reg_dur_type.setCurrentText(
+                "Fixed" if reg.get("duration_type", "fixed") == "fixed" else "Random (0 – max)")
+            self._iti_reg_dur_spin.setValue(float(reg.get("duration_s", 2.0)))
+            self._iti_reg_dur_max_spin.setValue(float(reg.get("duration_max_s", 3.0)))
+            self._update_iti_dur_visibility()
+        if self._iti_rnd_radius_spin is not None:
+            self._iti_rnd_radius_spin.setValue(float(rnd.get("radius", 0.1)))
+            self._iti_rnd_margin_x_spin.setValue(float(rnd.get("margin_x", 0.5)))
+            self._iti_rnd_margin_y_spin.setValue(float(rnd.get("margin_y", 0.5)))
+            self._iti_rnd_margin_radius_spin.setValue(float(rnd.get("margin_radius", 0.3)))
+            self._iti_rnd_dur_type.setCurrentText(
+                "Fixed" if rnd.get("duration_type", "fixed") == "fixed" else "Random (0 – max)")
+            self._iti_rnd_dur_spin.setValue(float(rnd.get("duration_s", 2.0)))
+            self._iti_rnd_dur_max_spin.setValue(float(rnd.get("duration_max_s", 3.0)))
+            self._update_iti_dur_visibility()
+        self._emit_overlay()
 
     # ── File operations ───────────────────────────────────────────────────────
 

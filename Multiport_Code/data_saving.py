@@ -56,8 +56,11 @@ class data_saver:
                         np.array(self.camera_data.get()).copy())
             if sensor_flag.value:
                 sensor_data_copy = np.array(self.sensor_data).copy()
-            if dlc_flag.value:
-                dlc_data_copy = np.array(self.dlc_data).copy()
+            if dlc_flag.value and self.dlc_data is not None:
+                try:
+                    dlc_data_copy = self.dlc_data.get_nowait()
+                except Exception:
+                    dlc_data_copy = None
             new_row = pd.DataFrame({
                 'Timestamp': [current_timestamp],
                 'Sensors':   [sensor_data_copy],

@@ -9,3 +9,6 @@ IMG_HEIGHT, IMG_WIDTH = 2160, 3840
 ### Data Handling
 data_path      = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/Data"
 protocols_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/Protocols"
+
+### Deeplabcut
+model_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/DLCModel"

@@ -350,9 +350,9 @@ class ExperimentPage(QtWidgets.QWidget):
         self._saving_proc = Process(
             target=saving_process,
             args=(
-                ds.get("dlc_queue"),      # full-res frames for saving
+                ds.get("dlc_queue"),      # full-res frames for camera saving
                 ds.get("sensor_array"),
-                None,                     # DLC data — not yet implemented
+                ds.get("pose_queue"),     # DLC pose estimates for CSV
                 ds.get("timestamp_value"),
                 cohort, mouse, session,
                 self._cam_flag, self._sensor_flag, self._dlc_flag,
