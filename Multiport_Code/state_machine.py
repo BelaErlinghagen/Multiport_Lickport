@@ -41,10 +41,14 @@ class StateMachine:
         BNC:id:PULSE:duration_ms
     """
 
-    def __init__(self, command_queue, sensor_array, pose_queue=None):
+    def __init__(self, command_queue, sensor_array, pose_queue=None, beamer_queue=None):
         self.command_queue = command_queue
         self.sensor_array  = sensor_array   # multiprocessing.Array('i', 16)
         self.pose_queue    = pose_queue     # optional Queue for DLC-based ITI
+        self.beamer_queue  = beamer_queue   # optional Queue for beamer projection
+        self._calib        = None           # BeamerCalibration, loaded at run()
+        self._shadow       = False          # protocol["beamer"]["shadow"] for this session
+        self._field_color  = [255, 255, 255]  # stable shadow-field colour for this session
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -68,10 +72,73 @@ class StateMachine:
         return True
 
     def _all_off(self):
-        """Safety: silence every LED and pump."""
+        """Safety: silence every LED and pump, and blank the beamer."""
         for i in range(1, _CIRCLE_SIZE + 1):
             self._send(f"LED:{i}:OFF")
             self._send(f"MOS:{i}:OFF:0")
+        self._beamer({"cmd": "clear"})
+
+    # ── Beamer ────────────────────────────────────────────────────────────────
+
+    def _load_calib(self):
+        """Load the current beamer calibration (cm ↔ camera mapping) for the session."""
+        try:
+            from beamer_controls import BeamerCalibration
+            self._calib = BeamerCalibration()
+        except Exception as exc:
+            print(f"[StateMachine] Beamer calibration unavailable: {exc}")
+            self._calib = None
+
+    def _beamer(self, cmd: dict):
+        """Put a command on the beamer queue; drop silently if full/absent."""
+        if self.beamer_queue is None:
+            return
+        try:
+            self.beamer_queue.put_nowait(cmd)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _region_color(region: dict) -> list:
+        """Region colour scaled by its brightness → [r, g, b] (0–255)."""
+        b = float(region.get("brightness", 100)) / 100.0
+        c = region.get("color", [255, 255, 255])
+        return [int(c[0] * b), int(c[1] * b), int(c[2] * b)]
+
+    def _session_field_color(self, protocol: dict) -> list:
+        """Shadow-field colour for the whole session, taken from the ITI region so
+        the lit intensity matches between trials and ITIs. Defaults to full white
+        (e.g. a fixed-time ITI, which has no region colour)."""
+        iti = protocol.get("intertrial", {})
+        region = {"fixed_region":  iti.get("region", {}),
+                  "random_region": iti.get("random_region", {})}.get(
+                      iti.get("type", "time"), {})
+        return self._region_color(region)
+
+    def _beamer_baseline(self, shadow: bool):
+        """Trial / fixed-time baseline: dark (Light mode) or a fully lit projection
+        area (Shadow mode — a diameter-0 shadow sphere lights the whole disc).
+
+        In Shadow mode the field uses the session-wide _field_color so the lit
+        intensity is identical during trials and ITIs (it never switches — only
+        the dark target hole appears/disappears)."""
+        if shadow:
+            self._beamer({"cmd": "sphere", "x_cm": 0.0, "y_cm": 0.0,
+                          "diameter_cm": 0.0, "shadow": True,
+                          "color": self._field_color})
+        else:
+            self._beamer({"cmd": "clear"})
+
+    def _beamer_sphere(self, region: dict, x_cm: float, y_cm: float, shadow: bool):
+        """Project the ITI target: bright sphere (Light) or dark hole (Shadow)."""
+        self._beamer({
+            "cmd":         "sphere",
+            "x_cm":        x_cm,
+            "y_cm":        y_cm,
+            "diameter_cm": float(region.get("diameter_cm", 6.0)),
+            "shadow":      shadow,
+            "color":       self._region_color(region),
+        })
 
     # ── Mouse session log ─────────────────────────────────────────────────────
 
@@ -203,6 +270,9 @@ class StateMachine:
         port_to_rid   = {v: k for k, v in reward_locations.items()}
         led_ports     = self._get_led_ports(protocol, reward_ports)
 
+        # Beamer trial baseline: dark (Light mode) or full lit field (Shadow mode).
+        self._beamer_baseline(self._shadow)
+
         for p in led_ports:
             self._send(f"LED:{p}:ON")
         print(f"[StateMachine] Trial {trial_num}: started  reward ports={reward_ports}")
@@ -266,81 +336,95 @@ class StateMachine:
         Returns True on normal completion, False if a stop flag fires.
 
         Three modes driven by iti_config["type"]:
-          "time"          — fixed sleep
-          "fixed_region"  — wait until DLC centroid dwells inside a fixed circle
-          "random_region" — same but circle center is randomised inside a margin circle
+          "time"          — fixed sleep, beamer holds the trial baseline
+          "fixed_region"  — project a cm-defined target sphere; wait until the DLC
+                            centroid dwells inside it (checked in beamer-pixel space)
+          "random_region" — same but the target centre is drawn from a cm margin disc
         """
         import math
         iti_type = iti_config.get("type", "time")
+        shadow = self._shadow
 
         if iti_type == "time":
+            # Beamer stays at the trial baseline for the fixed duration.
             return self._sleep(float(iti_config.get("duration_s", 3.0)), sm_stop, sm_active)
 
-        # ── DLC-based ITI ─────────────────────────────────────────────────────
+        # ── Region-based ITI (target specified in cm) ─────────────────────────
         if iti_type == "fixed_region":
-            reg  = iti_config.get("region", {})
-            cx_n = float(reg.get("x", 0.5))
-            cy_n = float(reg.get("y", 0.5))
-            r_n  = float(reg.get("radius", 0.1))
-            dur_cfg = reg
-        else:  # random_region
-            rnd  = iti_config.get("random_region", {})
-            r_n  = float(rnd.get("radius", 0.1))
-            angle = random.uniform(0, 2 * math.pi)
-            dist  = random.uniform(0, float(rnd.get("margin_radius", 0.3)))
-            cx_n  = float(rnd.get("margin_x", 0.5)) + dist * math.cos(angle)
-            cy_n  = float(rnd.get("margin_y", 0.5)) + dist * math.sin(angle)
-            dur_cfg = rnd
+            region = iti_config.get("region", {})
+            x_cm = float(region.get("x_cm", 0.0))
+            y_cm = float(region.get("y_cm", 0.0))
+        else:  # random_region — pick a centre uniformly inside the margin disc
+            region = iti_config.get("random_region", {})
+            mx = float(region.get("margin_x_cm", 0.0))
+            my = float(region.get("margin_y_cm", 0.0))
+            mr = float(region.get("margin_radius_cm", 10.0))
+            ang  = random.uniform(0, 2 * math.pi)
+            dist = mr * math.sqrt(random.uniform(0, 1))
+            x_cm = mx + dist * math.cos(ang)
+            y_cm = my + dist * math.sin(ang)
 
-        dur_type = dur_cfg.get("duration_type", "fixed")
-        required_s = (float(dur_cfg.get("duration_s", 2.0)) if dur_type == "fixed"
-                      else random.uniform(0, float(dur_cfg.get("duration_max_s", 3.0))))
+        diameter_cm = float(region.get("diameter_cm", 6.0))
+        dur_type = region.get("duration_type", "fixed")
+        required_s = (float(region.get("duration_s", 2.0)) if dur_type == "fixed"
+                      else random.uniform(0, float(region.get("duration_max_s", 3.0))))
 
-        try:
-            from shared_states import IMG_HEIGHT
-            img_size = IMG_HEIGHT
-        except Exception:
-            img_size = 2160
+        # Project the target for the whole ITI.
+        self._beamer_sphere(region, x_cm, y_cm, shadow)
 
-        cx_px = cx_n * img_size
-        cy_px = cy_n * img_size
-        r_px  = r_n  * img_size
+        # Target in beamer pixels; the mouse is mapped DLC → beamer via the affine.
+        calib = self._calib
+        can_track = bool(calib and calib.cam_to_beamer and self.pose_queue is not None)
+        if not can_track:
+            # No camera↔beamer mapping or no pose feed: hold the cue for the dwell
+            # time instead of true dwell detection so the session can't hang.
+            print("[StateMachine] ITI: no camera↔beamer mapping / pose feed — "
+                  f"holding the cue for {required_s:.1f} s.")
+            ok = self._sleep(required_s, sm_stop, sm_active)
+            self._beamer_baseline(shadow)
+            return ok
+
+        bx, by, r_px = calib.cm_to_px(x_cm, y_cm, diameter_cm)
+        from shared_states import DLC_CROP
+        crop_w = DLC_CROP[3] - DLC_CROP[2]
+        crop_h = DLC_CROP[1] - DLC_CROP[0]
         _THRESH = 0.5
         in_region_since = None
 
         print(f"[StateMachine] ITI ({iti_type}): waiting for mouse at "
-              f"({cx_n:.2f}, {cy_n:.2f}) r={r_n:.2f} for {required_s:.1f} s")
+              f"({x_cm:.1f}, {y_cm:.1f}) cm for {required_s:.1f} s")
 
         while True:
             if sm_stop.value or not sm_active.value:
-                return False
+                return False   # run()/_all_off blanks the beamer
 
-            if self.pose_queue is not None:
-                pose = None
-                try:
-                    pose = self.pose_queue.get_nowait()
-                except Exception:
-                    pass
+            pose = None
+            try:
+                pose = self.pose_queue.get_nowait()
+            except Exception:
+                pass
 
-                if pose is not None:
-                    pts = [(float(kp[0]), float(kp[1]))
-                           for kp in pose if float(kp[2]) > _THRESH]
-                    if pts:
-                        cx_e = sum(p[0] for p in pts) / len(pts)
-                        cy_e = sum(p[1] for p in pts) / len(pts)
-                        in_r = ((cx_e - cx_px) ** 2 + (cy_e - cy_px) ** 2) ** 0.5 <= r_px
-                    else:
-                        in_r = False   # no keypoints above threshold → position unknown
+            if pose is not None:
+                pts = [(float(kp[0]), float(kp[1]))
+                       for kp in pose if float(kp[2]) > _THRESH]
+                in_r = False
+                if pts:
+                    cx_e = sum(p[0] for p in pts) / len(pts)
+                    cy_e = sum(p[1] for p in pts) / len(pts)
+                    mapped = calib.dlc_to_px(cx_e / crop_w, cy_e / crop_h)
+                    if mapped is not None:
+                        in_r = ((mapped[0] - bx) ** 2 + (mapped[1] - by) ** 2) ** 0.5 <= r_px
 
-                    now = time.monotonic()
-                    if in_r:
-                        if in_region_since is None:
-                            in_region_since = now
-                        elif now - in_region_since >= required_s:
-                            print("[StateMachine] ITI complete — mouse in region.")
-                            return True
-                    else:
-                        in_region_since = None
+                now = time.monotonic()
+                if in_r:
+                    if in_region_since is None:
+                        in_region_since = now
+                    elif now - in_region_since >= required_s:
+                        print("[StateMachine] ITI complete — mouse in region.")
+                        self._beamer_baseline(shadow)
+                        return True
+                else:
+                    in_region_since = None
 
             time.sleep(0.02)
 
@@ -355,6 +439,12 @@ class StateMachine:
         Writes a session entry to {mouse_id}.json at start; updates it with the
         end time on completion.
         """
+        # Beamer session setup: global light/shadow, a stable shadow-field colour,
+        # and the current cm↔camera calibration.
+        self._shadow = bool(protocol.get("beamer", {}).get("shadow", False))
+        self._field_color = self._session_field_color(protocol)
+        self._load_calib()
+
         reward_locations = self._assign_locations(protocol)
         if reward_locations is None:
             print("[StateMachine] ERROR: reward location constraints are infeasible "
@@ -451,7 +541,7 @@ class StateMachine:
 
 def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
                            sensor_array, protocol_queue, session_done,
-                           pose_sm_queue=None):
+                           pose_sm_queue=None, beamer_queue=None):
     """Long-running process that hosts the StateMachine.
 
     Lifecycle:
@@ -470,7 +560,8 @@ def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
         sm_running.value = False
     signal.signal(signal.SIGTERM, _handle_term)
 
-    machine = StateMachine(command_queue, sensor_array, pose_queue=pose_sm_queue)
+    machine = StateMachine(command_queue, sensor_array, pose_queue=pose_sm_queue,
+                           beamer_queue=beamer_queue)
     print("[StateMachine] Process ready — waiting for activation.")
 
     while sm_running.value:

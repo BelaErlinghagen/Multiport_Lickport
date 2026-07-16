@@ -5,3 +5,8 @@
 Data/
 # Claude
 CLAUDE.md
+
+# Pycache
+Multiport_Code/__pycache__
+
+beamer_calibration.json

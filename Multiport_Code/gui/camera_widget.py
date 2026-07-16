@@ -43,6 +43,7 @@ class CameraWidget(QtWidgets.QOpenGLWidget):
     def __init__(self, frame_queue, shape, pose_display_queue=None):
         super().__init__()
         self._pixmap            = None
+        self._last_frame        = None   # latest grayscale frame (numpy H×W)
         self._last_pose         = None   # latest (num_kp, 3) pose array
         self._iti_overlay       = None   # dict or None; set by set_iti_overlay()
         self.frame_queue        = frame_queue
@@ -71,12 +72,21 @@ class CameraWidget(QtWidgets.QOpenGLWidget):
                 self.update()   # still repaint so overlay redraws even without new frames
             return
 
+        self._last_frame = frame
         h, w = self.shape
         qimg = QtGui.QImage(
             frame.tobytes(), w, h, w, QtGui.QImage.Format_Grayscale8
         )
         self._pixmap = QtGui.QPixmap.fromImage(qimg)
         self.update()
+
+    def latest_frame(self):
+        """Return the most recent grayscale frame (numpy H×W) or None.
+
+        Used by the beamer calibration dialog to show a live feed without
+        draining frame_queue (which this widget already owns).
+        """
+        return self._last_frame
 
     def set_iti_overlay(self, overlay):
         """Slot connected to ProtocolPage.overlay_changed. overlay is a dict or None."""
@@ -145,31 +155,30 @@ class CameraWidget(QtWidgets.QOpenGLWidget):
                 )
 
         # ── ITI region overlay ────────────────────────────────────────────────
+        # Overlay dict (from ProtocolPage): {"target": {x,y,radius},
+        # "margin": {x,y,radius}} in normalised camera coords (fraction of the
+        # frame). Either key may be absent; the beamer calibration maps the cm
+        # region here so the drawn contour lands where the beamer projects.
         if self._iti_overlay is not None and scaled_w > 0:
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-            iti_type = self._iti_overlay.get("type")
 
-            if iti_type == "fixed_region":
-                cx = self._iti_overlay["x"] * orig_size * scale + off_x
-                cy = self._iti_overlay["y"] * orig_size * scale + off_y
-                r  = self._iti_overlay["radius"] * orig_size * scale
-                painter.setPen(QtGui.QPen(QtGui.QColor(0, 200, 255), 2))
-                painter.setBrush(QtGui.QBrush(QtGui.QColor(0, 200, 255, 50)))
-                painter.drawEllipse(QtCore.QRectF(cx - r, cy - r, r * 2, r * 2))
-
-            elif iti_type == "random_region":
-                mx = self._iti_overlay["margin_x"] * orig_size * scale + off_x
-                my = self._iti_overlay["margin_y"] * orig_size * scale + off_y
-                mr = self._iti_overlay["margin_radius"] * orig_size * scale
-                # Dashed outline shows where the target circle center can fall
+            margin = self._iti_overlay.get("margin")
+            if margin is not None:
+                mx = margin["x"] * orig_size * scale + off_x
+                my = margin["y"] * orig_size * scale + off_y
+                mr = margin["radius"] * orig_size * scale
                 painter.setPen(QtGui.QPen(QtGui.QColor(255, 180, 0), 2,
                                           QtCore.Qt.DashLine))
                 painter.setBrush(QtCore.Qt.NoBrush)
                 painter.drawEllipse(QtCore.QRectF(mx - mr, my - mr, mr * 2, mr * 2))
-                # Example target circle drawn at margin center
-                r = self._iti_overlay["radius"] * orig_size * scale
+
+            target = self._iti_overlay.get("target")
+            if target is not None:
+                cx = target["x"] * orig_size * scale + off_x
+                cy = target["y"] * orig_size * scale + off_y
+                r  = target["radius"] * orig_size * scale
                 painter.setPen(QtGui.QPen(QtGui.QColor(0, 200, 255), 2))
                 painter.setBrush(QtGui.QBrush(QtGui.QColor(0, 200, 255, 50)))
-                painter.drawEllipse(QtCore.QRectF(mx - r, my - r, r * 2, r * 2))
+                painter.drawEllipse(QtCore.QRectF(cx - r, cy - r, r * 2, r * 2))
 
         painter.end()

@@ -1,6 +1,7 @@
 # main.py
 from multiprocessing import Process, Array, Queue, Value
 import numpy as np
+from beamer_controls import beamer_process
 from camera_controls import camera_process
 from deeplabcut_controls import dlc_process
 from main_plotting import run_gui
@@ -15,10 +16,13 @@ def main():
     frame_queue        = Queue(maxsize=2)   # camera → GUI (downsampled frames)
     pose_queue         = Queue(maxsize=2)   # DLC → saving (latest pose)
     pose_display_queue = Queue(maxsize=1)   # DLC → GUI overlay (latest pose)
+    pose_sm_queue      = Queue(maxsize=1)   # DLC → state machine (ITI dwell checks)
     sensor_array       = Array('i', 16)    # shared sensors
     camera_running     = Value('b', True)
     dlc_running        = Value('b', True)
     command_queue      = Queue(maxsize=100) # GUI → Arduino commands
+    beamer_queue       = Queue(maxsize=8)   # GUI/SM → beamer projection commands
+    beamer_running     = Value('b', True)
 
     # State-machine control flags
     sm_active      = Value('b', False)   # set True by ExperimentPage to start a session
@@ -31,20 +35,26 @@ def main():
     cam_proc = Process(target=camera_process, args=(frame_queue, dlc_queue, cam_shape, camera_running))
     cam_proc.start()
 
-    # Start DLC inference (runs continuously; results go to saving + GUI overlay)
+    # Start DLC inference (runs continuously; results go to saving + GUI overlay + SM)
     dlc_proc = Process(target=dlc_process,
-                       args=(dlc_queue, pose_queue, pose_display_queue, dlc_running))
+                       args=(dlc_queue, pose_queue, pose_display_queue, dlc_running,
+                             pose_sm_queue))
     dlc_proc.start()
 
     # Start sensor grabbing (also handles outbound commands)
     sensor_proc = Process(target=sensor_process, args=(sensor_array, timestamp_value, command_queue))
     sensor_proc.start()
 
+    # Start beamer projector (fullscreen window on the beamer's extended display)
+    beamer_proc = Process(target=beamer_process, args=(beamer_queue, beamer_running))
+    beamer_proc.start()
+
     # Start state machine (idles until ExperimentPage activates it)
     sm_proc = Process(
         target=state_machine_process,
         args=(sm_active, sm_stop, sm_running, command_queue,
-              sensor_array, protocol_queue, session_done),
+              sensor_array, protocol_queue, session_done,
+              pose_sm_queue, beamer_queue),
     )
     sm_proc.start()
 
@@ -60,6 +70,7 @@ def main():
         "sm_stop":            sm_stop,
         "session_done":       session_done,
         "protocol_queue":     protocol_queue,
+        "beamer_queue":       beamer_queue,
     }
     run_gui(frame_queue, sensor_array, cam_shape, command_queue, data_sources)
 
@@ -102,6 +113,17 @@ def main():
     if sensor_proc.is_alive():
         sensor_proc.kill()
         sensor_proc.join()
+
+    # Beamer: signal the Qt loop to quit so the fullscreen window closes cleanly,
+    # then escalate to SIGTERM then SIGKILL.
+    beamer_running.value = False
+    beamer_proc.join(timeout=3)
+    if beamer_proc.is_alive():
+        beamer_proc.terminate()
+        beamer_proc.join(timeout=1)
+    if beamer_proc.is_alive():
+        beamer_proc.kill()
+        beamer_proc.join()
 
 if __name__ == "__main__":
     import multiprocessing as mp

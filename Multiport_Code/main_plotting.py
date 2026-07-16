@@ -78,9 +78,9 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
                 QtWidgets.QSizePolicy.Expanding,
             )
 
-            page_clean = CleaningPage(command_queue)
+            page_clean = CleaningPage(command_queue, (data_sources or {}).get("beamer_queue"))
 
-            page_protocol = ProtocolPage()
+            page_protocol = ProtocolPage((data_sources or {}).get("beamer_queue"))
 
             page_experiment = ExperimentPage(data_sources or {})
 
@@ -102,6 +102,10 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
 
             # Wire ITI region overlay: ProtocolPage → CameraWidget
             page_protocol.overlay_changed.connect(self.camera.set_iti_overlay)
+
+            # Give the beamer calibration dialog a live camera feed to drag
+            # correspondence points onto (reads latest frame, no queue contention).
+            page_clean.set_frame_provider(self.camera)
 
             self.sensors = SensorWidget(sensor_array)
 

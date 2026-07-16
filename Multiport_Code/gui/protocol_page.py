@@ -57,20 +57,22 @@ class ProtocolPage(QtWidgets.QWidget):
             "type": "time",
             "duration_s": 5.0,
             "region": {
-                "x": 0.5, "y": 0.5, "radius": 0.1,
+                "x_cm": 0.0, "y_cm": 0.0, "diameter_cm": 6.0,
+                "brightness": 100, "color": [255, 255, 255],
                 "duration_type": "fixed",
                 "duration_s": 2.0,
                 "duration_max_s": 3.0,
             },
             "random_region": {
-                "radius": 0.1,
-                "margin_x": 0.5, "margin_y": 0.5, "margin_radius": 0.3,
+                "diameter_cm": 6.0,
+                "brightness": 100, "color": [255, 255, 255],
+                "margin_x_cm": 0.0, "margin_y_cm": 0.0, "margin_radius_cm": 10.0,
                 "duration_type": "fixed",
                 "duration_s": 2.0,
                 "duration_max_s": 3.0,
             },
         },
-        "beamer": None,
+        "beamer": {"shadow": False},
         "screens": None,
     }
 
@@ -82,11 +84,17 @@ class ProtocolPage(QtWidgets.QWidget):
     }
     _LED_MODE_KEYS = {v: k for k, v in _LED_MODE_LABELS.items()}
 
-    def __init__(self):
+    def __init__(self, beamer_queue=None):
         super().__init__()
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
 
         self._current_path: str | None = None
+        self.beamer_queue = beamer_queue     # None if the beamer process isn't wired in
+        self._beamer_calib = None            # lazy BeamerCalibration (cm ↔ camera mapping)
+
+        # Beamer sphere appearance for the two region menus (persist across rebuilds)
+        self._reg_color = QtGui.QColor(255, 255, 255)
+        self._rnd_color = QtGui.QColor(255, 255, 255)
 
         # Dynamic section state — populated by rebuild helpers
         self._reward_rows: list[tuple[QtWidgets.QSpinBox,
@@ -95,26 +103,25 @@ class ProtocolPage(QtWidgets.QWidget):
         self._min_spacing_spin: QtWidgets.QSpinBox | None = None
         self._spacing_warn_lbl: QtWidgets.QLabel | None   = None
 
+        # Global beamer light/shadow (static; set once in _build_ui)
+        self._beamer_shadow_chk: QtWidgets.QCheckBox | None = None
+
         # ITI widget refs (nullable; reset each time _rebuild_iti_section runs)
         self._iti_type_combo: QtWidgets.QComboBox | None = None        # static (set once in _build_ui)
         self._iti_time_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_reg_x_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_reg_y_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_reg_radius_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_reg_dur_type: QtWidgets.QComboBox | None = None
-        self._iti_reg_dur_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_reg_dur_max_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_reg_dur_fixed_w: QtWidgets.QWidget | None = None
-        self._iti_reg_dur_max_w: QtWidgets.QWidget | None = None
-        self._iti_rnd_radius_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_rnd_margin_x_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_rnd_margin_y_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_rnd_margin_radius_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_rnd_dur_type: QtWidgets.QComboBox | None = None
-        self._iti_rnd_dur_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_rnd_dur_max_spin: QtWidgets.QDoubleSpinBox | None = None
-        self._iti_rnd_dur_fixed_w: QtWidgets.QWidget | None = None
-        self._iti_rnd_dur_max_w: QtWidgets.QWidget | None = None
+        # Fixed region (cm-based beamer sphere + toggles + dwell)
+        self._iti_reg_x_spin = self._iti_reg_y_spin = self._iti_reg_diam_spin = None
+        self._iti_reg_bright = self._iti_reg_color_btn = None
+        self._iti_reg_beamer_chk = self._iti_reg_contour_chk = None
+        self._iti_reg_dur_type = self._iti_reg_dur_spin = self._iti_reg_dur_max_spin = None
+        self._iti_reg_dur_fixed_w = self._iti_reg_dur_max_w = None
+        # Random region (same sphere fields + margin + toggles + dwell)
+        self._iti_rnd_diam_spin = self._iti_rnd_bright = self._iti_rnd_color_btn = None
+        self._iti_rnd_margin_x_spin = self._iti_rnd_margin_y_spin = None
+        self._iti_rnd_margin_radius_spin = None
+        self._iti_rnd_beamer_chk = self._iti_rnd_contour_chk = self._iti_rnd_margin_chk = None
+        self._iti_rnd_dur_type = self._iti_rnd_dur_spin = self._iti_rnd_dur_max_spin = None
+        self._iti_rnd_dur_fixed_w = self._iti_rnd_dur_max_w = None
 
         self._build_ui()
         self._apply_protocol(self.DEFAULT_PROTOCOL)
@@ -256,12 +263,18 @@ class ProtocolPage(QtWidgets.QWidget):
 
         self._led_mode_combo.currentTextChanged.connect(self._update_led_visibility)
 
-        # Beamer + Screens placeholders
+        # Beamer control (global light/shadow) + Screens placeholder
         sl.addSpacing(4)
-        sl.addWidget(self._sublabel("Beamer"))
-        beamer_ph = QtWidgets.QLabel("Beamer control — not yet connected (placeholder)")
-        beamer_ph.setStyleSheet("color:#555; font-style:italic; margin-left:8px;")
-        sl.addWidget(beamer_ph)
+        sl.addWidget(self._sublabel("Beamer control"))
+        self._beamer_shadow_chk = QtWidgets.QCheckBox("Shadow (dark sphere on a lit field)")
+        self._beamer_shadow_chk.setStyleSheet("margin-left:8px;")
+        sl.addWidget(self._beamer_shadow_chk)
+        beamer_note = QtWidgets.QLabel(
+            "Light: dark during trials, bright sphere marks the ITI target.\n"
+            "Shadow: whole area lit during trials, dark sphere marks the ITI target.")
+        beamer_note.setWordWrap(True)
+        beamer_note.setStyleSheet("color:#777; font-size:9px; margin-left:8px;")
+        sl.addWidget(beamer_note)
 
         sl.addSpacing(4)
         sl.addWidget(self._sublabel("Screens"))
@@ -546,6 +559,33 @@ class ProtocolPage(QtWidgets.QWidget):
         return sb
 
     @staticmethod
+    def _make_cm_spin(val: float = 0.0, lo: float = -100.0,
+                      hi: float = 100.0) -> QtWidgets.QDoubleSpinBox:
+        """Return a QDoubleSpinBox for arena centimetres (matches the Test-Sphere menu)."""
+        sb = QtWidgets.QDoubleSpinBox()
+        sb.setRange(lo, hi)
+        sb.setSingleStep(0.5)
+        sb.setDecimals(1)
+        sb.setValue(val)
+        sb.setSuffix(" cm")
+        sb.setFixedWidth(90)
+        return sb
+
+    @staticmethod
+    def _make_bright_slider() -> QtWidgets.QSlider:
+        s = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        s.setRange(0, 100)
+        s.setValue(100)
+        s.setFixedWidth(120)
+        return s
+
+    @staticmethod
+    def _calib_hint() -> QtWidgets.QLabel:
+        lbl = QtWidgets.QLabel("Preview & contour need a completed beamer calibration.")
+        lbl.setStyleSheet("color:#777; font-size:9px;")
+        return lbl
+
+    @staticmethod
     def _labeled_row(label: str, widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
         """Return a QWidget containing a right-padded label + widget on one row."""
         w = QtWidgets.QWidget()
@@ -564,81 +604,138 @@ class ProtocolPage(QtWidgets.QWidget):
         layout = self._iti_container.layout()
 
         # Reset all nullable refs
-        (self._iti_time_spin, self._iti_reg_x_spin, self._iti_reg_y_spin,
-         self._iti_reg_radius_spin, self._iti_reg_dur_type, self._iti_reg_dur_spin,
-         self._iti_reg_dur_max_spin, self._iti_reg_dur_fixed_w, self._iti_reg_dur_max_w,
-         self._iti_rnd_radius_spin, self._iti_rnd_margin_x_spin, self._iti_rnd_margin_y_spin,
-         self._iti_rnd_margin_radius_spin, self._iti_rnd_dur_type, self._iti_rnd_dur_spin,
-         self._iti_rnd_dur_max_spin, self._iti_rnd_dur_fixed_w,
-         self._iti_rnd_dur_max_w) = (None,) * 18
+        self._iti_time_spin = None
+        self._iti_reg_x_spin = self._iti_reg_y_spin = self._iti_reg_diam_spin = None
+        self._iti_reg_bright = self._iti_reg_color_btn = None
+        self._iti_reg_beamer_chk = self._iti_reg_contour_chk = None
+        self._iti_reg_dur_type = self._iti_reg_dur_spin = self._iti_reg_dur_max_spin = None
+        self._iti_reg_dur_fixed_w = self._iti_reg_dur_max_w = None
+        self._iti_rnd_diam_spin = self._iti_rnd_bright = self._iti_rnd_color_btn = None
+        self._iti_rnd_margin_x_spin = self._iti_rnd_margin_y_spin = None
+        self._iti_rnd_margin_radius_spin = None
+        self._iti_rnd_beamer_chk = self._iti_rnd_contour_chk = self._iti_rnd_margin_chk = None
+        self._iti_rnd_dur_type = self._iti_rnd_dur_spin = self._iti_rnd_dur_max_spin = None
+        self._iti_rnd_dur_fixed_w = self._iti_rnd_dur_max_w = None
 
         iti_type = self._iti_type_combo.currentText() if self._iti_type_combo else "Fixed time"
 
         if iti_type == "Fixed time":
             self._iti_time_spin = self._make_dur_spin(5.0)
             layout.addWidget(self._labeled_row("Duration:", self._iti_time_spin))
-            self._iti_time_spin.valueChanged.connect(self._emit_overlay)
 
         elif iti_type == "Fixed region":
-            self._iti_reg_x_spin      = self._make_norm_spin(0.5)
-            self._iti_reg_y_spin      = self._make_norm_spin(0.5)
-            self._iti_reg_radius_spin = self._make_norm_spin(0.10, 0.01, 0.5)
-            layout.addWidget(self._labeled_row("Position X (0–1):", self._iti_reg_x_spin))
-            layout.addWidget(self._labeled_row("Position Y (0–1):", self._iti_reg_y_spin))
-            layout.addWidget(self._labeled_row("Radius (0–0.5):",   self._iti_reg_radius_spin))
+            self._iti_reg_x_spin    = self._make_cm_spin(0.0)
+            self._iti_reg_y_spin    = self._make_cm_spin(0.0)
+            self._iti_reg_diam_spin = self._make_cm_spin(6.0, 0.1, 200.0)
+            layout.addWidget(self._labeled_row("Position X (cm):", self._iti_reg_x_spin))
+            layout.addWidget(self._labeled_row("Position Y (cm):", self._iti_reg_y_spin))
+            layout.addWidget(self._labeled_row("Diameter (cm):",   self._iti_reg_diam_spin))
+
+            self._iti_reg_bright = self._make_bright_slider()
+            layout.addWidget(self._labeled_row("Brightness:", self._iti_reg_bright))
+            self._iti_reg_color_btn = QtWidgets.QPushButton()
+            self._iti_reg_color_btn.setFixedWidth(44)
+            self._update_swatch(self._iti_reg_color_btn, self._reg_color)
+            self._iti_reg_color_btn.clicked.connect(self._pick_reg_color)
+            layout.addWidget(self._labeled_row("Colour:", self._iti_reg_color_btn))
+
+            self._iti_reg_beamer_chk  = QtWidgets.QCheckBox("Beamer on")
+            self._iti_reg_contour_chk = QtWidgets.QCheckBox("Contour on")
+            layout.addWidget(self._toggle_row(self._iti_reg_beamer_chk, self._iti_reg_contour_chk))
+            layout.addWidget(self._calib_hint())
 
             layout.addWidget(self._sublabel("Dwell time"))
             self._iti_reg_dur_type = QtWidgets.QComboBox()
             self._iti_reg_dur_type.addItems(["Fixed", "Random (0 – max)"])
             self._iti_reg_dur_type.setFixedWidth(160)
             layout.addWidget(self._labeled_row("Duration type:", self._iti_reg_dur_type))
-
             self._iti_reg_dur_spin     = self._make_dur_spin(2.0)
             self._iti_reg_dur_max_spin = self._make_dur_spin(3.0)
             self._iti_reg_dur_fixed_w  = self._labeled_row("Duration:", self._iti_reg_dur_spin)
             self._iti_reg_dur_max_w    = self._labeled_row("Max duration:", self._iti_reg_dur_max_spin)
             layout.addWidget(self._iti_reg_dur_fixed_w)
             layout.addWidget(self._iti_reg_dur_max_w)
-
             self._iti_reg_dur_type.currentTextChanged.connect(self._update_iti_dur_visibility)
-            for w in (self._iti_reg_x_spin, self._iti_reg_y_spin, self._iti_reg_radius_spin,
-                      self._iti_reg_dur_spin, self._iti_reg_dur_max_spin):
-                w.valueChanged.connect(self._emit_overlay)
+
+            for w in (self._iti_reg_x_spin, self._iti_reg_y_spin, self._iti_reg_diam_spin):
+                w.valueChanged.connect(self._reg_live)
+            self._iti_reg_bright.valueChanged.connect(self._reg_live)
+            self._iti_reg_contour_chk.toggled.connect(self._emit_overlay)
+            self._iti_reg_beamer_chk.toggled.connect(self._reg_beamer_toggled)
             self._update_iti_dur_visibility()
 
         else:  # Random region
-            self._iti_rnd_radius_spin       = self._make_norm_spin(0.10, 0.01, 0.5)
-            layout.addWidget(self._labeled_row("Target radius (0–0.5):", self._iti_rnd_radius_spin))
+            self._iti_rnd_diam_spin = self._make_cm_spin(6.0, 0.1, 200.0)
+            layout.addWidget(self._labeled_row("Diameter (cm):", self._iti_rnd_diam_spin))
+            self._iti_rnd_bright = self._make_bright_slider()
+            layout.addWidget(self._labeled_row("Brightness:", self._iti_rnd_bright))
+            self._iti_rnd_color_btn = QtWidgets.QPushButton()
+            self._iti_rnd_color_btn.setFixedWidth(44)
+            self._update_swatch(self._iti_rnd_color_btn, self._rnd_color)
+            self._iti_rnd_color_btn.clicked.connect(self._pick_rnd_color)
+            layout.addWidget(self._labeled_row("Colour:", self._iti_rnd_color_btn))
 
-            layout.addWidget(self._sublabel("Margin circle (where target center can fall)"))
-            self._iti_rnd_margin_x_spin      = self._make_norm_spin(0.5)
-            self._iti_rnd_margin_y_spin      = self._make_norm_spin(0.5)
-            self._iti_rnd_margin_radius_spin = self._make_norm_spin(0.30, 0.01, 1.0)
-            layout.addWidget(self._labeled_row("Margin center X:", self._iti_rnd_margin_x_spin))
-            layout.addWidget(self._labeled_row("Margin center Y:", self._iti_rnd_margin_y_spin))
-            layout.addWidget(self._labeled_row("Margin radius:",   self._iti_rnd_margin_radius_spin))
+            layout.addWidget(self._sublabel("Outer margin (projection area for random targets)"))
+            self._iti_rnd_margin_x_spin      = self._make_cm_spin(0.0)
+            self._iti_rnd_margin_y_spin      = self._make_cm_spin(0.0)
+            self._iti_rnd_margin_radius_spin = self._make_cm_spin(10.0, 0.1, 200.0)
+            layout.addWidget(self._labeled_row("Outer margin centre X (cm):", self._iti_rnd_margin_x_spin))
+            layout.addWidget(self._labeled_row("Outer margin centre Y (cm):", self._iti_rnd_margin_y_spin))
+            layout.addWidget(self._labeled_row("Outer margin radius (cm):",   self._iti_rnd_margin_radius_spin))
+
+            self._iti_rnd_beamer_chk  = QtWidgets.QCheckBox("Beamer on")
+            self._iti_rnd_contour_chk = QtWidgets.QCheckBox("Contour on")
+            self._iti_rnd_margin_chk  = QtWidgets.QCheckBox("Show outer margin")
+            layout.addWidget(self._toggle_row(self._iti_rnd_beamer_chk,
+                                              self._iti_rnd_contour_chk,
+                                              self._iti_rnd_margin_chk))
+            note = QtWidgets.QLabel(
+                "Beamer on shows the target sphere (its diameter). The outer margin "
+                "is only drawn on the camera (Show outer margin) — never projected.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color:#777; font-size:9px;")
+            layout.addWidget(note)
+            layout.addWidget(self._calib_hint())
 
             layout.addWidget(self._sublabel("Dwell time"))
             self._iti_rnd_dur_type = QtWidgets.QComboBox()
             self._iti_rnd_dur_type.addItems(["Fixed", "Random (0 – max)"])
             self._iti_rnd_dur_type.setFixedWidth(160)
             layout.addWidget(self._labeled_row("Duration type:", self._iti_rnd_dur_type))
-
             self._iti_rnd_dur_spin     = self._make_dur_spin(2.0)
             self._iti_rnd_dur_max_spin = self._make_dur_spin(3.0)
             self._iti_rnd_dur_fixed_w  = self._labeled_row("Duration:", self._iti_rnd_dur_spin)
             self._iti_rnd_dur_max_w    = self._labeled_row("Max duration:", self._iti_rnd_dur_max_spin)
             layout.addWidget(self._iti_rnd_dur_fixed_w)
             layout.addWidget(self._iti_rnd_dur_max_w)
-
             self._iti_rnd_dur_type.currentTextChanged.connect(self._update_iti_dur_visibility)
-            for w in (self._iti_rnd_radius_spin, self._iti_rnd_margin_x_spin,
-                      self._iti_rnd_margin_y_spin, self._iti_rnd_margin_radius_spin,
-                      self._iti_rnd_dur_spin, self._iti_rnd_dur_max_spin):
+
+            # Target appearance (diameter/brightness/colour) re-projects the sphere;
+            # the outer-margin controls only redraw the camera overlay — the beamer
+            # never projects the margin.
+            self._iti_rnd_diam_spin.valueChanged.connect(self._rnd_live)
+            self._iti_rnd_bright.valueChanged.connect(self._rnd_live)
+            for w in (self._iti_rnd_margin_x_spin, self._iti_rnd_margin_y_spin,
+                      self._iti_rnd_margin_radius_spin):
                 w.valueChanged.connect(self._emit_overlay)
+            self._iti_rnd_contour_chk.toggled.connect(self._emit_overlay)
+            self._iti_rnd_margin_chk.toggled.connect(self._emit_overlay)
+            self._iti_rnd_beamer_chk.toggled.connect(self._refresh_rnd_beamer)
             self._update_iti_dur_visibility()
 
+        # Switching type clears any live beamer preview from the previous menu.
+        self._send_beamer({"cmd": "clear"})
         self._emit_overlay()
+
+    @staticmethod
+    def _toggle_row(*checkboxes) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        for c in checkboxes:
+            lay.addWidget(c)
+        lay.addStretch()
+        return w
 
     def _update_iti_dur_visibility(self):
         """Show either the fixed or max-duration row based on the dwell-type combo."""
@@ -657,28 +754,150 @@ class ProtocolPage(QtWidgets.QWidget):
             if self._iti_rnd_dur_max_w:
                 self._iti_rnd_dur_max_w.setVisible(not fixed)
 
+    # ── Beamer preview + coordinate mapping ───────────────────────────────────
+
+    def _send_beamer(self, cmd: dict):
+        if self.beamer_queue is None:
+            return
+        try:
+            self.beamer_queue.put_nowait(cmd)
+        except Exception:
+            pass
+
+    def _shadow(self) -> bool:
+        return bool(self._beamer_shadow_chk and self._beamer_shadow_chk.isChecked())
+
+    @staticmethod
+    def _eff_color(base: QtGui.QColor, bright: QtWidgets.QSlider | None) -> list:
+        b = (bright.value() / 100.0) if bright is not None else 1.0
+        return [int(base.red() * b), int(base.green() * b), int(base.blue() * b)]
+
+    @staticmethod
+    def _update_swatch(btn: QtWidgets.QPushButton, color: QtGui.QColor):
+        btn.setStyleSheet(
+            f"background: rgb({color.red()},{color.green()},{color.blue()}); "
+            f"border:1px solid #888;")
+
+    def _calib(self):
+        """Fresh BeamerCalibration (re-reads the JSON) or None if unavailable."""
+        try:
+            from beamer_controls import BeamerCalibration
+            return BeamerCalibration()
+        except Exception:
+            return None
+
+    def _region_norm(self, calib, x_cm, y_cm, diam_cm):
+        """cm circle → normalised camera {x, y, radius}, or None if uncalibrated."""
+        if calib is None:
+            return None
+        res = calib.cm_to_dlc(x_cm, y_cm, diam_cm)
+        if res is None:
+            return None
+        u, v, r = res
+        return {"x": u, "y": v, "radius": r}
+
+    def _project_reg_sphere(self):
+        if self._iti_reg_x_spin is None:
+            return
+        self._send_beamer({
+            "cmd":         "sphere",
+            "x_cm":        self._iti_reg_x_spin.value(),
+            "y_cm":        self._iti_reg_y_spin.value(),
+            "diameter_cm": self._iti_reg_diam_spin.value(),
+            "shadow":      self._shadow(),
+            "color":       self._eff_color(self._reg_color, self._iti_reg_bright),
+        })
+
+    def _project_rnd_sphere(self):
+        # Preview the target sphere at the arena centre, sized by its diameter.
+        # Position is fixed (independent of the outer margin) so margin edits never
+        # move or resize the projected sphere.
+        if self._iti_rnd_diam_spin is None:
+            return
+        self._send_beamer({
+            "cmd":         "sphere",
+            "x_cm":        0.0,
+            "y_cm":        0.0,
+            "diameter_cm": self._iti_rnd_diam_spin.value(),
+            "shadow":      self._shadow(),
+            "color":       self._eff_color(self._rnd_color, self._iti_rnd_bright),
+        })
+
+    def _refresh_rnd_beamer(self, *_):
+        """Live beamer preview for the random region: the target sphere only.
+        The outer margin is a camera overlay and is never projected by the beamer."""
+        if self._iti_rnd_beamer_chk and self._iti_rnd_beamer_chk.isChecked():
+            self._project_rnd_sphere()
+        else:
+            self._send_beamer({"cmd": "clear"})
+
+    def _reg_live(self, *_):
+        self._emit_overlay()
+        if self._iti_reg_beamer_chk and self._iti_reg_beamer_chk.isChecked():
+            self._project_reg_sphere()
+
+    def _reg_beamer_toggled(self, on):
+        if on:
+            self._project_reg_sphere()
+        else:
+            self._send_beamer({"cmd": "clear"})
+
+    def _pick_reg_color(self):
+        c = QtWidgets.QColorDialog.getColor(self._reg_color, self, "Sphere colour")
+        if c.isValid():
+            self._reg_color = c
+            if self._iti_reg_color_btn:
+                self._update_swatch(self._iti_reg_color_btn, c)
+            self._reg_live()
+
+    def _rnd_live(self, *_):
+        self._emit_overlay()
+        self._refresh_rnd_beamer()
+
+    def _pick_rnd_color(self):
+        c = QtWidgets.QColorDialog.getColor(self._rnd_color, self, "Sphere colour")
+        if c.isValid():
+            self._rnd_color = c
+            if self._iti_rnd_color_btn:
+                self._update_swatch(self._iti_rnd_color_btn, c)
+            self._rnd_live()
+
     def _emit_overlay(self, *_):
-        """Emit overlay_changed signal so CameraWidget can draw the ITI region."""
+        """Emit the camera overlay for the ITI region contour / projection margin.
+
+        Regions are specified in cm; they are mapped to normalised camera coords
+        via the beamer↔camera calibration so the drawn contour lands where the
+        beamer projects. Overlay dict shape: {"target": {x,y,radius},
+        "margin": {x,y,radius}} (either key optional); None clears it.
+        """
         if self._iti_type_combo is None:
             return
         iti_type = self._iti_type_combo.currentText()
-        if iti_type == "Fixed time":
-            self.overlay_changed.emit(None)
-        elif iti_type == "Fixed region" and self._iti_reg_x_spin is not None:
-            self.overlay_changed.emit({
-                "type":   "fixed_region",
-                "x":      self._iti_reg_x_spin.value(),
-                "y":      self._iti_reg_y_spin.value(),
-                "radius": self._iti_reg_radius_spin.value(),
-            })
-        elif iti_type == "Random region" and self._iti_rnd_radius_spin is not None:
-            self.overlay_changed.emit({
-                "type":          "random_region",
-                "radius":        self._iti_rnd_radius_spin.value(),
-                "margin_x":      self._iti_rnd_margin_x_spin.value(),
-                "margin_y":      self._iti_rnd_margin_y_spin.value(),
-                "margin_radius": self._iti_rnd_margin_radius_spin.value(),
-            })
+        calib = self._calib()
+        overlay: dict = {}
+
+        if iti_type == "Fixed region" and self._iti_reg_x_spin is not None:
+            if self._iti_reg_contour_chk and self._iti_reg_contour_chk.isChecked():
+                t = self._region_norm(calib, self._iti_reg_x_spin.value(),
+                                      self._iti_reg_y_spin.value(),
+                                      self._iti_reg_diam_spin.value())
+                if t:
+                    overlay["target"] = t
+
+        elif iti_type == "Random region" and self._iti_rnd_diam_spin is not None:
+            if self._iti_rnd_contour_chk and self._iti_rnd_contour_chk.isChecked():
+                # Target contour at the arena centre — matches the beamer preview.
+                t = self._region_norm(calib, 0.0, 0.0, self._iti_rnd_diam_spin.value())
+                if t:
+                    overlay["target"] = t
+            if self._iti_rnd_margin_chk and self._iti_rnd_margin_chk.isChecked():
+                m = self._region_norm(calib, self._iti_rnd_margin_x_spin.value(),
+                                      self._iti_rnd_margin_y_spin.value(),
+                                      2.0 * self._iti_rnd_margin_radius_spin.value())
+                if m:
+                    overlay["margin"] = m
+
+        self.overlay_changed.emit(overlay if overlay else None)
 
     # ── Protocol dict I/O ─────────────────────────────────────────────────────
 
@@ -725,15 +944,23 @@ class ProtocolPage(QtWidgets.QWidget):
         def _get(spin, fallback):
             return spin.value() if spin is not None else fallback
 
+        def _bright(slider, fallback=100):
+            return slider.value() if slider is not None else fallback
+
+        def _color(c):
+            return [c.red(), c.green(), c.blue()]
+
         iti = {
             "type":      {"Fixed time": "time",
                           "Fixed region": "fixed_region",
                           "Random region": "random_region"}.get(iti_type, "time"),
             "duration_s": _get(self._iti_time_spin, 5.0),
             "region": {
-                "x":            _get(self._iti_reg_x_spin, 0.5),
-                "y":            _get(self._iti_reg_y_spin, 0.5),
-                "radius":       _get(self._iti_reg_radius_spin, 0.1),
+                "x_cm":        _get(self._iti_reg_x_spin, 0.0),
+                "y_cm":        _get(self._iti_reg_y_spin, 0.0),
+                "diameter_cm": _get(self._iti_reg_diam_spin, 6.0),
+                "brightness":  _bright(self._iti_reg_bright),
+                "color":       _color(self._reg_color),
                 "duration_type": ("fixed" if (self._iti_reg_dur_type is None or
                                               self._iti_reg_dur_type.currentText() == "Fixed")
                                   else "random"),
@@ -741,10 +968,12 @@ class ProtocolPage(QtWidgets.QWidget):
                 "duration_max_s": _get(self._iti_reg_dur_max_spin, 3.0),
             },
             "random_region": {
-                "radius":        _get(self._iti_rnd_radius_spin, 0.1),
-                "margin_x":      _get(self._iti_rnd_margin_x_spin, 0.5),
-                "margin_y":      _get(self._iti_rnd_margin_y_spin, 0.5),
-                "margin_radius": _get(self._iti_rnd_margin_radius_spin, 0.3),
+                "diameter_cm":   _get(self._iti_rnd_diam_spin, 6.0),
+                "brightness":    _bright(self._iti_rnd_bright),
+                "color":         _color(self._rnd_color),
+                "margin_x_cm":      _get(self._iti_rnd_margin_x_spin, 0.0),
+                "margin_y_cm":      _get(self._iti_rnd_margin_y_spin, 0.0),
+                "margin_radius_cm": _get(self._iti_rnd_margin_radius_spin, 10.0),
                 "duration_type": ("fixed" if (self._iti_rnd_dur_type is None or
                                               self._iti_rnd_dur_type.currentText() == "Fixed")
                                   else "random"),
@@ -752,6 +981,9 @@ class ProtocolPage(QtWidgets.QWidget):
                 "duration_max_s": _get(self._iti_rnd_dur_max_spin, 3.0),
             },
         }
+
+        beamer = {"shadow": bool(self._beamer_shadow_chk.isChecked())
+                  if self._beamer_shadow_chk else False}
 
         return {
             "session": {
@@ -770,7 +1002,7 @@ class ProtocolPage(QtWidgets.QWidget):
                 "duration_s": self._trial_dur_spin.value(),
             },
             "intertrial": iti,
-            "beamer":  None,
+            "beamer":  beamer,
             "screens": None,
         }
 
@@ -848,6 +1080,11 @@ class ProtocolPage(QtWidgets.QWidget):
         self._trial_dur_spin.setValue(int(trial.get("duration_s", 30)))
         self._update_trial_widgets()
 
+        # ── Beamer (global light/shadow) ─────────────────────────
+        beamer = d.get("beamer") or {}
+        if self._beamer_shadow_chk is not None:
+            self._beamer_shadow_chk.setChecked(bool(beamer.get("shadow", False)))
+
         # ── Intertrial ───────────────────────────────────────────
         iti = d.get("intertrial", self.DEFAULT_PROTOCOL["intertrial"])
         _iti_label = {"time": "Fixed time", "fixed_region": "Fixed region",
@@ -855,27 +1092,39 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_type_combo.blockSignals(True)
         self._iti_type_combo.setCurrentText(_iti_label)
         self._iti_type_combo.blockSignals(False)
+
+        # Colour state persists independently of which region widgets exist, so a
+        # save→load round-trip keeps both regions' colours.
+        reg = iti.get("region", {})
+        rnd = iti.get("random_region", {})
+        rc = reg.get("color", [255, 255, 255])
+        nc = rnd.get("color", [255, 255, 255])
+        self._reg_color = QtGui.QColor(int(rc[0]), int(rc[1]), int(rc[2]))
+        self._rnd_color = QtGui.QColor(int(nc[0]), int(nc[1]), int(nc[2]))
+
         self._rebuild_iti_section()   # builds sub-widgets for the selected type
 
         # Populate sub-widgets from dict (they exist now that _rebuild ran)
-        reg = iti.get("region", {})
-        rnd = iti.get("random_region", {})
         if self._iti_time_spin is not None:
             self._iti_time_spin.setValue(float(iti.get("duration_s", 5.0)))
         if self._iti_reg_x_spin is not None:
-            self._iti_reg_x_spin.setValue(float(reg.get("x", 0.5)))
-            self._iti_reg_y_spin.setValue(float(reg.get("y", 0.5)))
-            self._iti_reg_radius_spin.setValue(float(reg.get("radius", 0.1)))
+            self._iti_reg_x_spin.setValue(float(reg.get("x_cm", 0.0)))
+            self._iti_reg_y_spin.setValue(float(reg.get("y_cm", 0.0)))
+            self._iti_reg_diam_spin.setValue(float(reg.get("diameter_cm", 6.0)))
+            self._iti_reg_bright.setValue(int(reg.get("brightness", 100)))
+            self._update_swatch(self._iti_reg_color_btn, self._reg_color)
             self._iti_reg_dur_type.setCurrentText(
                 "Fixed" if reg.get("duration_type", "fixed") == "fixed" else "Random (0 – max)")
             self._iti_reg_dur_spin.setValue(float(reg.get("duration_s", 2.0)))
             self._iti_reg_dur_max_spin.setValue(float(reg.get("duration_max_s", 3.0)))
             self._update_iti_dur_visibility()
-        if self._iti_rnd_radius_spin is not None:
-            self._iti_rnd_radius_spin.setValue(float(rnd.get("radius", 0.1)))
-            self._iti_rnd_margin_x_spin.setValue(float(rnd.get("margin_x", 0.5)))
-            self._iti_rnd_margin_y_spin.setValue(float(rnd.get("margin_y", 0.5)))
-            self._iti_rnd_margin_radius_spin.setValue(float(rnd.get("margin_radius", 0.3)))
+        if self._iti_rnd_diam_spin is not None:
+            self._iti_rnd_diam_spin.setValue(float(rnd.get("diameter_cm", 6.0)))
+            self._iti_rnd_bright.setValue(int(rnd.get("brightness", 100)))
+            self._update_swatch(self._iti_rnd_color_btn, self._rnd_color)
+            self._iti_rnd_margin_x_spin.setValue(float(rnd.get("margin_x_cm", 0.0)))
+            self._iti_rnd_margin_y_spin.setValue(float(rnd.get("margin_y_cm", 0.0)))
+            self._iti_rnd_margin_radius_spin.setValue(float(rnd.get("margin_radius_cm", 10.0)))
             self._iti_rnd_dur_type.setCurrentText(
                 "Fixed" if rnd.get("duration_type", "fixed") == "fixed" else "Random (0 – max)")
             self._iti_rnd_dur_spin.setValue(float(rnd.get("duration_s", 2.0)))
