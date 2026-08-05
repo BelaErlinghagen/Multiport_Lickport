@@ -27,7 +27,7 @@ The idea behind the Lick-O-Tron was to create a lickport for behavioral mouse ex
 ### Design
 
 The Lick-O-Tron contains three submodules: one Arduino proMicro and two MOSFET relay modules. The Arduino proMicro, as well as the power outlets of the MOSFET relay modules recieve power via the main connector (8 pin plug). 
-The Arduino's job is to register licks via a capacitive sensor (a needle that is connected to the single pin at the bottom of the Lick-O-Tron). This is achieved with the code found ![here](https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/LickportArduinoCode.ino). It then transmits binary data about lick events to the Arduino Megas that are housed on the PORTMASTER. The MOSFET modules are activated by the master Arduinos on the PORTMASTER and can trigger peristaltic pumps (or valves, etc...). The idea here is that lick information is recieved by the master Arduinos and then, depending on the needs of the experimenter, pumps are activated at set timepoints/with set PWM. This allows for very flexible control of liquid dispensation. The Lick-O-Tron further connects the master Arduinos with an LED, which can be independently controlled.
+The Arduino's job is to register licks via a capacitive sensor (a cannula that is connected to the single pin at the bottom of the Lick-O-Tron). This is achieved with the code found ![here](https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/LickportArduinoCode.ino). It then transmits binary data about lick events to the Arduino Megas that are housed on the PORTMASTER. The MOSFET modules are activated by the master Arduinos on the PORTMASTER and can trigger peristaltic pumps (or valves, etc...). The idea here is that lick information is recieved by the master Arduinos and then, depending on the needs of the experimenter, pumps are activated at set timepoints/with set PWM. This allows for very flexible control of liquid dispensation. The Lick-O-Tron further connects the master Arduinos with an LED, which can be independently controlled.
 
 <p align="middle">
   <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronFront.png" width="250" />
@@ -42,7 +42,7 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
 #### Parts
 | Item | Quantity | Manufactured by | EAN |
 | :---------- | ----------: | :---------- | ----------: |
-| Joy It Pro Micro | 1 | Joy It | 4250236822907 |
+| Joy It proMicro | 1 | Joy It | 4250236822907 |
 | MOSFET Relay Module | 2 | tbd | tbd |
 | Mini Peristaltic Pump | 1 (up to 2) | Whadda | 5410329730017 |
 | Lick-O-Tron PCB | 1 | Eurocircuits | None: see Folder in Repo |
@@ -54,9 +54,44 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
 | M3 Nuts | 4 | SWG Hox | 4053056028951 |
 | Sterican Canula | 2 | Roth | - |
 
+#### Step 1: Soldering
+
+With the PCB, the proMicro, the LED, the Resistors, some pins and the Relay Modules at hand, the first step is to solder all of these components onto the PCB. By the end, the PCB should look similar to what can be seen in Figure 2.
+
+#### Step 2: Uploading the code and testing the sensor
+
+Upload the Lick-O-Tron ![code](https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/LickportArduinoCode.ino) from this repo to the JoyIt proMicro using the Arduino IDE. Then, using the serial monitor, test whether touching the sensor pin registers something.
+
+#### Step 3: Preparing the cannula
+
+<p align="middle">
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/CannulaExample.jpg" width="500" />
+</p>
+<center>
+  <i>Figure 3: Example cannula assembly.</i>
+</center>
+
+In order to electrically connect the cannula to the sensor pin, for this build of the Multiport Setup, a wire was wrapped around the cannula, clamped to it and then a second wire was soldered onto the first one. This second wire was then soldered to a pin connector piece to connect to the sensor pin.
+
+#### Step 4: Assembly
+
+Once all those pieces are created, the Lick-O-Tron can be assembled. In the Multiport build that is previewed here, the PCB was simply put into the 3D printed chamber and everything was screwed together directly onto the arena (where the spout frame was already fixed into the acrylic sheets).
+
+#### Step 5: Add the pump
+
+In order to add the pump, solder two wires to the solder flags and on their other ends to a pin connector. Next, for exactly rebuilding the setup shown here, 3D print the pump holder pieces and attach the pump as shown in Fig. 4.
+
 
 ### Usage
 
+<p align="middle">
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-Tron_insetup.jpg" width="700" />
+</p>
+<center>
+  <i>Figure 4: All pieces together.</i>
+</center>
+
+The Lick-O-Tron is supposed to be connected via an 8 band ribbon cable to the PORTMASTER. The PORTMASTER can control up to 16 Lick-O-Trons.
 
 
 
@@ -66,7 +101,7 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
   <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/PORTMASTER/Portmaster.jpg" width="700" />
 </p>
 <center>
-  <i>Figure 3: The PORTMASTER rack, lid opened.</i>
+  <i>Figure 5: The PORTMASTER rack, lid opened.</i>
 </center>
 
 In order to control up to 16 Lick-O-Tron lickports, the PORTMASTER was designed: two Arduino Mega Microcontroller which are connected within the Multiport-Setup to the Computer via serial connection. The 

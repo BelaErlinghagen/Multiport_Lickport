@@ -10,13 +10,20 @@ Section layout (inside a QScrollArea):
       • number of rewards (dropdown 1-16)
       • per-reward config  (dynamic table: duration, probability)
       • distribution       (fixed port map  OR  random + spacing)
+      • sporadic switching (two rewards trade lickports mid-session)
+      • delay              (release OR equalise, from session start)
       • LED activation     (mode dropdown + optional neighbor count)
-      • Beamer          (global light / shadow mode)
-      • Screens         (trial + ITI pattern per touch screen, optional shuffle)
+      • Screens         (mode: none / static / dynamic)
   ── Trial ───────────────────────────────────────────────────────
+  ── Sounds ──────────────────────────────────────────────────────
+      • a tone at trial start and/or trial end
   ── Intertrial Interval ──────────────────────────────────────────
       • Fixed time  OR  Fixed region  OR  Random region
+      • each region carries its own beamer light/shadow mode
       • Region settings shown as live overlay on the camera preview
+
+Protocols are read strictly — every key in DEFAULT_PROTOCOL must be present, so a
+malformed file raises KeyError at load rather than silently running with defaults.
 """
 
 import json
@@ -46,13 +53,31 @@ class ProtocolPage(QtWidgets.QWidget):
                 "type": "fixed",
                 "fixed_map": {"1": 1, "2": 9},
                 "min_spacing": 4,
+                "exclude_previous": False,
             },
             "led_mode": "reward_only",
             "led_neighbors": 1,
+            "switching": {"enabled": False, "probability": 0.0},
+            "delay": {
+                "enabled": False,
+                "mode": "release",            # "release" | "equalise"
+                "duration_type": "fixed",     # "fixed" | "random"
+                "duration_s": 10.0,
+                "duration_max_s": 30.0,
+                # Applied to every reward once an "equalise" delay elapses.
+                "probability": 1.0,
+                "duration_ms": 500,
+            },
         },
         "trial": {
             "end_type": "time",
             "duration_s": 30,
+        },
+        "sounds": {
+            "trial_start": {"enabled": False, "frequency_hz": 1000,
+                            "volume": 1.0, "duration_s": 0.5},
+            "trial_end":   {"enabled": False, "frequency_hz": 1000,
+                            "volume": 1.0, "duration_s": 0.5},
         },
         "intertrial": {
             "type": "time",
@@ -60,6 +85,7 @@ class ProtocolPage(QtWidgets.QWidget):
             "region": {
                 "x_cm": 0.0, "y_cm": 0.0, "diameter_cm": 6.0,
                 "brightness": 100, "color": [255, 255, 255],
+                "shadow": False,
                 "duration_type": "fixed",
                 "duration_s": 2.0,
                 "duration_max_s": 3.0,
@@ -67,18 +93,24 @@ class ProtocolPage(QtWidgets.QWidget):
             "random_region": {
                 "diameter_cm": 6.0,
                 "brightness": 100, "color": [255, 255, 255],
+                "shadow": False,
                 "margin_x_cm": 0.0, "margin_y_cm": 0.0, "margin_radius_cm": 10.0,
                 "duration_type": "fixed",
                 "duration_s": 2.0,
                 "duration_max_s": 3.0,
             },
         },
-        "beamer": {"shadow": False},
         "screens": {
-            "enabled":   False,
+            "mode":      "none",              # "none" | "static" | "dynamic"
+            # static: one entry per screen
             "trial":     ["black", "black"],
             "iti":       ["black", "black"],
             "randomize": False,
+            # dynamic: one entry per reward
+            "dynamic": [
+                {"id": 1, "trial": "black", "iti": "black"},
+                {"id": 2, "trial": "black", "iti": "black"},
+            ],
         },
     }
 
@@ -99,6 +131,28 @@ class ProtocolPage(QtWidgets.QWidget):
     }
     _LED_MODE_KEYS = {v: k for k, v in _LED_MODE_LABELS.items()}
 
+    _SCREEN_MODE_LABELS = {
+        "none":    "None (screens stay black)",
+        "static":  "Static (pattern per screen)",
+        "dynamic": "Dynamic (pattern follows the reward)",
+    }
+    _SCREEN_MODE_KEYS = {v: k for k, v in _SCREEN_MODE_LABELS.items()}
+
+    _DELAY_MODE_LABELS = {
+        "release":  "Release (rewards inert until the delay passes)",
+        "equalise": "Equalise (all rewards share values after the delay)",
+    }
+    _DELAY_MODE_KEYS = {v: k for k, v in _DELAY_MODE_LABELS.items()}
+
+    # Fixed/random timing choices, shared by the ITI dwell and the reward delay.
+    # The second entry contains an en-dash (U+2013) — keep it in one place so the
+    # save/load round-trip can never disagree with the widget text.
+    _DWELL_LABELS = ["Fixed", "Random (0 – max)"]
+
+    _SOUND_KEYS = ("trial_start", "trial_end")
+    _SOUND_LABELS = {"trial_start": "Play a tone at trial start",
+                     "trial_end":   "Play a tone at trial end"}
+
     def __init__(self, beamer_queue=None):
         super().__init__()
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
@@ -110,6 +164,10 @@ class ProtocolPage(QtWidgets.QWidget):
         # Beamer sphere appearance for the two region menus (persist across rebuilds)
         self._reg_color = QtGui.QColor(255, 255, 255)
         self._rnd_color = QtGui.QColor(255, 255, 255)
+        # Per-region light/shadow mode. Persisted here (like the colours above) so the
+        # setting survives the widget teardown when the user switches ITI type.
+        self._reg_shadow = False
+        self._rnd_shadow = False
 
         # Dynamic section state — populated by rebuild helpers
         self._reward_rows: list[tuple[QtWidgets.QSpinBox,
@@ -118,15 +176,32 @@ class ProtocolPage(QtWidgets.QWidget):
         self._min_spacing_spin: QtWidgets.QSpinBox | None = None
         self._spacing_warn_lbl: QtWidgets.QLabel | None   = None
 
-        # Global beamer light/shadow (static; set once in _build_ui)
-        self._beamer_shadow_chk: QtWidgets.QCheckBox | None = None
+        # Sporadic reward switching (static; set once in _build_ui)
+        self._switch_enabled_chk: QtWidgets.QCheckBox | None = None
+        self._switch_prob_spin: QtWidgets.QDoubleSpinBox | None = None
+        self._switch_body_w: QtWidgets.QWidget | None = None
 
-        # Touch-screen patterns (static; set once in _build_ui)
-        self._screens_enabled_chk: QtWidgets.QCheckBox | None = None
+        # Reward delay (static; set once in _build_ui)
+        self._delay_enabled_chk = self._delay_mode_combo = None
+        self._delay_dur_type = self._delay_dur_spin = self._delay_dur_max_spin = None
+        self._delay_dur_fixed_w = self._delay_dur_max_w = None
+        self._delay_eq_prob_spin = self._delay_eq_dur_spin = self._delay_eq_w = None
+        self._delay_body_w = None
+
+        # Trial sounds — one entry per _SOUND_KEYS, each a dict of widget refs
+        self._sound_w: dict[str, dict] = {}
+
+        # Touch-screen patterns
+        self._screens_mode_combo: QtWidgets.QComboBox | None  = None
+        self._screens_static_w: QtWidgets.QWidget | None      = None
+        self._screens_dynamic_w: QtWidgets.QWidget | None     = None
+        self._screens_dyn_warn: QtWidgets.QLabel | None       = None
         self._screens_random_chk: QtWidgets.QCheckBox | None  = None
-        self._screens_rows: QtWidgets.QWidget | None          = None
         self._screen_trial_combos: list[QtWidgets.QComboBox]  = []
         self._screen_iti_combos: list[QtWidgets.QComboBox]    = []
+        # One (trial, iti) combo pair per reward — rebuilt when the count changes
+        self._screen_dyn_rows: list[tuple[QtWidgets.QComboBox,
+                                          QtWidgets.QComboBox]] = []
 
         # ITI widget refs (nullable; reset each time _rebuild_iti_section runs)
         self._iti_type_combo: QtWidgets.QComboBox | None = None        # static (set once in _build_ui)
@@ -135,6 +210,7 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_reg_x_spin = self._iti_reg_y_spin = self._iti_reg_diam_spin = None
         self._iti_reg_bright = self._iti_reg_color_btn = None
         self._iti_reg_beamer_chk = self._iti_reg_contour_chk = None
+        self._iti_reg_shadow_chk = None
         self._iti_reg_dur_type = self._iti_reg_dur_spin = self._iti_reg_dur_max_spin = None
         self._iti_reg_dur_fixed_w = self._iti_reg_dur_max_w = None
         # Random region (same sphere fields + margin + toggles + dwell)
@@ -142,6 +218,7 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_rnd_margin_x_spin = self._iti_rnd_margin_y_spin = None
         self._iti_rnd_margin_radius_spin = None
         self._iti_rnd_beamer_chk = self._iti_rnd_contour_chk = self._iti_rnd_margin_chk = None
+        self._iti_rnd_shadow_chk = None
         self._iti_rnd_dur_type = self._iti_rnd_dur_spin = self._iti_rnd_dur_max_spin = None
         self._iti_rnd_dur_fixed_w = self._iti_rnd_dur_max_w = None
 
@@ -260,6 +337,103 @@ class ProtocolPage(QtWidgets.QWidget):
         self._dist_container.layout().setSpacing(2)
         sl.addWidget(self._dist_container)
 
+        # Sporadic switching — rewards trade lickports partway through the session
+        sl.addSpacing(4)
+        sl.addWidget(self._sublabel("Sporadic switching"))
+        self._switch_enabled_chk = QtWidgets.QCheckBox(
+            "Rewards trade lickports during the session")
+        self._switch_enabled_chk.setStyleSheet("margin-left:8px;")
+        sl.addWidget(self._switch_enabled_chk)
+
+        self._switch_body_w = QtWidgets.QWidget()
+        sw_layout = QtWidgets.QVBoxLayout(self._switch_body_w)
+        sw_layout.setContentsMargins(8, 0, 0, 0)
+        sw_layout.setSpacing(2)
+        self._switch_prob_spin = QtWidgets.QDoubleSpinBox()
+        self._switch_prob_spin.setRange(0.0, 1.0)
+        self._switch_prob_spin.setSingleStep(0.05)
+        self._switch_prob_spin.setDecimals(2)
+        self._switch_prob_spin.setValue(0.0)
+        self._switch_prob_spin.setFixedWidth(90)
+        sw_layout.addWidget(self._labeled_row("Probability per trial:",
+                                              self._switch_prob_spin))
+        switch_note = QtWidgets.QLabel(
+            "Rolled once at the start of every trial after the first. On a hit two "
+            "rewards (a random pair when there are more than two) swap lickports for "
+            "the rest of the session — the ports in use never change, only which "
+            "reward sits at each.")
+        switch_note.setWordWrap(True)
+        switch_note.setStyleSheet("color:#777; font-size:9px;")
+        sw_layout.addWidget(switch_note)
+        sl.addWidget(self._switch_body_w)
+        self._switch_enabled_chk.toggled.connect(self._update_switch_visibility)
+
+        # Delay — gates or equalises the rewards for a while after the session starts
+        sl.addSpacing(4)
+        sl.addWidget(self._sublabel("Delay"))
+        self._delay_enabled_chk = QtWidgets.QCheckBox(
+            "Delay the reward regime after the session starts")
+        self._delay_enabled_chk.setStyleSheet("margin-left:8px;")
+        sl.addWidget(self._delay_enabled_chk)
+
+        self._delay_body_w = QtWidgets.QWidget()
+        dl_layout = QtWidgets.QVBoxLayout(self._delay_body_w)
+        dl_layout.setContentsMargins(8, 0, 0, 0)
+        dl_layout.setSpacing(2)
+
+        self._delay_mode_combo = QtWidgets.QComboBox()
+        self._delay_mode_combo.addItems(list(self._DELAY_MODE_LABELS.values()))
+        self._delay_mode_combo.setMinimumWidth(320)
+        dl_layout.addWidget(self._labeled_row("Mode:", self._delay_mode_combo))
+
+        self._delay_dur_type = QtWidgets.QComboBox()
+        self._delay_dur_type.addItems(self._DWELL_LABELS)
+        self._delay_dur_type.setFixedWidth(160)
+        dl_layout.addWidget(self._labeled_row("Duration type:", self._delay_dur_type))
+
+        # Session-scale, so this needs a wider range than the ITI dwell helper offers.
+        self._delay_dur_spin = self._make_delay_spin(10.0)
+        self._delay_dur_max_spin = self._make_delay_spin(30.0)
+        self._delay_dur_fixed_w = self._labeled_row("Duration:", self._delay_dur_spin)
+        self._delay_dur_max_w = self._labeled_row("Max duration:", self._delay_dur_max_spin)
+        dl_layout.addWidget(self._delay_dur_fixed_w)
+        dl_layout.addWidget(self._delay_dur_max_w)
+
+        self._delay_eq_w = QtWidgets.QWidget()
+        eq_layout = QtWidgets.QVBoxLayout(self._delay_eq_w)
+        eq_layout.setContentsMargins(0, 0, 0, 0)
+        eq_layout.setSpacing(2)
+        self._delay_eq_prob_spin = QtWidgets.QDoubleSpinBox()
+        self._delay_eq_prob_spin.setRange(0.0, 1.0)
+        self._delay_eq_prob_spin.setSingleStep(0.05)
+        self._delay_eq_prob_spin.setDecimals(2)
+        self._delay_eq_prob_spin.setValue(1.0)
+        self._delay_eq_prob_spin.setFixedWidth(90)
+        self._delay_eq_dur_spin = QtWidgets.QSpinBox()
+        self._delay_eq_dur_spin.setRange(1, 30000)
+        self._delay_eq_dur_spin.setValue(500)
+        self._delay_eq_dur_spin.setFixedWidth(100)
+        eq_layout.addWidget(self._labeled_row("Equalised probability:",
+                                              self._delay_eq_prob_spin))
+        eq_layout.addWidget(self._labeled_row("Equalised duration (ms):",
+                                              self._delay_eq_dur_spin))
+        dl_layout.addWidget(self._delay_eq_w)
+
+        delay_note = QtWidgets.QLabel(
+            "Release: the reward ports are inert until the delay passes — a lick does "
+            "nothing and does not use the reward up.\n"
+            "Equalise: until the delay passes each reward uses its own probability and "
+            "duration; afterwards every reward uses the equalised values above.\n"
+            "The clock runs once from the start of the session, not once per trial.")
+        delay_note.setWordWrap(True)
+        delay_note.setStyleSheet("color:#777; font-size:9px;")
+        dl_layout.addWidget(delay_note)
+        sl.addWidget(self._delay_body_w)
+
+        self._delay_enabled_chk.toggled.connect(self._update_delay_visibility)
+        self._delay_mode_combo.currentTextChanged.connect(self._update_delay_visibility)
+        self._delay_dur_type.currentTextChanged.connect(self._update_delay_visibility)
+
         # LED activation
         sl.addSpacing(4)
         led_row = QtWidgets.QHBoxLayout()
@@ -285,31 +459,23 @@ class ProtocolPage(QtWidgets.QWidget):
 
         self._led_mode_combo.currentTextChanged.connect(self._update_led_visibility)
 
-        # Beamer control (global light/shadow) + Screens placeholder
-        sl.addSpacing(4)
-        sl.addWidget(self._sublabel("Beamer control"))
-        self._beamer_shadow_chk = QtWidgets.QCheckBox("Shadow (dark sphere on a lit field)")
-        self._beamer_shadow_chk.setStyleSheet("margin-left:8px;")
-        sl.addWidget(self._beamer_shadow_chk)
-        beamer_note = QtWidgets.QLabel(
-            "Light: dark during trials, bright sphere marks the ITI target.\n"
-            "Shadow: whole area lit during trials, dark sphere marks the ITI target.")
-        beamer_note.setWordWrap(True)
-        beamer_note.setStyleSheet("color:#777; font-size:9px; margin-left:8px;")
-        sl.addWidget(beamer_note)
-
-        # Screens — one pattern per touch screen for the trial and for the ITI.
+        # Screens — none, a fixed pattern per screen, or patterns that follow rewards
         sl.addSpacing(4)
         sl.addWidget(self._sublabel("Screens"))
-        self._screens_enabled_chk = QtWidgets.QCheckBox(
-            "Show patterns on the touch screens")
-        self._screens_enabled_chk.setStyleSheet("margin-left:8px;")
-        sl.addWidget(self._screens_enabled_chk)
+        scr_mode_row = QtWidgets.QHBoxLayout()
+        scr_mode_row.addWidget(QtWidgets.QLabel("    Mode:"))
+        self._screens_mode_combo = QtWidgets.QComboBox()
+        self._screens_mode_combo.addItems(list(self._SCREEN_MODE_LABELS.values()))
+        self._screens_mode_combo.setMinimumWidth(260)
+        scr_mode_row.addWidget(self._screens_mode_combo)
+        scr_mode_row.addStretch()
+        sl.addLayout(scr_mode_row)
 
+        # -- Static: one pattern per screen, for the trial and for the ITI
         self._screen_trial_combos = []
         self._screen_iti_combos   = []
-        self._screens_rows = QtWidgets.QWidget()
-        scr_layout = QtWidgets.QVBoxLayout(self._screens_rows)
+        self._screens_static_w = QtWidgets.QWidget()
+        scr_layout = QtWidgets.QVBoxLayout(self._screens_static_w)
         scr_layout.setContentsMargins(8, 0, 0, 0)
         scr_layout.setSpacing(2)
         for phase, combos in (("Trial", self._screen_trial_combos),
@@ -340,9 +506,17 @@ class ProtocolPage(QtWidgets.QWidget):
         screens_note.setWordWrap(True)
         screens_note.setStyleSheet("color:#777; font-size:9px;")
         scr_layout.addWidget(screens_note)
-        sl.addWidget(self._screens_rows)
+        sl.addWidget(self._screens_static_w)
 
-        self._screens_enabled_chk.toggled.connect(self._update_screens_visibility)
+        # -- Dynamic: a pattern per reward; rows rebuilt when the count changes
+        self._screens_dynamic_w = QtWidgets.QWidget()
+        dyn_layout = QtWidgets.QVBoxLayout(self._screens_dynamic_w)
+        dyn_layout.setContentsMargins(8, 0, 0, 0)
+        dyn_layout.setSpacing(2)
+        sl.addWidget(self._screens_dynamic_w)
+
+        self._screens_mode_combo.currentTextChanged.connect(
+            self._update_screens_visibility)
 
         sl.addWidget(self._make_separator())
 
@@ -377,6 +551,13 @@ class ProtocolPage(QtWidgets.QWidget):
         # Connect reward count and distribution type to rebuilds
         self._count_combo.currentIndexChanged.connect(self._rebuild_reward_section)
         self._dist_type_combo.currentIndexChanged.connect(self._rebuild_dist_section)
+
+        sl.addWidget(self._make_separator())
+
+        # ── Sounds ────────────────────────────────────────────────
+        sl.addWidget(self._section_label("Sounds"))
+        for key in self._SOUND_KEYS:
+            sl.addWidget(self._build_sound_block(key))
 
         sl.addWidget(self._make_separator())
 
@@ -435,12 +616,82 @@ class ProtocolPage(QtWidgets.QWidget):
             if child:
                 child.setParent(None)
 
+    def _build_sound_block(self, key: str) -> QtWidgets.QWidget:
+        """One enable checkbox + frequency/length/volume row for a trial tone.
+
+        Mirrors the speaker test in the Cleaning/Testing tab, including the volume
+        being an *overdrive factor* shown as a percentage: 100 % is a clean sine and
+        higher clips, which is how the quiet speakers get driven hard.
+        """
+        block = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(block)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        chk = QtWidgets.QCheckBox(self._SOUND_LABELS[key])
+        chk.setStyleSheet("margin-left:8px;")
+        layout.addWidget(chk)
+
+        body = QtWidgets.QWidget()
+        body_layout = QtWidgets.QVBoxLayout(body)
+        body_layout.setContentsMargins(8, 0, 0, 0)
+        body_layout.setSpacing(2)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Frequency:"))
+        freq = QtWidgets.QSpinBox()
+        freq.setRange(20, 20000)
+        freq.setValue(1000)
+        freq.setSuffix(" Hz")
+        freq.setFixedWidth(90)
+        row.addWidget(freq)
+        row.addSpacing(12)
+        row.addWidget(QtWidgets.QLabel("Length:"))
+        length = QtWidgets.QDoubleSpinBox()
+        length.setRange(0.05, 30.0)
+        length.setSingleStep(0.1)
+        length.setDecimals(2)
+        length.setValue(0.5)
+        length.setSuffix(" s")
+        length.setFixedWidth(80)
+        row.addWidget(length)
+        row.addStretch()
+        row_w = QtWidgets.QWidget()
+        row_w.setLayout(row)
+        row.setContentsMargins(0, 0, 0, 0)
+        body_layout.addWidget(row_w)
+
+        vol_row = QtWidgets.QHBoxLayout()
+        vol_row.addWidget(QtWidgets.QLabel("Volume (overdrive):"))
+        vol = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        vol.setRange(0, 1000)
+        vol.setValue(100)
+        vol_lbl = QtWidgets.QLabel("100 %")
+        vol_lbl.setFixedWidth(48)
+        vol.valueChanged.connect(lambda v, l=vol_lbl: l.setText(f"{v} %"))
+        vol_row.addWidget(vol)
+        vol_row.addWidget(vol_lbl)
+        vol_row_w = QtWidgets.QWidget()
+        vol_row_w.setLayout(vol_row)
+        vol_row.setContentsMargins(0, 0, 0, 0)
+        body_layout.addWidget(vol_row_w)
+
+        layout.addWidget(body)
+        chk.toggled.connect(body.setEnabled)
+        body.setEnabled(chk.isChecked())
+
+        self._sound_w[key] = {"chk": chk, "freq": freq, "len": length,
+                              "vol": vol, "vol_lbl": vol_lbl, "body": body}
+        return block
+
     # ── Dynamic section builders ──────────────────────────────────────────────
 
     def _rebuild_reward_section(self):
-        """Rebuild both the reward-config table and the distribution panel."""
+        """Rebuild the reward-config table, the distribution panel and the
+        per-reward screen rows — all three are sized by the reward count."""
         self._rebuild_reward_config()
         self._rebuild_dist_section()
+        self._rebuild_screens_dynamic()
 
     def _rebuild_reward_config(self):
         """Rebuild the per-reward parameter table (duration + probability)."""
@@ -566,6 +817,75 @@ class ProtocolPage(QtWidgets.QWidget):
             self._min_spacing_spin.valueChanged.connect(self._update_spacing_warning)
             self._update_spacing_warning()
 
+    def _rebuild_screens_dynamic(self):
+        """Rebuild the per-reward pattern rows used by the Dynamic screen mode.
+
+        One (trial, ITI) pattern pair per reward. The screens themselves are pinned
+        to the lickports rewards 1 and 2 start on, so each screen shows the pattern
+        of whichever reward currently sits at its port.
+        """
+        self._clear_widget(self._screens_dynamic_w)
+        self._screen_dyn_rows = []
+        # _clear_widget reparents everything away, so the warning label has to be
+        # recreated here rather than built once.
+        self._screens_dyn_warn = None
+
+        layout = self._screens_dynamic_w.layout()
+        n = int(self._count_combo.currentText())
+
+        hdr = QtWidgets.QWidget()
+        hdr_l = QtWidgets.QHBoxLayout(hdr)
+        hdr_l.setContentsMargins(0, 0, 0, 0)
+        for text, width in [("Reward", 58), ("Trial pattern", 124), ("ITI pattern", 124)]:
+            lbl = QtWidgets.QLabel(text)
+            lbl.setFixedWidth(width)
+            lbl.setStyleSheet("color:#666; font-size:10px;")
+            hdr_l.addWidget(lbl)
+        hdr_l.addStretch()
+        layout.addWidget(hdr)
+
+        for i in range(n):
+            row_w = QtWidgets.QWidget()
+            row_l = QtWidgets.QHBoxLayout(row_w)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            row_l.setSpacing(4)
+
+            rid_lbl = QtWidgets.QLabel(str(i + 1))
+            rid_lbl.setFixedWidth(58)
+            rid_lbl.setStyleSheet("color:#ccc;")
+            row_l.addWidget(rid_lbl)
+
+            trial_combo = QtWidgets.QComboBox()
+            trial_combo.addItems(list(self._PATTERN_LABELS.values()))
+            trial_combo.setFixedWidth(120)
+            row_l.addWidget(trial_combo)
+
+            iti_combo = QtWidgets.QComboBox()
+            iti_combo.addItems(list(self._PATTERN_LABELS.values()))
+            iti_combo.setFixedWidth(120)
+            row_l.addWidget(iti_combo)
+
+            row_l.addStretch()
+            layout.addWidget(row_w)
+            self._screen_dyn_rows.append((trial_combo, iti_combo))
+
+        self._screens_dyn_warn = QtWidgets.QLabel("")
+        self._screens_dyn_warn.setWordWrap(True)
+        layout.addWidget(self._screens_dyn_warn)
+        if n < self._N_SCREENS:
+            self._screens_dyn_warn.setText(
+                f"⚠  Only reward 1 anchors a screen — screen 2 stays black all "
+                f"session. Use {self._N_SCREENS} or more rewards to drive both.")
+            self._screens_dyn_warn.setStyleSheet("color:#e06c00; font-size:10px;")
+        else:
+            self._screens_dyn_warn.setText(
+                "Screen 1 is pinned to the lickport reward 1 starts on, screen 2 to "
+                "reward 2's. Each screen shows the pattern of whichever reward is at "
+                "its port, so the patterns follow the rewards when they swap. Rewards "
+                "beyond the second never anchor a screen, but their pattern does show "
+                "if they swap onto one of those two ports.")
+            self._screens_dyn_warn.setStyleSheet("color:#777; font-size:9px;")
+
     def _update_spacing_warning(self):
         if self._min_spacing_spin is None or self._spacing_warn_lbl is None:
             return
@@ -596,12 +916,42 @@ class ProtocolPage(QtWidgets.QWidget):
             self._trial_end_combo.currentText() == "Fixed time")
 
     def _update_screens_visibility(self):
-        """Grey out the pattern pickers when screens are switched off."""
-        if self._screens_rows is None or self._screens_enabled_chk is None:
-            return
-        self._screens_rows.setEnabled(self._screens_enabled_chk.isChecked())
+        """Show the panel belonging to the selected screen mode.
+
+        setVisible rather than setEnabled: with three modes, greying out the two
+        inactive panels would leave a large block of dead space.
+        """
+        mode = self._SCREEN_MODE_KEYS[self._screens_mode_combo.currentText()]
+        self._screens_static_w.setVisible(mode == "static")
+        self._screens_dynamic_w.setVisible(mode == "dynamic")
+
+    def _update_switch_visibility(self):
+        self._switch_body_w.setVisible(self._switch_enabled_chk.isChecked())
+
+    def _update_delay_visibility(self):
+        """Show the delay body, and within it the timing row and equalised values
+        that match the selected mode."""
+        self._delay_body_w.setVisible(self._delay_enabled_chk.isChecked())
+        fixed = self._delay_dur_type.currentText() == self._DWELL_LABELS[0]
+        self._delay_dur_fixed_w.setVisible(fixed)
+        self._delay_dur_max_w.setVisible(not fixed)
+        self._delay_eq_w.setVisible(
+            self._DELAY_MODE_KEYS[self._delay_mode_combo.currentText()] == "equalise")
 
     # ── ITI section ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_delay_spin(val: float) -> QtWidgets.QDoubleSpinBox:
+        """Duration spin for the reward delay — session-scale, so it needs a wider
+        range than the ITI dwell helper's 600 s ceiling."""
+        sb = QtWidgets.QDoubleSpinBox()
+        sb.setRange(0.0, 86400.0)
+        sb.setSingleStep(1.0)
+        sb.setDecimals(1)
+        sb.setValue(val)
+        sb.setSuffix(" s")
+        sb.setFixedWidth(110)
+        return sb
 
     @staticmethod
     def _make_norm_spin(val: float = 0.5, lo: float = 0.0,
@@ -676,12 +1026,14 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_reg_x_spin = self._iti_reg_y_spin = self._iti_reg_diam_spin = None
         self._iti_reg_bright = self._iti_reg_color_btn = None
         self._iti_reg_beamer_chk = self._iti_reg_contour_chk = None
+        self._iti_reg_shadow_chk = None
         self._iti_reg_dur_type = self._iti_reg_dur_spin = self._iti_reg_dur_max_spin = None
         self._iti_reg_dur_fixed_w = self._iti_reg_dur_max_w = None
         self._iti_rnd_diam_spin = self._iti_rnd_bright = self._iti_rnd_color_btn = None
         self._iti_rnd_margin_x_spin = self._iti_rnd_margin_y_spin = None
         self._iti_rnd_margin_radius_spin = None
         self._iti_rnd_beamer_chk = self._iti_rnd_contour_chk = self._iti_rnd_margin_chk = None
+        self._iti_rnd_shadow_chk = None
         self._iti_rnd_dur_type = self._iti_rnd_dur_spin = self._iti_rnd_dur_max_spin = None
         self._iti_rnd_dur_fixed_w = self._iti_rnd_dur_max_w = None
 
@@ -690,6 +1042,13 @@ class ProtocolPage(QtWidgets.QWidget):
         if iti_type == "Fixed time":
             self._iti_time_spin = self._make_dur_spin(5.0)
             layout.addWidget(self._labeled_row("Duration:", self._iti_time_spin))
+            note = QtWidgets.QLabel(
+                "Light and shadow are a property of the ITI target region, so there "
+                "is no beamer mode to set here — the beamer stays dark for the whole "
+                "session. Pick Fixed region or Random region to use Shadow.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color:#777; font-size:9px;")
+            layout.addWidget(note)
 
         elif iti_type == "Fixed region":
             self._iti_reg_x_spin    = self._make_cm_spin(0.0)
@@ -712,9 +1071,22 @@ class ProtocolPage(QtWidgets.QWidget):
             layout.addWidget(self._toggle_row(self._iti_reg_beamer_chk, self._iti_reg_contour_chk))
             layout.addWidget(self._calib_hint())
 
+            layout.addWidget(self._sublabel("Beamer mode"))
+            self._iti_reg_shadow_chk = QtWidgets.QCheckBox(
+                "Shadow (dark sphere on a lit field)")
+            self._iti_reg_shadow_chk.setChecked(self._reg_shadow)
+            layout.addWidget(self._iti_reg_shadow_chk)
+            shadow_note = QtWidgets.QLabel(
+                "Light: dark during trials, bright sphere marks the ITI target.\n"
+                "Shadow: whole area lit during trials, dark sphere marks the ITI target.")
+            shadow_note.setWordWrap(True)
+            shadow_note.setStyleSheet("color:#777; font-size:9px;")
+            layout.addWidget(shadow_note)
+            self._iti_reg_shadow_chk.toggled.connect(self._reg_shadow_toggled)
+
             layout.addWidget(self._sublabel("Dwell time"))
             self._iti_reg_dur_type = QtWidgets.QComboBox()
-            self._iti_reg_dur_type.addItems(["Fixed", "Random (0 – max)"])
+            self._iti_reg_dur_type.addItems(self._DWELL_LABELS)
             self._iti_reg_dur_type.setFixedWidth(160)
             layout.addWidget(self._labeled_row("Duration type:", self._iti_reg_dur_type))
             self._iti_reg_dur_spin     = self._make_dur_spin(2.0)
@@ -765,9 +1137,22 @@ class ProtocolPage(QtWidgets.QWidget):
             layout.addWidget(note)
             layout.addWidget(self._calib_hint())
 
+            layout.addWidget(self._sublabel("Beamer mode"))
+            self._iti_rnd_shadow_chk = QtWidgets.QCheckBox(
+                "Shadow (dark sphere on a lit field)")
+            self._iti_rnd_shadow_chk.setChecked(self._rnd_shadow)
+            layout.addWidget(self._iti_rnd_shadow_chk)
+            rnd_shadow_note = QtWidgets.QLabel(
+                "Light: dark during trials, bright sphere marks the ITI target.\n"
+                "Shadow: whole area lit during trials, dark sphere marks the ITI target.")
+            rnd_shadow_note.setWordWrap(True)
+            rnd_shadow_note.setStyleSheet("color:#777; font-size:9px;")
+            layout.addWidget(rnd_shadow_note)
+            self._iti_rnd_shadow_chk.toggled.connect(self._rnd_shadow_toggled)
+
             layout.addWidget(self._sublabel("Dwell time"))
             self._iti_rnd_dur_type = QtWidgets.QComboBox()
-            self._iti_rnd_dur_type.addItems(["Fixed", "Random (0 – max)"])
+            self._iti_rnd_dur_type.addItems(self._DWELL_LABELS)
             self._iti_rnd_dur_type.setFixedWidth(160)
             layout.addWidget(self._labeled_row("Duration type:", self._iti_rnd_dur_type))
             self._iti_rnd_dur_spin     = self._make_dur_spin(2.0)
@@ -832,8 +1217,23 @@ class ProtocolPage(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _shadow(self) -> bool:
-        return bool(self._beamer_shadow_chk and self._beamer_shadow_chk.isChecked())
+    # Shadow is a per-region setting, so each preview reads its own checkbox. The
+    # persisted flag is the fallback for when the panel isn't currently built.
+    def _reg_shadow_on(self) -> bool:
+        return bool(self._iti_reg_shadow_chk.isChecked()
+                    if self._iti_reg_shadow_chk is not None else self._reg_shadow)
+
+    def _rnd_shadow_on(self) -> bool:
+        return bool(self._iti_rnd_shadow_chk.isChecked()
+                    if self._iti_rnd_shadow_chk is not None else self._rnd_shadow)
+
+    def _reg_shadow_toggled(self, on: bool):
+        self._reg_shadow = bool(on)
+        self._reg_live()      # re-project immediately if the beamer preview is on
+
+    def _rnd_shadow_toggled(self, on: bool):
+        self._rnd_shadow = bool(on)
+        self._refresh_rnd_beamer()
 
     @staticmethod
     def _eff_color(base: QtGui.QColor, bright: QtWidgets.QSlider | None) -> list:
@@ -872,7 +1272,7 @@ class ProtocolPage(QtWidgets.QWidget):
             "x_cm":        self._iti_reg_x_spin.value(),
             "y_cm":        self._iti_reg_y_spin.value(),
             "diameter_cm": self._iti_reg_diam_spin.value(),
-            "shadow":      self._shadow(),
+            "shadow":      self._reg_shadow_on(),
             "color":       self._eff_color(self._reg_color, self._iti_reg_bright),
         })
 
@@ -887,7 +1287,7 @@ class ProtocolPage(QtWidgets.QWidget):
             "x_cm":        0.0,
             "y_cm":        0.0,
             "diameter_cm": self._iti_rnd_diam_spin.value(),
-            "shadow":      self._shadow(),
+            "shadow":      self._rnd_shadow_on(),
             "color":       self._eff_color(self._rnd_color, self._iti_rnd_bright),
         })
 
@@ -987,7 +1387,10 @@ class ProtocolPage(QtWidgets.QWidget):
                 str(i + 1): int(combo.currentText())
                 for i, combo in enumerate(self._fixed_port_combos)
             }
-            dist = {"type": "fixed", "fixed_map": fixed_map, "min_spacing": 4}
+            # min_spacing / exclude_previous only apply to a random distribution, but
+            # both are written either way so switching type and back keeps the values.
+            dist = {"type": "fixed", "fixed_map": fixed_map,
+                    "min_spacing": 4, "exclude_previous": False}
         else:
             spacing          = self._min_spacing_spin.value() if self._min_spacing_spin else 4
             exclude_previous = (self._exclude_prev_chk.isChecked()
@@ -998,8 +1401,7 @@ class ProtocolPage(QtWidgets.QWidget):
                 "exclude_previous": exclude_previous,
             }
 
-        led_key = self._LED_MODE_KEYS.get(
-            self._led_mode_combo.currentText(), "reward_only")
+        led_key = self._LED_MODE_KEYS[self._led_mode_combo.currentText()]
 
         sess_type = "time" if self._sess_type_combo.currentText() == "Time" else "trials"
         end_type  = ("time" if self._trial_end_combo.currentText() == "Fixed time"
@@ -1018,10 +1420,13 @@ class ProtocolPage(QtWidgets.QWidget):
         def _color(c):
             return [c.red(), c.green(), c.blue()]
 
+        def _chk(box, fallback):
+            return bool(box.isChecked()) if box is not None else bool(fallback)
+
         iti = {
             "type":      {"Fixed time": "time",
                           "Fixed region": "fixed_region",
-                          "Random region": "random_region"}.get(iti_type, "time"),
+                          "Random region": "random_region"}[iti_type],
             "duration_s": _get(self._iti_time_spin, 5.0),
             "region": {
                 "x_cm":        _get(self._iti_reg_x_spin, 0.0),
@@ -1029,8 +1434,10 @@ class ProtocolPage(QtWidgets.QWidget):
                 "diameter_cm": _get(self._iti_reg_diam_spin, 6.0),
                 "brightness":  _bright(self._iti_reg_bright),
                 "color":       _color(self._reg_color),
+                "shadow":      _chk(self._iti_reg_shadow_chk, self._reg_shadow),
                 "duration_type": ("fixed" if (self._iti_reg_dur_type is None or
-                                              self._iti_reg_dur_type.currentText() == "Fixed")
+                                              self._iti_reg_dur_type.currentText()
+                                              == self._DWELL_LABELS[0])
                                   else "random"),
                 "duration_s":     _get(self._iti_reg_dur_spin, 2.0),
                 "duration_max_s": _get(self._iti_reg_dur_max_spin, 3.0),
@@ -1039,31 +1446,34 @@ class ProtocolPage(QtWidgets.QWidget):
                 "diameter_cm":   _get(self._iti_rnd_diam_spin, 6.0),
                 "brightness":    _bright(self._iti_rnd_bright),
                 "color":         _color(self._rnd_color),
+                "shadow":        _chk(self._iti_rnd_shadow_chk, self._rnd_shadow),
                 "margin_x_cm":      _get(self._iti_rnd_margin_x_spin, 0.0),
                 "margin_y_cm":      _get(self._iti_rnd_margin_y_spin, 0.0),
                 "margin_radius_cm": _get(self._iti_rnd_margin_radius_spin, 10.0),
                 "duration_type": ("fixed" if (self._iti_rnd_dur_type is None or
-                                              self._iti_rnd_dur_type.currentText() == "Fixed")
+                                              self._iti_rnd_dur_type.currentText()
+                                              == self._DWELL_LABELS[0])
                                   else "random"),
                 "duration_s":     _get(self._iti_rnd_dur_spin, 2.0),
                 "duration_max_s": _get(self._iti_rnd_dur_max_spin, 3.0),
             },
         }
 
-        beamer = {"shadow": bool(self._beamer_shadow_chk.isChecked())
-                  if self._beamer_shadow_chk else False}
-
         # ── Screens ───────────────────────────────────────────────
+        # Every mode's settings are written whatever the mode, so switching between
+        # them and back never loses a pattern.
         def _patterns(combos):
-            return [self._PATTERN_KEYS.get(c.currentText(), "black") for c in combos]
+            return [self._PATTERN_KEYS[c.currentText()] for c in combos]
 
         screens = {
-            "enabled":   bool(self._screens_enabled_chk.isChecked()
-                              if self._screens_enabled_chk else False),
+            "mode":      self._SCREEN_MODE_KEYS[self._screens_mode_combo.currentText()],
             "trial":     _patterns(self._screen_trial_combos),
             "iti":       _patterns(self._screen_iti_combos),
-            "randomize": bool(self._screens_random_chk.isChecked()
-                              if self._screens_random_chk else False),
+            "randomize": bool(self._screens_random_chk.isChecked()),
+            "dynamic":   [{"id":    i + 1,
+                           "trial": self._PATTERN_KEYS[t.currentText()],
+                           "iti":   self._PATTERN_KEYS[it.currentText()]}
+                          for i, (t, it) in enumerate(self._screen_dyn_rows)],
         }
 
         return {
@@ -1077,13 +1487,36 @@ class ProtocolPage(QtWidgets.QWidget):
                 "distribution":  dist,
                 "led_mode":      led_key,
                 "led_neighbors": self._led_neighbors_spin.value(),
+                "switching": {
+                    "enabled":     bool(self._switch_enabled_chk.isChecked()),
+                    "probability": round(self._switch_prob_spin.value(), 4),
+                },
+                "delay": {
+                    "enabled":       bool(self._delay_enabled_chk.isChecked()),
+                    "mode":          self._DELAY_MODE_KEYS[
+                        self._delay_mode_combo.currentText()],
+                    "duration_type": ("fixed" if self._delay_dur_type.currentText()
+                                      == self._DWELL_LABELS[0] else "random"),
+                    "duration_s":     self._delay_dur_spin.value(),
+                    "duration_max_s": self._delay_dur_max_spin.value(),
+                    "probability":    round(self._delay_eq_prob_spin.value(), 4),
+                    "duration_ms":    self._delay_eq_dur_spin.value(),
+                },
             },
             "trial": {
                 "end_type":   end_type,
                 "duration_s": self._trial_dur_spin.value(),
             },
+            "sounds": {
+                key: {
+                    "enabled":      bool(w["chk"].isChecked()),
+                    "frequency_hz": w["freq"].value(),
+                    "volume":       round(w["vol"].value() / 100.0, 3),
+                    "duration_s":   w["len"].value(),
+                }
+                for key, w in self._sound_w.items()
+            },
             "intertrial": iti,
-            "beamer":  beamer,
             "screens": screens,
         }
 
@@ -1091,36 +1524,45 @@ class ProtocolPage(QtWidgets.QWidget):
         """Populate all widgets from a protocol dict.
 
         Rebuilds dynamic sections explicitly to avoid spurious signal chaining.
+
+        The dict is read strictly — a missing key raises KeyError rather than
+        silently substituting a default, so a malformed protocol is caught at load
+        instead of quietly running an experiment the user did not configure. The
+        `is not None` widget guards below are a different thing: they test whether
+        the sub-widgets for the *selected* ITI type currently exist.
         """
         # ── Session ──────────────────────────────────────────────
-        sess = d.get("session", {})
+        sess = d["session"]
         self._sess_type_combo.blockSignals(True)
         self._sess_type_combo.setCurrentText(
-            "Time" if sess.get("type", "time") == "time" else "Trials")
+            "Time" if sess["type"] == "time" else "Trials")
         self._sess_type_combo.blockSignals(False)
-        self._sess_length_spin.setValue(int(sess.get("length", 600)))
+        self._sess_length_spin.setValue(int(sess["length"]))
         self._update_sess_unit()
 
         # ── Reward count → triggers rebuild ──────────────────────
-        rw    = d.get("rewards", {})
-        count = int(rw.get("count", 2))
+        rw    = d["rewards"]
+        count = int(rw["count"])
         self._count_combo.blockSignals(True)
         self._count_combo.setCurrentText(str(count))
         self._count_combo.blockSignals(False)
 
-        # Rebuild dynamic sections manually (no signal)
+        # Rebuild dynamic sections manually (no signal). The dynamic screen rows are
+        # sized by the reward count too, and must exist before the screens block
+        # below populates them.
         self._rebuild_reward_config()
+        self._rebuild_screens_dynamic()
 
         # Populate reward config rows
-        configs = {cfg["id"]: cfg for cfg in rw.get("configs", [])}
+        configs = {cfg["id"]: cfg for cfg in rw["configs"]}
         for i, (dur_spin, prob_spin) in enumerate(self._reward_rows):
-            cfg = configs.get(i + 1, {})
-            dur_spin.setValue(int(cfg.get("duration_ms", 500)))
-            prob_spin.setValue(float(cfg.get("probability", 1.0)))
+            cfg = configs[i + 1]
+            dur_spin.setValue(int(cfg["duration_ms"]))
+            prob_spin.setValue(float(cfg["probability"]))
 
         # ── Distribution ─────────────────────────────────────────
-        dist = rw.get("distribution", {})
-        dist_type = dist.get("type", "fixed")
+        dist = rw["distribution"]
+        dist_type = dist["type"]
         self._dist_type_combo.blockSignals(True)
         self._dist_type_combo.setCurrentText(
             "Fixed" if dist_type == "fixed" else "Random")
@@ -1129,105 +1571,140 @@ class ProtocolPage(QtWidgets.QWidget):
         self._rebuild_dist_section()
 
         if dist_type == "fixed":
-            fixed_map = dist.get("fixed_map", {})
+            fixed_map = dist["fixed_map"]
             for i, combo in enumerate(self._fixed_port_combos):
-                port = int(fixed_map.get(str(i + 1), 1))
-                combo.setCurrentText(str(port))
+                combo.setCurrentText(str(int(fixed_map[str(i + 1)])))
         else:
             if self._min_spacing_spin is not None:
-                self._min_spacing_spin.setValue(int(dist.get("min_spacing", 4)))
+                self._min_spacing_spin.setValue(int(dist["min_spacing"]))
             if self._exclude_prev_chk is not None:
-                self._exclude_prev_chk.setChecked(
-                    bool(dist.get("exclude_previous", False)))
+                self._exclude_prev_chk.setChecked(bool(dist["exclude_previous"]))
             self._update_spacing_warning()
 
         # ── LED ──────────────────────────────────────────────────
-        led_mode_key = rw.get("led_mode", "reward_only")
         self._led_mode_combo.blockSignals(True)
-        self._led_mode_combo.setCurrentText(
-            self._LED_MODE_LABELS.get(led_mode_key,
-                                      self._LED_MODE_LABELS["reward_only"]))
+        self._led_mode_combo.setCurrentText(self._LED_MODE_LABELS[rw["led_mode"]])
         self._led_mode_combo.blockSignals(False)
-        self._led_neighbors_spin.setValue(int(rw.get("led_neighbors", 1)))
+        self._led_neighbors_spin.setValue(int(rw["led_neighbors"]))
         self._update_led_visibility()
 
+        # ── Sporadic switching ───────────────────────────────────
+        sw = rw["switching"]
+        self._switch_enabled_chk.blockSignals(True)
+        self._switch_enabled_chk.setChecked(bool(sw["enabled"]))
+        self._switch_enabled_chk.blockSignals(False)
+        self._switch_prob_spin.setValue(float(sw["probability"]))
+        self._update_switch_visibility()
+
+        # ── Delay ────────────────────────────────────────────────
+        dl = rw["delay"]
+        for widget in (self._delay_enabled_chk, self._delay_mode_combo,
+                       self._delay_dur_type):
+            widget.blockSignals(True)
+        self._delay_enabled_chk.setChecked(bool(dl["enabled"]))
+        self._delay_mode_combo.setCurrentText(self._DELAY_MODE_LABELS[dl["mode"]])
+        self._delay_dur_type.setCurrentText(
+            self._DWELL_LABELS[0] if dl["duration_type"] == "fixed"
+            else self._DWELL_LABELS[1])
+        for widget in (self._delay_enabled_chk, self._delay_mode_combo,
+                       self._delay_dur_type):
+            widget.blockSignals(False)
+        self._delay_dur_spin.setValue(float(dl["duration_s"]))
+        self._delay_dur_max_spin.setValue(float(dl["duration_max_s"]))
+        self._delay_eq_prob_spin.setValue(float(dl["probability"]))
+        self._delay_eq_dur_spin.setValue(int(dl["duration_ms"]))
+        self._update_delay_visibility()
+
         # ── Trial ────────────────────────────────────────────────
-        trial    = d.get("trial", {})
-        end_type = trial.get("end_type", "time")
+        trial = d["trial"]
         self._trial_end_combo.blockSignals(True)
         self._trial_end_combo.setCurrentText(
-            "Fixed time" if end_type in ("time", "fixed") else "All rewards collected")
+            "Fixed time" if trial["end_type"] == "time" else "All rewards collected")
         self._trial_end_combo.blockSignals(False)
-        self._trial_dur_spin.setValue(int(trial.get("duration_s", 30)))
+        self._trial_dur_spin.setValue(int(trial["duration_s"]))
         self._update_trial_widgets()
 
-        # ── Beamer (global light/shadow) ─────────────────────────
-        beamer = d.get("beamer") or {}
-        if self._beamer_shadow_chk is not None:
-            self._beamer_shadow_chk.setChecked(bool(beamer.get("shadow", False)))
+        # ── Sounds ───────────────────────────────────────────────
+        for key, w in self._sound_w.items():
+            snd = d["sounds"][key]
+            w["chk"].blockSignals(True)
+            w["chk"].setChecked(bool(snd["enabled"]))
+            w["chk"].blockSignals(False)
+            w["freq"].setValue(int(snd["frequency_hz"]))
+            w["len"].setValue(float(snd["duration_s"]))
+            w["vol"].setValue(int(round(float(snd["volume"]) * 100)))
+            w["body"].setEnabled(w["chk"].isChecked())
 
         # ── Screens ──────────────────────────────────────────────
-        # Older protocols store "screens": null — fall back to the defaults.
-        screens = d.get("screens") or self.DEFAULT_PROTOCOL["screens"]
-        if self._screens_enabled_chk is not None:
-            self._screens_enabled_chk.blockSignals(True)
-            self._screens_enabled_chk.setChecked(bool(screens.get("enabled", False)))
-            self._screens_enabled_chk.blockSignals(False)
+        screens = d["screens"]
+        self._screens_mode_combo.blockSignals(True)
+        self._screens_mode_combo.setCurrentText(
+            self._SCREEN_MODE_LABELS[screens["mode"]])
+        self._screens_mode_combo.blockSignals(False)
         for key, combos in (("trial", self._screen_trial_combos),
                             ("iti",   self._screen_iti_combos)):
-            patterns = list(screens.get(key, []) or [])
+            patterns = screens[key]
             for i, combo in enumerate(combos):
-                pat = patterns[i] if i < len(patterns) else "black"
-                combo.setCurrentText(
-                    self._PATTERN_LABELS.get(pat, self._PATTERN_LABELS["black"]))
-        if self._screens_random_chk is not None:
-            self._screens_random_chk.setChecked(bool(screens.get("randomize", False)))
+                combo.setCurrentText(self._PATTERN_LABELS[patterns[i]])
+        self._screens_random_chk.setChecked(bool(screens["randomize"]))
+        dyn = {row["id"]: row for row in screens["dynamic"]}
+        for i, (trial_combo, iti_combo) in enumerate(self._screen_dyn_rows):
+            row = dyn[i + 1]
+            trial_combo.setCurrentText(self._PATTERN_LABELS[row["trial"]])
+            iti_combo.setCurrentText(self._PATTERN_LABELS[row["iti"]])
         self._update_screens_visibility()
 
         # ── Intertrial ───────────────────────────────────────────
-        iti = d.get("intertrial", self.DEFAULT_PROTOCOL["intertrial"])
+        iti = d["intertrial"]
         _iti_label = {"time": "Fixed time", "fixed_region": "Fixed region",
-                      "random_region": "Random region"}.get(iti.get("type", "time"), "Fixed time")
+                      "random_region": "Random region"}[iti["type"]]
         self._iti_type_combo.blockSignals(True)
         self._iti_type_combo.setCurrentText(_iti_label)
         self._iti_type_combo.blockSignals(False)
 
-        # Colour state persists independently of which region widgets exist, so a
-        # save→load round-trip keeps both regions' colours.
-        reg = iti.get("region", {})
-        rnd = iti.get("random_region", {})
-        rc = reg.get("color", [255, 255, 255])
-        nc = rnd.get("color", [255, 255, 255])
+        # Colour and shadow state persist independently of which region widgets
+        # exist, so a save→load round-trip keeps both regions' settings. These must
+        # be assigned before _rebuild_iti_section, which seeds the widgets from them.
+        reg = iti["region"]
+        rnd = iti["random_region"]
+        rc = reg["color"]
+        nc = rnd["color"]
         self._reg_color = QtGui.QColor(int(rc[0]), int(rc[1]), int(rc[2]))
         self._rnd_color = QtGui.QColor(int(nc[0]), int(nc[1]), int(nc[2]))
+        self._reg_shadow = bool(reg["shadow"])
+        self._rnd_shadow = bool(rnd["shadow"])
 
         self._rebuild_iti_section()   # builds sub-widgets for the selected type
 
         # Populate sub-widgets from dict (they exist now that _rebuild ran)
         if self._iti_time_spin is not None:
-            self._iti_time_spin.setValue(float(iti.get("duration_s", 5.0)))
+            self._iti_time_spin.setValue(float(iti["duration_s"]))
         if self._iti_reg_x_spin is not None:
-            self._iti_reg_x_spin.setValue(float(reg.get("x_cm", 0.0)))
-            self._iti_reg_y_spin.setValue(float(reg.get("y_cm", 0.0)))
-            self._iti_reg_diam_spin.setValue(float(reg.get("diameter_cm", 6.0)))
-            self._iti_reg_bright.setValue(int(reg.get("brightness", 100)))
+            self._iti_reg_x_spin.setValue(float(reg["x_cm"]))
+            self._iti_reg_y_spin.setValue(float(reg["y_cm"]))
+            self._iti_reg_diam_spin.setValue(float(reg["diameter_cm"]))
+            self._iti_reg_bright.setValue(int(reg["brightness"]))
             self._update_swatch(self._iti_reg_color_btn, self._reg_color)
+            self._iti_reg_shadow_chk.setChecked(self._reg_shadow)
             self._iti_reg_dur_type.setCurrentText(
-                "Fixed" if reg.get("duration_type", "fixed") == "fixed" else "Random (0 – max)")
-            self._iti_reg_dur_spin.setValue(float(reg.get("duration_s", 2.0)))
-            self._iti_reg_dur_max_spin.setValue(float(reg.get("duration_max_s", 3.0)))
+                self._DWELL_LABELS[0] if reg["duration_type"] == "fixed"
+                else self._DWELL_LABELS[1])
+            self._iti_reg_dur_spin.setValue(float(reg["duration_s"]))
+            self._iti_reg_dur_max_spin.setValue(float(reg["duration_max_s"]))
             self._update_iti_dur_visibility()
         if self._iti_rnd_diam_spin is not None:
-            self._iti_rnd_diam_spin.setValue(float(rnd.get("diameter_cm", 6.0)))
-            self._iti_rnd_bright.setValue(int(rnd.get("brightness", 100)))
+            self._iti_rnd_diam_spin.setValue(float(rnd["diameter_cm"]))
+            self._iti_rnd_bright.setValue(int(rnd["brightness"]))
             self._update_swatch(self._iti_rnd_color_btn, self._rnd_color)
-            self._iti_rnd_margin_x_spin.setValue(float(rnd.get("margin_x_cm", 0.0)))
-            self._iti_rnd_margin_y_spin.setValue(float(rnd.get("margin_y_cm", 0.0)))
-            self._iti_rnd_margin_radius_spin.setValue(float(rnd.get("margin_radius_cm", 10.0)))
+            self._iti_rnd_shadow_chk.setChecked(self._rnd_shadow)
+            self._iti_rnd_margin_x_spin.setValue(float(rnd["margin_x_cm"]))
+            self._iti_rnd_margin_y_spin.setValue(float(rnd["margin_y_cm"]))
+            self._iti_rnd_margin_radius_spin.setValue(float(rnd["margin_radius_cm"]))
             self._iti_rnd_dur_type.setCurrentText(
-                "Fixed" if rnd.get("duration_type", "fixed") == "fixed" else "Random (0 – max)")
-            self._iti_rnd_dur_spin.setValue(float(rnd.get("duration_s", 2.0)))
-            self._iti_rnd_dur_max_spin.setValue(float(rnd.get("duration_max_s", 3.0)))
+                self._DWELL_LABELS[0] if rnd["duration_type"] == "fixed"
+                else self._DWELL_LABELS[1])
+            self._iti_rnd_dur_spin.setValue(float(rnd["duration_s"]))
+            self._iti_rnd_dur_max_spin.setValue(float(rnd["duration_max_s"]))
             self._update_iti_dur_visibility()
         self._emit_overlay()
 

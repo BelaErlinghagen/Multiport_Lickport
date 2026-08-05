@@ -20,6 +20,15 @@ Inter-process communication (all multiprocessing objects):
   screen_queue     Queue      — {"screen_id", "pattern_id"} commands for
                                screen_controls (the two HDMI touch screens).
 
+Trial tones go through a SpeakerControls owned directly by this class rather than a
+queue and a process of its own: it opens no audio device until the first tone and
+plays through a daemon thread, so it never blocks the trial loop.
+
+The protocol is read strictly — every key ProtocolPage writes must be present, so a
+malformed protocol raises KeyError rather than silently running on defaults. The
+`_meta` block is the exception: the GUI injects it at runtime and a standalone run
+legitimately has none.
+
 Session flow:
   IDLE  →  (sm_active=True)  →  [TRIAL → ITI] × N  →  DONE / STOPPED  →  IDLE
 """
@@ -53,9 +62,24 @@ class StateMachine:
         self.beamer_queue  = beamer_queue   # optional Queue for beamer projection
         self.screen_queue  = screen_queue   # optional Queue for touch-screen patterns
         self._calib        = None           # BeamerCalibration, loaded at run()
-        self._shadow       = False          # protocol["beamer"]["shadow"] for this session
+        self._shadow       = False          # derived from the active ITI region
         self._field_color  = [255, 255, 255]  # stable shadow-field colour for this session
         self._screens      = {}             # protocol["screens"] for this session
+
+        # Live reward layout. Promoted from a local so _screens_apply can follow the
+        # rewards around the arena as they swap lickports.
+        self._reward_locations: dict = {}     # {reward_id: port}, mutated by switching
+        self._screen_anchor_ports: list = []  # port each screen is pinned to (or None)
+        self._switch_log: list = []           # [{"trial", "rewards", "ports"}]
+
+        # Reward delay (session-scoped: sampled once, measured from session start)
+        self._delay_cfg: dict = {}
+        self._delay_deadline = None
+
+        # Trial tones
+        self._sounds: dict = {}
+        self._speaker = None
+        self._speaker_tried = False
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -86,6 +110,12 @@ class StateMachine:
         self._beamer({"cmd": "clear"})
         for s in range(1, _SCREEN_COUNT + 1):
             self._screen(s, "black")
+        # A long trial tone must not outlive an emergency stop.
+        if self._speaker is not None:
+            try:
+                self._speaker.stop()
+            except Exception:
+                pass
 
     # ── Beamer ────────────────────────────────────────────────────────────────
 
@@ -110,19 +140,23 @@ class StateMachine:
     @staticmethod
     def _region_color(region: dict) -> list:
         """Region colour scaled by its brightness → [r, g, b] (0–255)."""
-        b = float(region.get("brightness", 100)) / 100.0
-        c = region.get("color", [255, 255, 255])
+        b = float(region["brightness"]) / 100.0
+        c = region["color"]
         return [int(c[0] * b), int(c[1] * b), int(c[2] * b)]
 
-    def _session_field_color(self, protocol: dict) -> list:
-        """Shadow-field colour for the whole session, taken from the ITI region so
-        the lit intensity matches between trials and ITIs. Defaults to full white
-        (e.g. a fixed-time ITI, which has no region colour)."""
-        iti = protocol.get("intertrial", {})
-        region = {"fixed_region":  iti.get("region", {}),
-                  "random_region": iti.get("random_region", {})}.get(
-                      iti.get("type", "time"), {})
-        return self._region_color(region)
+    @staticmethod
+    def _active_iti_region(protocol: dict) -> dict | None:
+        """The ITI region in play this session, or None for a fixed-time ITI.
+
+        Light/shadow is a property of the target region, so a fixed-time ITI — which
+        has no region — simply has no shadow mode and runs the beamer dark.
+        """
+        iti = protocol["intertrial"]
+        if iti["type"] == "fixed_region":
+            return iti["region"]
+        if iti["type"] == "random_region":
+            return iti["random_region"]
+        return None
 
     def _beamer_baseline(self, shadow: bool):
         """Trial / fixed-time baseline: dark (Light mode) or a fully lit projection
@@ -144,10 +178,50 @@ class StateMachine:
             "cmd":         "sphere",
             "x_cm":        x_cm,
             "y_cm":        y_cm,
-            "diameter_cm": float(region.get("diameter_cm", 6.0)),
+            "diameter_cm": float(region["diameter_cm"]),
             "shadow":      shadow,
             "color":       self._region_color(region),
         })
+
+    # ── Speaker ───────────────────────────────────────────────────────────────
+
+    def _speaker_obj(self):
+        """Lazily build the tone generator; None if it cannot be created.
+
+        SpeakerControls opens no audio device on construction — it only stores a
+        device string — and every tone runs in a daemon thread feeding a short-lived
+        `aplay` child, so this costs nothing until the first tone and never blocks
+        the trial loop. That is why the state machine owns one directly instead of
+        going through a queue and a separate process like the beamer and screens do.
+        """
+        if not self._speaker_tried:
+            self._speaker_tried = True
+            try:
+                from speaker_controls import SpeakerControls
+                self._speaker = SpeakerControls()
+            except Exception as exc:
+                print(f"[StateMachine] speaker unavailable: {exc}")
+                self._speaker = None
+        return self._speaker
+
+    def _play_sound(self, key: str):
+        """Play the protocol's "trial_start" / "trial_end" tone, if enabled."""
+        cfg = self._sounds[key]
+        if not cfg["enabled"]:
+            return
+        # Read the settings outside the guard below: a malformed protocol should
+        # raise like everywhere else, only a playback failure is survivable.
+        length, freq, volume = (float(cfg["duration_s"]),
+                                int(cfg["frequency_hz"]),
+                                float(cfg["volume"]))
+        spk = self._speaker_obj()
+        if spk is None:
+            return
+        try:
+            spk.produce_sound(length, freq, volume)
+        except Exception as exc:
+            # A dead speaker must never abort a running experiment.
+            print(f"[StateMachine] sound '{key}' failed: {exc}")
 
     # ── Touch screens ─────────────────────────────────────────────────────────
 
@@ -162,17 +236,35 @@ class StateMachine:
             pass
 
     def _screens_apply(self, phase: str) -> list:
-        """Show the protocol's *phase* ("trial" / "iti") patterns on the screens.
+        """Show the *phase* ("trial" / "iti") patterns on the screens.
 
-        With "randomize" on, the trial patterns are shuffled across the screens at
-        the start of every trial, so which screen carries which cue is
-        unpredictable. Returns the patterns actually shown (empty if disabled).
+        static  — the protocol's per-screen patterns. With "randomize" on, the trial
+                  patterns are shuffled across the screens at the start of every
+                  trial, so which screen carries which cue is unpredictable.
+        dynamic — each screen is pinned to the lickport its reward started on and
+                  shows the pattern of whichever reward currently occupies that
+                  port, so the cues follow the rewards when they swap.
+
+        Returns the patterns actually shown (empty in "none" mode).
         """
-        if not self._screens.get("enabled", False):
+        mode = self._screens["mode"]
+        if mode == "none":
             return []
-        patterns = list(self._screens.get(phase, []) or [])[:_SCREEN_COUNT]
-        if phase == "trial" and self._screens.get("randomize", False):
-            random.shuffle(patterns)
+
+        if mode == "static":
+            patterns = list(self._screens[phase])[:_SCREEN_COUNT]
+            if phase == "trial" and self._screens["randomize"]:
+                random.shuffle(patterns)
+        else:  # dynamic
+            by_rid = {row["id"]: row for row in self._screens["dynamic"]}
+            port_to_rid = {port: rid for rid, port in self._reward_locations.items()}
+            # These lookups read live runtime state — a screen with no anchoring
+            # reward, or a port no reward currently sits on — not protocol keys.
+            patterns = []
+            for port in self._screen_anchor_ports:
+                row = by_rid.get(port_to_rid.get(port))
+                patterns.append(row[phase] if row else "black")
+
         for i, pattern in enumerate(patterns):
             self._screen(i + 1, pattern)
         return patterns
@@ -220,11 +312,15 @@ class StateMachine:
         """Return {reward_id: port} mapping, or None if impossible."""
         dist = protocol["rewards"]["distribution"]
         if dist["type"] == "fixed":
-            return {int(k): int(v) for k, v in dist["fixed_map"].items()}
+            # Indexed by reward id rather than by whatever the map happens to hold,
+            # so a map missing a reward raises instead of quietly running a session
+            # with fewer rewards than the protocol asks for.
+            return {rid: int(dist["fixed_map"][str(rid)])
+                    for rid in range(1, int(protocol["rewards"]["count"]) + 1)}
 
         # Collect ports to exclude when the user enabled "exclude previous locations"
         excluded: set[int] = set()
-        if dist.get("exclude_previous", False):
+        if dist["exclude_previous"]:
             json_path = self._mouse_json_path(protocol)
             if json_path:
                 log = self._load_mouse_log(json_path)
@@ -235,7 +331,7 @@ class StateMachine:
 
         return self._random_locations(
             protocol["rewards"]["count"],
-            int(dist.get("min_spacing", 4)),
+            int(dist["min_spacing"]),
             excluded,
         )
 
@@ -270,11 +366,63 @@ class StateMachine:
                 return False
         return True
 
+    def _maybe_switch_rewards(self, protocol: dict, trial_num: int):
+        """Roll once at the start of a trial; on a hit two rewards trade lickports.
+
+        This is a permutation of the ports already in use, never a move to a free
+        one, so the set of occupied ports is invariant. That is what keeps the LED
+        set stable across trials and guarantees every dynamic screen anchor still
+        resolves to some reward — a future "move a reward to a free port" feature
+        would break both and needs more than a swap here.
+        """
+        sw = protocol["rewards"]["switching"]
+        # Trial 1 establishes the baseline layout, so rolls start from trial 2.
+        if not sw["enabled"] or trial_num <= 1 or len(self._reward_locations) < 2:
+            return
+        if random.random() >= float(sw["probability"]):
+            return
+
+        a, b = random.sample(sorted(self._reward_locations), 2)
+        self._reward_locations[a], self._reward_locations[b] = (
+            self._reward_locations[b], self._reward_locations[a])
+        self._switch_log.append({
+            "trial":   trial_num,
+            "rewards": [a, b],
+            "ports":   [self._reward_locations[a], self._reward_locations[b]],
+        })
+        print(f"[StateMachine] Trial {trial_num}: rewards {a} and {b} swapped ports "
+              f"→ {self._reward_locations}")
+
+    # ── Reward delay ──────────────────────────────────────────────────────────
+
+    def _delay_active(self) -> bool:
+        """True while the session-start reward delay is still running."""
+        return (self._delay_deadline is not None
+                and time.monotonic() < self._delay_deadline)
+
+    def _release_blocked(self) -> bool:
+        """Release mode: the ports are inert during the delay — a lick delivers
+        nothing and does not use the reward up."""
+        return (self._delay_cfg["enabled"]
+                and self._delay_cfg["mode"] == "release"
+                and self._delay_active())
+
+    def _reward_params(self, cfg: dict) -> tuple:
+        """(probability, duration_ms) for one reward.
+
+        Equalise mode replaces both with the delay block's values once the delay
+        has passed; until then each reward keeps its own.
+        """
+        d = self._delay_cfg
+        if d["enabled"] and d["mode"] == "equalise" and not self._delay_active():
+            return float(d["probability"]), int(d["duration_ms"])
+        return float(cfg["probability"]), int(cfg["duration_ms"])
+
     # ── LED activation ────────────────────────────────────────────────────────
 
     def _get_led_ports(self, protocol: dict, reward_ports: list) -> set:
         """Return the set of LED port IDs to illuminate based on protocol led_mode."""
-        mode = protocol["rewards"].get("led_mode", "reward_only")
+        mode = protocol["rewards"]["led_mode"]
         if mode == "none":
             return set()
         if mode == "all":
@@ -282,7 +430,7 @@ class StateMachine:
         if mode == "reward_only":
             return set(reward_ports)
         if mode == "neighbors":
-            n = int(protocol["rewards"].get("led_neighbors", 1))
+            n = int(protocol["rewards"]["led_neighbors"])
             ports = set()
             for p in reward_ports:
                 for d in range(-n, n + 1):
@@ -292,25 +440,35 @@ class StateMachine:
 
     # ── Trial ─────────────────────────────────────────────────────────────────
 
-    def _run_trial(self, trial_num: int, protocol: dict,
-                   reward_locations: dict, sm_stop, sm_active) -> bool:
+    def _run_trial(self, trial_num: int, protocol: dict, sm_stop, sm_active,
+                   sess_deadline: float | None = None) -> bool:
         """Execute one trial.
 
         Each rewarded port can be collected at most once per trial.
         On sensor trigger: roll probability; if hit, pulse the pump; regardless,
         turn off the LED and mark the port collected.
 
+        *sess_deadline* is a time.monotonic() stamp for the end of the session. It
+        bounds the "all rewards collected" end type, which otherwise has no time
+        limit at all — a trial would run forever if the mouse never licked, or for
+        the whole of a Release delay regardless of how short the session is.
+
         Returns True on normal completion, False if stopped early.
         """
+        # Roll the port swap first: the reward ports, LEDs and screen cues derived
+        # below must all describe the post-swap layout for this trial.
+        self._maybe_switch_rewards(protocol, trial_num)
+
         configs       = {cfg["id"]: cfg for cfg in protocol["rewards"]["configs"]}
-        reward_ports  = list(reward_locations.values())
-        port_to_rid   = {v: k for k, v in reward_locations.items()}
+        reward_ports  = list(self._reward_locations.values())
+        port_to_rid   = {v: k for k, v in self._reward_locations.items()}
         led_ports     = self._get_led_ports(protocol, reward_ports)
 
         # Beamer trial baseline: dark (Light mode) or full lit field (Shadow mode).
         self._beamer_baseline(self._shadow)
 
-        # Touch-screen cues for this trial (shuffled across screens if randomised).
+        # Touch-screen cues for this trial. Dynamic mode reads the reward layout, so
+        # this has to follow the swap above.
         screen_patterns = self._screens_apply("trial")
 
         for p in led_ports:
@@ -318,9 +476,11 @@ class StateMachine:
         print(f"[StateMachine] Trial {trial_num}: started  reward ports={reward_ports}"
               + (f"  screens={screen_patterns}" if screen_patterns else ""))
 
+        self._play_sound("trial_start")
+
         trial_conf  = protocol["trial"]
         end_type    = trial_conf["end_type"]
-        duration    = float(trial_conf.get("duration_s", 30))
+        duration    = float(trial_conf["duration_s"])
 
         collected   = set()
         trial_start = time.monotonic()
@@ -337,16 +497,21 @@ class StateMachine:
                 break
             if end_type == "all_rewards" and len(collected) >= len(reward_ports):
                 break
+            if sess_deadline is not None and time.monotonic() >= sess_deadline:
+                break
 
             # ── Sensor polling ────────────────────────────────────
             for port in reward_ports:
                 if port in collected:
                     continue
                 if int(self.sensor_array[port - 1]) == 1:
+                    # Release delay: the port is inert, so the lick is ignored
+                    # entirely — no pulse, and the reward stays available.
+                    if self._release_blocked():
+                        continue
+
                     rid  = port_to_rid[port]
-                    cfg  = configs.get(rid, {})
-                    prob = float(cfg.get("probability", 1.0))
-                    dur  = int(cfg.get("duration_ms", 500))
+                    prob, dur = self._reward_params(configs[rid])
 
                     if random.random() < prob:
                         print(f"[StateMachine] Trial {trial_num}: "
@@ -364,6 +529,9 @@ class StateMachine:
         # Turn off any remaining LEDs
         for p in led_ports:
             self._send(f"LED:{p}:OFF")
+
+        # Only on a normal end — an emergency stop returns above, silently.
+        self._play_sound("trial_end")
 
         print(f"[StateMachine] Trial {trial_num}: ended  "
               f"({len(collected)}/{len(reward_ports)} collected)")
@@ -383,7 +551,7 @@ class StateMachine:
           "random_region" — same but the target centre is drawn from a cm margin disc
         """
         import math
-        iti_type = iti_config.get("type", "time")
+        iti_type = iti_config["type"]
         shadow = self._shadow
 
         # Touch screens switch to their ITI patterns for the whole interval.
@@ -391,27 +559,26 @@ class StateMachine:
 
         if iti_type == "time":
             # Beamer stays at the trial baseline for the fixed duration.
-            return self._sleep(float(iti_config.get("duration_s", 3.0)), sm_stop, sm_active)
+            return self._sleep(float(iti_config["duration_s"]), sm_stop, sm_active)
 
         # ── Region-based ITI (target specified in cm) ─────────────────────────
         if iti_type == "fixed_region":
-            region = iti_config.get("region", {})
-            x_cm = float(region.get("x_cm", 0.0))
-            y_cm = float(region.get("y_cm", 0.0))
+            region = iti_config["region"]
+            x_cm = float(region["x_cm"])
+            y_cm = float(region["y_cm"])
         else:  # random_region — pick a centre uniformly inside the margin disc
-            region = iti_config.get("random_region", {})
-            mx = float(region.get("margin_x_cm", 0.0))
-            my = float(region.get("margin_y_cm", 0.0))
-            mr = float(region.get("margin_radius_cm", 10.0))
+            region = iti_config["random_region"]
+            mx = float(region["margin_x_cm"])
+            my = float(region["margin_y_cm"])
+            mr = float(region["margin_radius_cm"])
             ang  = random.uniform(0, 2 * math.pi)
             dist = mr * math.sqrt(random.uniform(0, 1))
             x_cm = mx + dist * math.cos(ang)
             y_cm = my + dist * math.sin(ang)
 
-        diameter_cm = float(region.get("diameter_cm", 6.0))
-        dur_type = region.get("duration_type", "fixed")
-        required_s = (float(region.get("duration_s", 2.0)) if dur_type == "fixed"
-                      else random.uniform(0, float(region.get("duration_max_s", 3.0))))
+        diameter_cm = float(region["diameter_cm"])
+        required_s = (float(region["duration_s"]) if region["duration_type"] == "fixed"
+                      else random.uniform(0, float(region["duration_max_s"])))
 
         # Project the target for the whole ITI.
         self._beamer_sphere(region, x_cm, y_cm, shadow)
@@ -483,26 +650,52 @@ class StateMachine:
         Writes a session entry to {mouse_id}.json at start; updates it with the
         end time on completion.
         """
-        # Beamer session setup: global light/shadow, a stable shadow-field colour,
-        # and the current cm↔camera calibration.
-        self._shadow = bool(protocol.get("beamer", {}).get("shadow", False))
-        self._field_color = self._session_field_color(protocol)
+        # Beamer session setup. Light/shadow belongs to the ITI target region, so a
+        # fixed-time ITI (no region) simply runs the beamer dark all session.
+        region = self._active_iti_region(protocol)
+        self._shadow      = bool(region["shadow"]) if region else False
+        self._field_color = self._region_color(region) if region else [255, 255, 255]
         self._load_calib()
 
-        # Touch-screen patterns for this session ("screens": null in older protocols).
-        self._screens = protocol.get("screens") or {}
+        # Touch-screen patterns for this session.
+        self._screens = protocol["screens"]
+        if self._screens["mode"] == "none":
+            # Blank once up front, so a pattern left over from the Cleaning/Testing
+            # tab doesn't sit on the screens for the whole session.
+            for s in range(1, _SCREEN_COUNT + 1):
+                self._screen(s, "black")
 
-        reward_locations = self._assign_locations(protocol)
-        if reward_locations is None:
+        self._sounds        = protocol["sounds"]
+        self._speaker       = None
+        self._speaker_tried = False
+        self._switch_log    = []
+
+        locations = self._assign_locations(protocol)
+        if locations is None:
             print("[StateMachine] ERROR: reward location constraints are infeasible "
                   f"(count={protocol['rewards']['count']}, "
-                  f"spacing={protocol['rewards']['distribution'].get('min_spacing')}). "
+                  f"spacing={protocol['rewards']['distribution']['min_spacing']}). "
                   "Aborting session.")
             session_done.value = True
             return
 
-        reward_ports = sorted(reward_locations.values())
-        print(f"[StateMachine] Session started.  Reward locations: {reward_locations}")
+        self._reward_locations = dict(locations)
+        # Each screen is pinned to the port its reward starts on. Captured before any
+        # switch roll, and padded with None so a screen without an anchoring reward
+        # deterministically stays black rather than keeping a stale pattern.
+        self._screen_anchor_ports = [locations.get(s + 1) for s in range(_SCREEN_COUNT)]
+
+        reward_ports = sorted(locations.values())
+        print(f"[StateMachine] Session started.  Reward locations: {locations}")
+
+        # Reward delay: sampled once here, but the deadline is anchored to the
+        # session clock below so the mouse-log disk write can't eat into it.
+        self._delay_cfg = protocol["rewards"]["delay"]
+        delay_s = 0.0
+        if self._delay_cfg["enabled"]:
+            delay_s = (float(self._delay_cfg["duration_s"])
+                       if self._delay_cfg["duration_type"] == "fixed"
+                       else random.uniform(0.0, float(self._delay_cfg["duration_max_s"])))
 
         # ── Write session start to mouse log ─────────────────────────────────
         meta       = protocol.get("_meta", {})
@@ -521,7 +714,11 @@ class StateMachine:
             "end_time":      None,
             "protocol_path": meta.get("protocol_path", ""),
             "protocol":      protocol_clean,
+            # The initial assignment. Switching permutes which reward sits where but
+            # never changes the port set, so this stays the session's port list.
             "reward_ports":  reward_ports,
+            "reward_switches": [],
+            "reward_delay_s":  round(delay_s, 3) if self._delay_cfg["enabled"] else None,
         }
 
         json_path = self._mouse_json_path(protocol)
@@ -538,6 +735,18 @@ class StateMachine:
         trial_num   = 0
         stopped     = False
 
+        # Anchored here rather than where it was sampled, so writing the mouse log
+        # above doesn't silently shorten the delay.
+        self._delay_deadline = (sess_start + delay_s
+                                if self._delay_cfg["enabled"] else None)
+        if self._delay_deadline is not None:
+            print(f"[StateMachine] Reward delay ({self._delay_cfg['mode']}) for "
+                  f"{delay_s:.1f} s from session start.")
+
+        # Bounds a trial that ends on "all rewards collected", which otherwise has
+        # no time limit of its own.
+        sess_deadline = sess_start + float(sess_length) if sess_type == "time" else None
+
         while True:
             if sm_stop.value or not sm_active.value:
                 stopped = True
@@ -548,8 +757,8 @@ class StateMachine:
                 break
 
             trial_num += 1
-            if not self._run_trial(trial_num, protocol, reward_locations,
-                                   sm_stop, sm_active):
+            if not self._run_trial(trial_num, protocol, sm_stop, sm_active,
+                                   sess_deadline):
                 stopped = True
                 break
 
@@ -559,8 +768,7 @@ class StateMachine:
                 (sess_type == "trials" and trial_num < sess_length)
             )
             if session_continues:
-                iti_config = protocol.get("intertrial", {"type": "time", "duration_s": 3.0})
-                if not self._run_iti(iti_config, sm_stop, sm_active):
+                if not self._run_iti(protocol["intertrial"], sm_stop, sm_active):
                     stopped = True
                     break
 
@@ -574,6 +782,7 @@ class StateMachine:
                 if (entry.get("session_id") == session_id
                         and entry.get("start_time") == start_str):
                     entry["end_time"] = end_str
+                    entry["reward_switches"] = self._switch_log
                     break
             self._save_mouse_log(json_path, log)
 

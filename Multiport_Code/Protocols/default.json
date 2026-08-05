@@ -1,0 +1,122 @@
+{
+  "session": {
+    "type": "time",
+    "length": 600
+  },
+  "rewards": {
+    "count": 2,
+    "configs": [
+      {
+        "id": 1,
+        "duration_ms": 500,
+        "probability": 1.0
+      },
+      {
+        "id": 2,
+        "duration_ms": 500,
+        "probability": 1.0
+      }
+    ],
+    "distribution": {
+      "type": "fixed",
+      "fixed_map": {
+        "1": 1,
+        "2": 9
+      },
+      "min_spacing": 4,
+      "exclude_previous": false
+    },
+    "led_mode": "reward_only",
+    "led_neighbors": 1,
+    "switching": {
+      "enabled": false,
+      "probability": 0.0
+    },
+    "delay": {
+      "enabled": false,
+      "mode": "release",
+      "duration_type": "fixed",
+      "duration_s": 10.0,
+      "duration_max_s": 30.0,
+      "probability": 1.0,
+      "duration_ms": 500
+    }
+  },
+  "trial": {
+    "end_type": "time",
+    "duration_s": 30
+  },
+  "sounds": {
+    "trial_start": {
+      "enabled": false,
+      "frequency_hz": 1000,
+      "volume": 1.0,
+      "duration_s": 0.5
+    },
+    "trial_end": {
+      "enabled": false,
+      "frequency_hz": 1000,
+      "volume": 1.0,
+      "duration_s": 0.5
+    }
+  },
+  "intertrial": {
+    "type": "time",
+    "duration_s": 5.0,
+    "region": {
+      "x_cm": 0.0,
+      "y_cm": 0.0,
+      "diameter_cm": 6.0,
+      "brightness": 100,
+      "color": [
+        255,
+        255,
+        255
+      ],
+      "shadow": false,
+      "duration_type": "fixed",
+      "duration_s": 2.0,
+      "duration_max_s": 3.0
+    },
+    "random_region": {
+      "diameter_cm": 6.0,
+      "brightness": 100,
+      "color": [
+        255,
+        255,
+        255
+      ],
+      "shadow": false,
+      "margin_x_cm": 0.0,
+      "margin_y_cm": 0.0,
+      "margin_radius_cm": 10.0,
+      "duration_type": "fixed",
+      "duration_s": 2.0,
+      "duration_max_s": 3.0
+    }
+  },
+  "screens": {
+    "mode": "none",
+    "trial": [
+      "black",
+      "black"
+    ],
+    "iti": [
+      "black",
+      "black"
+    ],
+    "randomize": false,
+    "dynamic": [
+      {
+        "id": 1,
+        "trial": "black",
+        "iti": "black"
+      },
+      {
+        "id": 2,
+        "trial": "black",
+        "iti": "black"
+      }
+    ]
+  }
+}

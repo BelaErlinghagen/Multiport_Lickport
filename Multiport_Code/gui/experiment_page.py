@@ -75,21 +75,44 @@ def session_from_entry_name(name):
 
 def _iti_detail(iti):
     """One-line plain-text description of an intertrial config."""
-    kind = iti.get("type", "time")
+    kind = iti["type"]
     if kind == "time":
-        return f"{iti.get('duration_s', '?')} s"
-    region = iti.get("region" if kind == "fixed_region" else "random_region", {})
-    bits = [f"sphere {region.get('diameter_cm', '?')} cm"]
+        return f"{iti['duration_s']} s"
+    region = iti["region"] if kind == "fixed_region" else iti["random_region"]
+    bits = [f"sphere {region['diameter_cm']} cm"]
     if kind == "fixed_region":
-        bits.append(f"at ({region.get('x_cm', '?')}, {region.get('y_cm', '?')}) cm")
+        bits.append(f"at ({region['x_cm']}, {region['y_cm']}) cm")
     else:
-        bits.append(f"within {region.get('margin_radius_cm', '?')} cm of "
-                    f"({region.get('margin_x_cm', '?')}, {region.get('margin_y_cm', '?')}) cm")
-    if region.get("duration_type", "fixed") == "fixed":
-        bits.append(f"dwell {region.get('duration_s', '?')} s")
+        bits.append(f"within {region['margin_radius_cm']} cm of "
+                    f"({region['margin_x_cm']}, {region['margin_y_cm']}) cm")
+    if region["duration_type"] == "fixed":
+        bits.append(f"dwell {region['duration_s']} s")
     else:
-        bits.append(f"dwell random 0–{region.get('duration_max_s', '?')} s")
+        bits.append(f"dwell random 0–{region['duration_max_s']} s")
+    # Light/shadow is a property of the region, not of the session.
+    bits.append("shadow" if region["shadow"] else "light")
     return ", ".join(str(b) for b in bits)
+
+
+def _delay_detail(delay):
+    """One-line description of the reward delay, or None when it is off."""
+    if not delay["enabled"]:
+        return None
+    timing = (f"{delay['duration_s']} s"
+              if delay["duration_type"] == "fixed"
+              else f"random 0–{delay['duration_max_s']} s")
+    if delay["mode"] == "equalise":
+        return (f"equalise after {timing} from session start "
+                f"(then p={delay['probability']}, {delay['duration_ms']} ms for all)")
+    return f"release after {timing} from session start"
+
+
+def _sound_detail(sound):
+    """One-line description of a trial tone, or None when it is off."""
+    if not sound["enabled"]:
+        return None
+    return (f"{sound['frequency_hz']} Hz, {sound['duration_s']} s, "
+            f"{int(round(sound['volume'] * 100))} % overdrive")
 
 
 def build_entry_html(protocol, meta, reward_ports, comments):
@@ -115,55 +138,78 @@ def build_entry_html(protocol, meta, reward_ports, comments):
                    f"{e(os.path.basename(str(meta['protocol_path'])))}</li>")
     out.append("</ul>")
 
-    sess   = protocol.get("session", {})
-    trial  = protocol.get("trial", {})
-    rew    = protocol.get("rewards", {})
-    dist   = rew.get("distribution", {})
-    iti    = protocol.get("intertrial", {})
-    beamer = protocol.get("beamer") or {}
-    screens = protocol.get("screens") or {}
+    sess    = protocol["session"]
+    trial   = protocol["trial"]
+    rew     = protocol["rewards"]
+    dist    = rew["distribution"]
+    iti     = protocol["intertrial"]
+    screens = protocol["screens"]
+    switching = rew["switching"]
 
-    trial_detail = (f"{trial.get('duration_s', '?')} s per trial"
-                    if trial.get("end_type") == "time"
+    trial_detail = (f"{trial['duration_s']} s per trial"
+                    if trial["end_type"] == "time"
                     else "ends when all rewards collected")
 
     out.append("<h2>Protocol</h2><ul>")
-    out.append(f"<li><b>Session:</b> {e(str(sess.get('type', '?')))}, "
-               f"length {e(str(sess.get('length', '?')))}</li>")
-    out.append(f"<li><b>Trial:</b> {e(str(trial.get('end_type', '?')))} — {e(trial_detail)}</li>")
-    out.append(f"<li><b>Rewards:</b> {e(str(rew.get('count', '?')))} "
-               f"({e(str(dist.get('type', '?')))} distribution)</li>")
-    out.append(f"<li><b>LED mode:</b> {e(str(rew.get('led_mode', '?')))}</li>")
-    out.append(f"<li><b>Beamer:</b> {'shadow' if beamer.get('shadow') else 'light'}</li>")
-    if screens.get("enabled"):
-        s_trial = ", ".join(str(p) for p in (screens.get("trial") or []))
-        s_iti   = ", ".join(str(p) for p in (screens.get("iti") or []))
-        rnd     = " (randomised per trial)" if screens.get("randomize") else ""
-        out.append(f"<li><b>Screens:</b> trial [{e(s_trial)}]{e(rnd)} — "
+    out.append(f"<li><b>Session:</b> {e(str(sess['type']))}, "
+               f"length {e(str(sess['length']))}</li>")
+    out.append(f"<li><b>Trial:</b> {e(str(trial['end_type']))} — {e(trial_detail)}</li>")
+    out.append(f"<li><b>Rewards:</b> {e(str(rew['count']))} "
+               f"({e(str(dist['type']))} distribution)</li>")
+    out.append(f"<li><b>LED mode:</b> {e(str(rew['led_mode']))}</li>")
+
+    if switching["enabled"]:
+        out.append(f"<li><b>Switching:</b> two rewards trade lickports, "
+                   f"p={e(str(switching['probability']))} per trial</li>")
+    else:
+        out.append("<li><b>Switching:</b> off</li>")
+
+    delay_detail = _delay_detail(rew["delay"])
+    out.append(f"<li><b>Delay:</b> {e(delay_detail)}</li>" if delay_detail
+               else "<li><b>Delay:</b> off</li>")
+
+    mode = screens["mode"]
+    if mode == "static":
+        s_trial = ", ".join(str(p) for p in screens["trial"])
+        s_iti   = ", ".join(str(p) for p in screens["iti"])
+        rnd     = " (randomised per trial)" if screens["randomize"] else ""
+        out.append(f"<li><b>Screens:</b> static — trial [{e(s_trial)}]{e(rnd)} — "
                    f"ITI [{e(s_iti)}]</li>")
+    elif mode == "dynamic":
+        rows = ", ".join(f"R{r['id']}: {r['trial']}/{r['iti']}"
+                         for r in screens["dynamic"])
+        out.append(f"<li><b>Screens:</b> dynamic — pattern follows the reward "
+                   f"(trial/ITI per reward) [{e(rows)}]</li>")
     else:
         out.append("<li><b>Screens:</b> off</li>")
-    out.append(f"<li><b>Intertrial:</b> {e(str(iti.get('type', '?')))} — "
+
+    for key, label in (("trial_start", "Trial-start sound"),
+                       ("trial_end", "Trial-end sound")):
+        detail = _sound_detail(protocol["sounds"][key])
+        out.append(f"<li><b>{label}:</b> {e(detail)}</li>" if detail
+                   else f"<li><b>{label}:</b> off</li>")
+
+    out.append(f"<li><b>Intertrial:</b> {e(str(iti['type']))} — "
                f"{e(_iti_detail(iti))}</li>")
     out.append("</ul>")
 
-    configs = rew.get("configs") or []
+    configs = rew["configs"]
     if configs:
         out.append("<h3>Reward configuration</h3>")
         out.append("<table border='1' cellpadding='4' cellspacing='0'>"
                    "<tr><th>Reward</th><th>Duration (ms)</th><th>Probability</th></tr>")
         for cfg in configs:
-            out.append(f"<tr><td>{e(str(cfg.get('id', '')))}</td>"
-                       f"<td>{e(str(cfg.get('duration_ms', '')))}</td>"
-                       f"<td>{e(str(cfg.get('probability', '')))}</td></tr>")
+            out.append(f"<tr><td>{e(str(cfg['id']))}</td>"
+                       f"<td>{e(str(cfg['duration_ms']))}</td>"
+                       f"<td>{e(str(cfg['probability']))}</td></tr>")
         out.append("</table>")
 
     out.append("<h2>Chosen reward ports</h2>")
     if reward_ports:
         out.append(f"<p>{e(', '.join(str(p) for p in reward_ports))}</p>")
-        if dist.get("type") == "random":
+        if dist["type"] == "random":
             out.append(f"<p><i>Assigned randomly (min spacing "
-                       f"{e(str(dist.get('min_spacing', '?')))}).</i></p>")
+                       f"{e(str(dist['min_spacing']))}).</i></p>")
     else:
         out.append("<p><i>No reward ports recorded.</i></p>")
 
@@ -1304,17 +1350,26 @@ class ExperimentPage(QtWidgets.QWidget):
             self, "Select Protocol", start_dir, "JSON (*.json)")
         if not path:
             return
+        # The summary reads the protocol strictly, so a file written by an older
+        # version raises KeyError here. Catch it alongside the read errors and clear
+        # the loaded protocol, so a half-understood file can never be started.
         try:
             with open(path, "r") as fh:
                 self._loaded_protocol = json.load(fh)
+            self._loaded_protocol_path = path
+            self._proto_path_lbl.setText(path)
+            self._show_protocol_summary()
+        except KeyError as exc:
+            self._loaded_protocol = None
+            self._loaded_protocol_path = None
+            self._proto_path_lbl.setText(
+                f"Protocol file is missing key {exc} — re-save it in the Protocol tab.")
+            self._proto_summary.setVisible(False)
         except Exception as exc:
+            self._loaded_protocol = None
+            self._loaded_protocol_path = None
             self._proto_path_lbl.setText(f"Error loading: {exc}")
             self._proto_summary.setVisible(False)
-            return
-
-        self._loaded_protocol_path = path
-        self._proto_path_lbl.setText(path)
-        self._show_protocol_summary()
 
     def _show_protocol_summary(self):
         """Populate and reveal the summary box from self._loaded_protocol."""
@@ -1323,20 +1378,25 @@ class ExperimentPage(QtWidgets.QWidget):
             self._proto_summary.setVisible(False)
             return
 
-        sess = d.get("session", {})
-        s_type   = sess.get("type", "?")
-        s_length = sess.get("length", "?")
+        sess = d["session"]
+        s_type   = sess["type"]
+        s_length = sess["length"]
         unit     = "s" if s_type == "time" else "trials"
         self._sum_session.setText(f"Session: {s_type},  {s_length} {unit}")
 
-        rew  = d.get("rewards", {})
-        cnt  = rew.get("count", "?")
-        dist = rew.get("distribution", {}).get("type", "?")
-        self._sum_rewards.setText(f"Rewards: {cnt}  ({dist} distribution)")
+        rew  = d["rewards"]
+        extras = []
+        if rew["switching"]["enabled"]:
+            extras.append(f"switching p={rew['switching']['probability']}")
+        if rew["delay"]["enabled"]:
+            extras.append(f"{rew['delay']['mode']} delay")
+        suffix = f"  [{', '.join(extras)}]" if extras else ""
+        self._sum_rewards.setText(
+            f"Rewards: {rew['count']}  ({rew['distribution']['type']} distribution)"
+            f"{suffix}")
 
-        trial  = d.get("trial", {})
-        t_type = trial.get("end_type", "?")
-        t_detail = (f"{trial.get('duration_s', '?')} s per trial" if t_type == "time"
+        trial  = d["trial"]
+        t_detail = (f"{trial['duration_s']} s per trial" if trial["end_type"] == "time"
                     else "ends when all rewards collected")
         self._sum_trial.setText(f"Trial: {t_detail}")
 
@@ -1512,8 +1572,17 @@ class ExperimentPage(QtWidgets.QWidget):
             "start_time":    entry.get("start_time", ""),
             "end_time":      entry.get("end_time", ""),
         }
-        content = build_entry_html(self._loaded_protocol, meta,
-                                   entry.get("reward_ports", []), self._comments)
+        # The write-up reads the protocol strictly. A schema mismatch must never
+        # cost the user a real session's record, so fall back to a minimal body.
+        try:
+            content = build_entry_html(self._loaded_protocol, meta,
+                                       entry.get("reward_ports", []), self._comments)
+        except Exception as exc:
+            print(f"[ExperimentPage] could not render the session write-up: {exc}")
+            content = (f"<h2>Session</h2><p>{escape(mouse)} / {escape(session)}</p>"
+                       f"<p><i>The protocol summary could not be rendered "
+                       f"({escape(str(exc))}); the full protocol is stored in the "
+                       f"record.</i></p>")
         record = build_entry_record(
             name=build_entry_name(session),
             tags=self._selected_tags(),
