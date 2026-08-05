@@ -8,6 +8,7 @@ import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 import shared_states
+from speaker_controls import SpeakerControls
 
 
 class CleaningPage(QtWidgets.QWidget):
@@ -15,27 +16,37 @@ class CleaningPage(QtWidgets.QWidget):
 
     Section order (top → bottom):
       1. Beamer        — Test Sphere controls + Calibration wizard (via beamer_queue)
-      2. Screens       — placeholder, hardware not yet connected
-      3. ALL OFF safety button  ← sits directly above LED controls
-      4. LEDs          — manual toggle controls
-      5. Pumps         — manual pulse controls
-      6. BNC           — manual pulse controls
-      7. Automated Cleaning Cycle
+      2. Speaker       — tone test (frequency / length / overdrive volume)
+      3. Screens       — pattern test for the two HDMI screens (via screen_queue)
+      4. ALL OFF safety button  ← sits directly above LED controls
+      5. LEDs          — manual toggle controls
+      6. Pumps         — manual pulse controls
+      7. BNC           — manual pulse controls
+      8. Automated Cleaning Cycle
     """
 
     _BTN_SIZE = 44   # px, square grid buttons
 
-    def __init__(self, command_queue, beamer_queue=None):
+    def __init__(self, command_queue, beamer_queue=None, screen_queue=None):
         super().__init__()
         # WA_OpaquePaintEvent: Qt skips its background pre-fill before paintEvent.
         # Our paintEvent then fills every pixel, so the widget is never uninitialized.
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
         self.command_queue = command_queue
         self.beamer_queue = beamer_queue   # None if the beamer process isn't wired in
+        self.screen_queue = screen_queue   # None if the screen process isn't wired in
         self.frame_provider = None         # set by run_gui: object with latest_frame()
         self._sphere_color = QtGui.QColor(255, 255, 255)  # Test Sphere colour
         self._sphere_shown = False         # is a Test Sphere currently projected?
         self.led_state = {i: False for i in range(1, 17)}
+
+        # Speaker tone generator (headphone jack). Init failure must not break the
+        # rest of the panel, so guard it and disable playback if unavailable.
+        try:
+            self.speaker = SpeakerControls()
+        except Exception as exc:
+            print(f"[CleaningPage] speaker init failed: {exc}")
+            self.speaker = None
 
         # Cleaning-cycle state
         self._cleaning_active = False
@@ -119,32 +130,91 @@ class CleaningPage(QtWidgets.QWidget):
         root.addLayout(sphere_btn_row)
         root.addWidget(self._separator())
 
-        # ── 3. Screens (placeholder) ──────────────────────────────
+        # ── 2. Speaker ────────────────────────────────────────────
+        root.addWidget(self._section_label("Speaker"))
+
+        spk_row = QtWidgets.QHBoxLayout()
+        spk_row.addWidget(QtWidgets.QLabel("Frequency:"))
+        self.spk_freq = QtWidgets.QSpinBox()
+        self.spk_freq.setRange(20, 20000)
+        self.spk_freq.setValue(1000)
+        self.spk_freq.setSuffix(" Hz")
+        self.spk_freq.setFixedWidth(90)
+        spk_row.addWidget(self.spk_freq)
+        spk_row.addSpacing(12)
+        spk_row.addWidget(QtWidgets.QLabel("Length:"))
+        self.spk_length = QtWidgets.QDoubleSpinBox()
+        self.spk_length.setRange(0.05, 30.0)
+        self.spk_length.setSingleStep(0.1)
+        self.spk_length.setDecimals(2)
+        self.spk_length.setValue(0.5)
+        self.spk_length.setSuffix(" s")
+        self.spk_length.setFixedWidth(80)
+        spk_row.addWidget(self.spk_length)
+        spk_row.addStretch()
+        root.addLayout(spk_row)
+
+        # Volume is an overdrive factor: 100 % = clean sine, higher clips → louder.
+        vol_row = QtWidgets.QHBoxLayout()
+        vol_row.addWidget(QtWidgets.QLabel("Volume (overdrive):"))
+        self.spk_volume = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.spk_volume.setRange(0, 1000)
+        self.spk_volume.setValue(100)
+        self._spk_vol_lbl = QtWidgets.QLabel("100 %")
+        self._spk_vol_lbl.setFixedWidth(48)
+        self.spk_volume.valueChanged.connect(
+            lambda v: self._spk_vol_lbl.setText(f"{v} %"))
+        vol_row.addWidget(self.spk_volume)
+        vol_row.addWidget(self._spk_vol_lbl)
+        root.addLayout(vol_row)
+
+        spk_btn_row = QtWidgets.QHBoxLayout()
+        play_btn = QtWidgets.QPushButton("Play tone")
+        play_btn.clicked.connect(self._play_speaker)
+        spk_stop_btn = QtWidgets.QPushButton("Stop")
+        spk_stop_btn.clicked.connect(self._stop_speaker)
+        spk_btn_row.addWidget(play_btn)
+        spk_btn_row.addWidget(spk_stop_btn)
+        root.addLayout(spk_btn_row)
+        root.addWidget(self._separator())
+
+        # ── 3. Screens ────────────────────────────────────────────
         root.addWidget(self._section_label("Screens"))
 
+        # "Connected" means the screen process is running *and* the displays it
+        # was told to use (shared_states.screen_indices) actually exist — a missing
+        # display leaves its pattern window hidden, so commands go nowhere.
+        n_configured = len(getattr(shared_states, "screen_indices", []) or [])
+        n_attached = self._attached_screen_count()
+        screens_connected = self.screen_queue is not None and n_attached > 0
         screens_status_row = QtWidgets.QHBoxLayout()
         screens_dot = QtWidgets.QLabel("●")
-        screens_dot.setStyleSheet("color:#666; font-size:14px;")
+        screens_dot.setStyleSheet(
+            f"color:{'#1a9e1a' if screens_connected and n_attached == n_configured else '#b8860b' if screens_connected else '#666'};"
+            " font-size:14px;")
         screens_status_row.addWidget(screens_dot)
-        screens_status_row.addWidget(QtWidgets.QLabel("Not connected  (2 screens)"))
+        if self.screen_queue is None:
+            screens_text = "Not connected  (screen process not running)"
+        else:
+            screens_text = f"{n_attached} / {n_configured} HDMI screen(s) attached"
+        screens_status_row.addWidget(QtWidgets.QLabel(screens_text))
         screens_status_row.addStretch()
-        screens_connect = QtWidgets.QPushButton("Connect")
-        screens_connect.setEnabled(False)
-        screens_status_row.addWidget(screens_connect)
         root.addLayout(screens_status_row)
 
-        for screen_num in range(1, 3):
+        # One row per screen; each button overwrites that screen with its pattern.
+        screen_patterns = [("Black", "black"),
+                           ("White circles", "circles"),
+                           ("Black zigzag", "zigzag")]
+        for screen_num in range(1, max(2, n_configured) + 1):
             screen_row = QtWidgets.QHBoxLayout()
             screen_row.addWidget(QtWidgets.QLabel(f"Screen {screen_num}:"))
-            screen_pattern = QtWidgets.QComboBox()
-            screen_pattern.addItems(
-                ["Blank", "Grating 45°", "Grating 90°", "Noise", "Full flash"]
-            )
-            screen_pattern.setEnabled(False)
-            screen_row.addWidget(screen_pattern)
-            screen_test = QtWidgets.QPushButton("Test")
-            screen_test.setEnabled(False)
-            screen_row.addWidget(screen_test)
+            for label, pattern in screen_patterns:
+                btn = QtWidgets.QPushButton(label)
+                btn.setEnabled(self.screen_queue is not None)
+                btn.clicked.connect(
+                    lambda _, n=screen_num, p=pattern: self._set_screen_pattern(n, p))
+                screen_row.addWidget(btn)
+            screen_row.addStretch()
             root.addLayout(screen_row)
 
         root.addWidget(self._separator())
@@ -363,6 +433,47 @@ class CleaningPage(QtWidgets.QWidget):
     def _open_beamer_calibration(self):
         self._sphere_shown = False
         BeamerCalibrationDialog(self.beamer_queue, self.frame_provider, self).exec_()
+
+    # ── Speaker control ───────────────────────────────────────────
+
+    def _play_speaker(self):
+        if self.speaker is None:
+            return
+        # Slider is a percentage; 100 % → overdrive factor 1.0 (clean sine).
+        self.speaker.produce_sound(
+            self.spk_length.value(),
+            self.spk_freq.value(),
+            self.spk_volume.value() / 100.0,
+        )
+
+    def _stop_speaker(self):
+        if self.speaker is not None:
+            self.speaker.stop()
+
+    # ── Screen control ────────────────────────────────────────────
+
+    @staticmethod
+    def _attached_screen_count() -> int:
+        """How many of shared_states.screen_indices exist as real displays.
+
+        The screen process leaves the window hidden for an index that isn't
+        there, so this is what the pattern buttons can actually reach.
+        """
+        indices = getattr(shared_states, "screen_indices", []) or []
+        n_displays = len(QtWidgets.QApplication.screens())
+        return sum(1 for i in indices if 0 <= int(i) < n_displays)
+
+    def _send_screen(self, cmd: dict):
+        if self.screen_queue is None:
+            return
+        try:
+            self.screen_queue.put_nowait(cmd)
+        except Exception:
+            pass  # queue full — drop silently
+
+    def _set_screen_pattern(self, screen_num: int, pattern: str):
+        """Overwrite screen *screen_num* (1-based) with *pattern*."""
+        self._send_screen({"screen_id": screen_num, "pattern_id": pattern})
 
     # ── Manual control actions ────────────────────────────────────
 

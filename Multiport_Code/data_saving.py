@@ -1,9 +1,15 @@
 import numpy as np
 import pandas as pd
 import os
-from time import sleep
+import signal
+from time import monotonic, sleep
 from datetime import datetime
 from threading import Thread
+
+# How long rows may sit in RAM before being appended to the CSV. Overridden by
+# shared_states.save_chunk_seconds; the fallback keeps this module usable standalone.
+DEFAULT_CHUNK_SECONDS = 30
+
 
 class data_saver:
     def __init__(self, camera_data, sensor_data, dlc_data, timestamp_queue):
@@ -14,35 +20,60 @@ class data_saver:
         self.running = True
         print("Data saver launched.")
 
-    def start_saving(self, cohort_id, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag):
+    @staticmethod
+    def _flush(rows, csv_path):
+        """Append buffered rows to the session CSV and clear the buffer.
+
+        Writing in chunks (rather than holding one DataFrame until the session ends)
+        means a crash costs at most one chunk, and it avoids re-concatenating a
+        growing DataFrame on every 50 ms sample. The header is written only when the
+        file is created; there is no index column — Timestamp is the key.
+        """
+        if not rows:
+            return
+        pd.DataFrame(rows).to_csv(csv_path, mode="a", index=False,
+                                  header=not os.path.exists(csv_path))
+        print(f"[Saving] flushed {len(rows)} row(s) to {os.path.basename(csv_path)}")
+        rows.clear()
+
+    def start_saving(self, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag):
         from shared_states import data_path
-        # create cohort, mouse and session folders if they do not exist yet
-        cohort_path = data_path + f"/{cohort_id}"
-        mouse_path = cohort_path + f"/{mouse_id}"
+        # create mouse and session folders if they do not exist yet
+        mouse_path = data_path + f"/{mouse_id}"
         session_path = mouse_path + f"/{session_id}"
         try:
-            if not os.path.exists(cohort_path):
-                os.makedirs(cohort_path)
             if not os.path.exists(mouse_path):
                 os.makedirs(mouse_path)
             if not os.path.exists(session_path):
                 os.makedirs(session_path)
         except Exception as e:
             print(f"Folder Creation Error during Saving: {e}")
-        
-        current_time = current_time = datetime.now().strftime('%Y%m%d_%H:%M:%S')
+
+        current_time = current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
         recording_id = f"{current_time}_{session_id}"
         recording_folder = f"{session_path}/{recording_id}"
         os.makedirs(recording_folder)
         os.makedirs(f"{recording_folder}/Image_Arrays")
 
-        print(f"Saving Data for {mouse_id} in Cohort {cohort_id}, Session: {session_id} at {data_path}")
+        print(f"Saving Data for {mouse_id}, Session: {session_id} at {data_path}")
+
+        # Rows are buffered here and appended to the CSV every chunk_seconds, so a
+        # crash mid-session only loses the rows since the last flush.
+        try:
+            import shared_states
+            chunk_seconds = float(getattr(shared_states, "save_chunk_seconds",
+                                          DEFAULT_CHUNK_SECONDS))
+        except Exception:
+            chunk_seconds = DEFAULT_CHUNK_SECONDS
+        csv_path = f"{recording_folder}/{recording_id}_Data.csv"
+        rows = []
+        last_flush = monotonic()
+
         # saving loop, constantly checking if data should still be saved
-        dataframe = pd.DataFrame({'Timestamp': [], 'Sensors': [], 'DLCStuff': []})
         while True:
             if not self.running:
-                # Session ended — flush dataframe to disk and exit
-                dataframe.to_csv(f"{recording_folder}/{recording_id}_Data.csv")
+                # Session ended — write whatever has not been flushed yet and exit
+                self._flush(rows, csv_path)
                 break
             try:
                 current_timestamp = self.timestamp.get(timeout=0.05)
@@ -61,19 +92,33 @@ class data_saver:
                     dlc_data_copy = self.dlc_data.get_nowait()
                 except Exception:
                     dlc_data_copy = None
-            new_row = pd.DataFrame({
-                'Timestamp': [current_timestamp],
-                'Sensors':   [sensor_data_copy],
-                'DLCStuff':  [dlc_data_copy],
+            rows.append({
+                'Timestamp': current_timestamp,
+                'Sensors':   sensor_data_copy,
+                'DLCStuff':  dlc_data_copy,
             })
-            dataframe = pd.concat([dataframe, new_row]).reset_index(drop=True)
+            now = monotonic()
+            if now - last_flush >= chunk_seconds:
+                self._flush(rows, csv_path)
+                last_flush = now
             # sampling rate = 20 Hz
             sleep(0.05)
 
 
     
-def saving_process(camera_data, sensor_data, dlc_data, timestamp_queue, cohort_id, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag, running_flag):
+def saving_process(camera_data, sensor_data, dlc_data, timestamp_queue, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag, running_flag):
     saver = data_saver(camera_data, sensor_data, dlc_data, timestamp_queue)
+    saving_thread = None
+
+    # A SIGTERM (the GUI ending the recording) must not cut the saving thread off
+    # mid-chunk: stop the loop and give it a moment to append the buffered rows.
+    def _handle_term(_sig, _frame):
+        saver.running = False
+        if saving_thread is not None:
+            saving_thread.join(timeout=2)
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _handle_term)
+
     # constantly checking if the running_flag changes
     running_process = False
     while True:
@@ -82,15 +127,20 @@ def saving_process(camera_data, sensor_data, dlc_data, timestamp_queue, cohort_i
             running_process = True
             saver.running = True
             # To DO: move mouse id and so on in here so that it can be flexibly deployed
-            Thread(
+            saving_thread = Thread(
                 target=saver.start_saving,
-                args=(cohort_id, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag),
+                args=(mouse_id, session_id, camera_flag, sensor_flag, dlc_flag),
                 daemon=True
-            ).start()
+            )
+            saving_thread.start()
             print("Started Process")
         elif running_process == True and running_flag.value == False:
             print("Saving done.")
             saver.running = False
+            # Wait for the final flush so the process can exit without losing rows.
+            if saving_thread is not None:
+                saving_thread.join(timeout=5)
+                saving_thread = None
             running_process = False
         sleep(0.05)
             
@@ -118,7 +168,7 @@ if __name__ == "__main__":
     saving_dlc_data = Value('b', False)
     running_flag = Value('b', False)
     saving_proc = Process(target=saving_process, args=(
-        frame_queue, sensor_array, None, timestamp_queue, "Test_Cohort", "Test_Mouse", "Test_Session", 
+        frame_queue, sensor_array, None, timestamp_queue, "Test_Mouse", "Test_Session",
         saving_camera_data, saving_sensor_data, saving_dlc_data,  running_flag,)
         )
     saving_proc.start()

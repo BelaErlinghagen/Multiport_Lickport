@@ -10,8 +10,8 @@ Section layout (inside a QScrollArea):
       • per-reward config  (dynamic table: duration, probability)
       • distribution       (fixed port map  OR  random + spacing)
       • LED activation     (mode dropdown + optional neighbor count)
-      • Beamer placeholder
-      • Screens placeholder
+      • Beamer          (global light / shadow mode)
+      • Screens         (trial + ITI pattern per touch screen, optional shuffle)
   ── Trial ───────────────────────────────────────────────────────
   ── Intertrial Interval ──────────────────────────────────────────
       • Fixed time  OR  Fixed region  OR  Random region
@@ -73,8 +73,22 @@ class ProtocolPage(QtWidgets.QWidget):
             },
         },
         "beamer": {"shadow": False},
-        "screens": None,
+        "screens": {
+            "enabled":   False,
+            "trial":     ["black", "black"],
+            "iti":       ["black", "black"],
+            "randomize": False,
+        },
     }
+
+    # Touch-screen patterns (keys match screen_controls.normalize_pattern).
+    _N_SCREENS = 2
+    _PATTERN_LABELS = {
+        "black":   "Black",
+        "circles": "White circles",
+        "zigzag":  "Black zigzag",
+    }
+    _PATTERN_KEYS = {v: k for k, v in _PATTERN_LABELS.items()}
 
     _LED_MODE_LABELS = {
         "none":         "None (LEDs off during trial)",
@@ -105,6 +119,13 @@ class ProtocolPage(QtWidgets.QWidget):
 
         # Global beamer light/shadow (static; set once in _build_ui)
         self._beamer_shadow_chk: QtWidgets.QCheckBox | None = None
+
+        # Touch-screen patterns (static; set once in _build_ui)
+        self._screens_enabled_chk: QtWidgets.QCheckBox | None = None
+        self._screens_random_chk: QtWidgets.QCheckBox | None  = None
+        self._screens_rows: QtWidgets.QWidget | None          = None
+        self._screen_trial_combos: list[QtWidgets.QComboBox]  = []
+        self._screen_iti_combos: list[QtWidgets.QComboBox]    = []
 
         # ITI widget refs (nullable; reset each time _rebuild_iti_section runs)
         self._iti_type_combo: QtWidgets.QComboBox | None = None        # static (set once in _build_ui)
@@ -276,11 +297,51 @@ class ProtocolPage(QtWidgets.QWidget):
         beamer_note.setStyleSheet("color:#777; font-size:9px; margin-left:8px;")
         sl.addWidget(beamer_note)
 
+        # Screens — one pattern per touch screen for the trial and for the ITI.
         sl.addSpacing(4)
         sl.addWidget(self._sublabel("Screens"))
-        screens_ph = QtWidgets.QLabel("Screen control — not yet connected (placeholder)")
-        screens_ph.setStyleSheet("color:#555; font-style:italic; margin-left:8px;")
-        sl.addWidget(screens_ph)
+        self._screens_enabled_chk = QtWidgets.QCheckBox(
+            "Show patterns on the touch screens")
+        self._screens_enabled_chk.setStyleSheet("margin-left:8px;")
+        sl.addWidget(self._screens_enabled_chk)
+
+        self._screen_trial_combos = []
+        self._screen_iti_combos   = []
+        self._screens_rows = QtWidgets.QWidget()
+        scr_layout = QtWidgets.QVBoxLayout(self._screens_rows)
+        scr_layout.setContentsMargins(8, 0, 0, 0)
+        scr_layout.setSpacing(2)
+        for phase, combos in (("Trial", self._screen_trial_combos),
+                              ("ITI",   self._screen_iti_combos)):
+            row = QtWidgets.QHBoxLayout()
+            lbl = QtWidgets.QLabel(f"{phase}:")
+            lbl.setFixedWidth(40)
+            row.addWidget(lbl)
+            for s in range(self._N_SCREENS):
+                row.addWidget(QtWidgets.QLabel(f"Screen {s + 1}"))
+                combo = QtWidgets.QComboBox()
+                combo.addItems(list(self._PATTERN_LABELS.values()))
+                combo.setFixedWidth(120)
+                row.addWidget(combo)
+                combos.append(combo)
+            row.addStretch()
+            wrapper = QtWidgets.QWidget()
+            wrapper.setLayout(row)
+            row.setContentsMargins(0, 0, 0, 0)
+            scr_layout.addWidget(wrapper)
+
+        self._screens_random_chk = QtWidgets.QCheckBox(
+            "Randomise which screen shows which trial pattern (each trial)")
+        scr_layout.addWidget(self._screens_random_chk)
+        screens_note = QtWidgets.QLabel(
+            "Patterns are set at the start of each trial and each intertrial "
+            "interval, and both screens are blanked at the end of the session.")
+        screens_note.setWordWrap(True)
+        screens_note.setStyleSheet("color:#777; font-size:9px;")
+        scr_layout.addWidget(screens_note)
+        sl.addWidget(self._screens_rows)
+
+        self._screens_enabled_chk.toggled.connect(self._update_screens_visibility)
 
         sl.addWidget(self._make_separator())
 
@@ -532,6 +593,12 @@ class ProtocolPage(QtWidgets.QWidget):
     def _update_trial_widgets(self):
         self._trial_time_widget.setVisible(
             self._trial_end_combo.currentText() == "Fixed time")
+
+    def _update_screens_visibility(self):
+        """Grey out the pattern pickers when screens are switched off."""
+        if self._screens_rows is None or self._screens_enabled_chk is None:
+            return
+        self._screens_rows.setEnabled(self._screens_enabled_chk.isChecked())
 
     # ── ITI section ───────────────────────────────────────────────────────────
 
@@ -985,6 +1052,19 @@ class ProtocolPage(QtWidgets.QWidget):
         beamer = {"shadow": bool(self._beamer_shadow_chk.isChecked())
                   if self._beamer_shadow_chk else False}
 
+        # ── Screens ───────────────────────────────────────────────
+        def _patterns(combos):
+            return [self._PATTERN_KEYS.get(c.currentText(), "black") for c in combos]
+
+        screens = {
+            "enabled":   bool(self._screens_enabled_chk.isChecked()
+                              if self._screens_enabled_chk else False),
+            "trial":     _patterns(self._screen_trial_combos),
+            "iti":       _patterns(self._screen_iti_combos),
+            "randomize": bool(self._screens_random_chk.isChecked()
+                              if self._screens_random_chk else False),
+        }
+
         return {
             "session": {
                 "type":   sess_type,
@@ -1003,7 +1083,7 @@ class ProtocolPage(QtWidgets.QWidget):
             },
             "intertrial": iti,
             "beamer":  beamer,
-            "screens": None,
+            "screens": screens,
         }
 
     def _apply_protocol(self, d: dict):
@@ -1084,6 +1164,24 @@ class ProtocolPage(QtWidgets.QWidget):
         beamer = d.get("beamer") or {}
         if self._beamer_shadow_chk is not None:
             self._beamer_shadow_chk.setChecked(bool(beamer.get("shadow", False)))
+
+        # ── Screens ──────────────────────────────────────────────
+        # Older protocols store "screens": null — fall back to the defaults.
+        screens = d.get("screens") or self.DEFAULT_PROTOCOL["screens"]
+        if self._screens_enabled_chk is not None:
+            self._screens_enabled_chk.blockSignals(True)
+            self._screens_enabled_chk.setChecked(bool(screens.get("enabled", False)))
+            self._screens_enabled_chk.blockSignals(False)
+        for key, combos in (("trial", self._screen_trial_combos),
+                            ("iti",   self._screen_iti_combos)):
+            patterns = list(screens.get(key, []) or [])
+            for i, combo in enumerate(combos):
+                pat = patterns[i] if i < len(patterns) else "black"
+                combo.setCurrentText(
+                    self._PATTERN_LABELS.get(pat, self._PATTERN_LABELS["black"]))
+        if self._screens_random_chk is not None:
+            self._screens_random_chk.setChecked(bool(screens.get("randomize", False)))
+        self._update_screens_visibility()
 
         # ── Intertrial ───────────────────────────────────────────
         iti = d.get("intertrial", self.DEFAULT_PROTOCOL["intertrial"])

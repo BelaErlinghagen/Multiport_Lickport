@@ -24,19 +24,47 @@ camera_gain        = 20.0
 # the beamer calibration feed.
 DLC_CROP = (100, 2100, 1000, 3000)   # → 2000 × 2000
 
+### Speaker
+# ALSA device that speaker_controls.py plays tones through (via `aplay -D`).
+# "default" uses the system's current output; set it to "plughw:0,0" to force the
+# analog/headphone jack (card 0, device 0) — e.g. if the default output is the
+# HDMI beamer instead of the speakers.
+speaker_device = "default"
+
 ### Beamer
 # The beamer is an HDMI-connected extended display. beamer_screen_index selects
-# which QApplication.screens() entry the projection window opens on (0 is usually
-# the control monitor, 1 the beamer). The cm/pixel scale is measured empirically
-# by the calibration wizard and written to beamer_calibration_path — the lens
-# distance is stored for reference only.
-beamer_screen_index     = 1
+# which QApplication.screens() entry the projection window opens on. The current
+# layout (`xrandr --listmonitors`) is:
+#   0 = DP-0   1920×1200  control monitor
+#   1 = DP-3    800×480   touch screen
+#   2 = HDMI-0 1920×1080  beamer
+#   3 = DP-5    800×480   touch screen
+# Plugging displays in/out reshuffles these indices, so re-check them after any
+# cabling change (the beamer must stay on a 1920×1080 display or the saved
+# px_per_cm no longer applies). The cm/pixel scale is measured empirically by the
+# calibration wizard and written to beamer_calibration_path — the lens distance
+# is stored for reference only.
+beamer_screen_index     = 2
 beamer_lens_distance_cm = 196
 beamer_calibration_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/beamer_calibration.json"
+
+### Screens
+# The two Raspberry Pi touch screens are wired to the PC as extra displays.
+# screen_indices are the QApplication.screens() indices the two fullscreen pattern
+# windows open on, in order: [Screen 1, Screen 2]. On the current layout they are
+# the two 800×480 panels, DP-3 and DP-5 (see the beamer note above for the full
+# display list). An index that doesn't exist leaves that window hidden rather than
+# covering the control monitor.
+screen_indices = [1, 3]
 
 ### Data Handling
 data_path      = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/Data"
 protocols_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/Protocols"
+# Sensor/DLC rows are buffered in RAM and appended to the session CSV this often.
+# A crash therefore costs at most this many seconds of table data — lower it for
+# more safety, raise it for fewer disk writes. Camera frames are unaffected: they
+# are written to Image_Arrays/ as they arrive.
+save_chunk_seconds = 30
 
 ### Deeplabcut
 model_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/DLCModel"

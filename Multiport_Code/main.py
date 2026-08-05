@@ -5,6 +5,7 @@ from beamer_controls import beamer_process
 from camera_controls import camera_process
 from deeplabcut_controls import dlc_process
 from main_plotting import run_gui
+from screen_controls import screen_process
 from serial_controls import sensor_process
 from state_machine import state_machine_process
 
@@ -23,6 +24,8 @@ def main():
     command_queue      = Queue(maxsize=100) # GUI → Arduino commands
     beamer_queue       = Queue(maxsize=8)   # GUI/SM → beamer projection commands
     beamer_running     = Value('b', True)
+    screen_queue       = Queue(maxsize=8)   # GUI/SM → touch-screen pattern commands
+    screen_running     = Value('b', True)
 
     # State-machine control flags
     sm_active      = Value('b', False)   # set True by ExperimentPage to start a session
@@ -49,12 +52,16 @@ def main():
     beamer_proc = Process(target=beamer_process, args=(beamer_queue, beamer_running))
     beamer_proc.start()
 
+    # Start the touch screens (one fullscreen pattern window per HDMI screen)
+    screen_proc = Process(target=screen_process, args=(screen_queue, screen_running))
+    screen_proc.start()
+
     # Start state machine (idles until ExperimentPage activates it)
     sm_proc = Process(
         target=state_machine_process,
         args=(sm_active, sm_stop, sm_running, command_queue,
               sensor_array, protocol_queue, session_done,
-              pose_sm_queue, beamer_queue),
+              pose_sm_queue, beamer_queue, screen_queue),
     )
     sm_proc.start()
 
@@ -71,6 +78,7 @@ def main():
         "session_done":       session_done,
         "protocol_queue":     protocol_queue,
         "beamer_queue":       beamer_queue,
+        "screen_queue":       screen_queue,
     }
     run_gui(frame_queue, sensor_array, cam_shape, command_queue, data_sources)
 
@@ -124,6 +132,16 @@ def main():
     if beamer_proc.is_alive():
         beamer_proc.kill()
         beamer_proc.join()
+
+    # Screens: same clean-quit-then-escalate sequence as the beamer.
+    screen_running.value = False
+    screen_proc.join(timeout=3)
+    if screen_proc.is_alive():
+        screen_proc.terminate()
+        screen_proc.join(timeout=1)
+    if screen_proc.is_alive():
+        screen_proc.kill()
+        screen_proc.join()
 
 if __name__ == "__main__":
     import multiprocessing as mp

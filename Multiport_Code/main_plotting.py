@@ -1,8 +1,52 @@
 # main_plotting.py — GUI entry point
 # Imports widgets from the gui/ subpackage and builds the main window.
+import sys
+import traceback
+
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 from gui import CameraWidget, SensorWidget, CleaningPage, ExperimentPage, ProtocolPage
+
+
+def _install_exception_guard():
+    """Stop a single Python error from killing the whole GUI process.
+
+    PyQt5 (>= 5.5) calls Qt's qFatal() when an exception escapes a slot, which
+    aborts the process with SIGABRT — a bad reply from the RSpace API while the
+    settings dialog is open would take a running experiment down with it.
+    Installing our own sys.excepthook suppresses that abort, so the error is
+    logged and shown instead of being fatal.
+    """
+    reporting = []   # guard: a repeating error must not stack up dialogs
+
+    def hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            QtWidgets.QApplication.quit()
+            return
+        traceback.print_exception(exc_type, exc, tb)
+        if reporting:
+            return
+        reporting.append(True)
+        summary = "".join(traceback.format_exception_only(exc_type, exc)).strip()
+        details = "".join(traceback.format_exception(exc_type, exc, tb))
+
+        def report():
+            # Shown from a timer, not from here: this hook runs while the stack is
+            # still unwinding out of the failed slot, and opening a modal dialog's
+            # nested event loop at that point is not safe.
+            try:
+                box = QtWidgets.QMessageBox(
+                    QtWidgets.QMessageBox.Warning, "Error",
+                    f"Something went wrong. The GUI is still running and any "
+                    f"recording in progress is unaffected.\n\n{summary}")
+                box.setDetailedText(details)
+                box.exec_()
+            finally:
+                reporting.clear()
+
+        QtCore.QTimer.singleShot(0, report)
+
+    sys.excepthook = hook
 
 
 class _OpaqueWidget(QtWidgets.QWidget):
@@ -28,6 +72,7 @@ class _OpaqueWidget(QtWidgets.QWidget):
 
 def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None):
     app = QtWidgets.QApplication([])
+    _install_exception_guard()
 
     # ── Dark theme via Fusion style + QPalette ────────────────────────────────
     # Using a global QWidget stylesheet rule ("QWidget { background: ... }") forces
@@ -78,7 +123,9 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
                 QtWidgets.QSizePolicy.Expanding,
             )
 
-            page_clean = CleaningPage(command_queue, (data_sources or {}).get("beamer_queue"))
+            page_clean = CleaningPage(command_queue,
+                                      (data_sources or {}).get("beamer_queue"),
+                                      (data_sources or {}).get("screen_queue"))
 
             page_protocol = ProtocolPage((data_sources or {}).get("beamer_queue"))
 
@@ -108,6 +155,10 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
             page_clean.set_frame_provider(self.camera)
 
             self.sensors = SensorWidget(sensor_array)
+
+            # Zero the lick counts when a recording starts, so the heat-map shows
+            # the current session rather than everything since the GUI opened.
+            page_experiment.recording_started.connect(self.sensors.reset_counts)
 
             reset_btn = QtWidgets.QPushButton("Reset counts")
             reset_btn.setFixedHeight(28)

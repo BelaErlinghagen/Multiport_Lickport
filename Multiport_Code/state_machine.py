@@ -16,6 +16,9 @@ Inter-process communication (all multiprocessing objects):
                                setting sm_active=True; SM reads it at session start.
   session_done     Value('b') — SM sets True on natural session completion so that
                                ExperimentPage can auto-stop recording.
+  beamer_queue     Queue      — projection commands for beamer_controls.
+  screen_queue     Queue      — {"screen_id", "pattern_id"} commands for
+                               screen_controls (the two HDMI touch screens).
 
 Session flow:
   IDLE  →  (sm_active=True)  →  [TRIAL → ITI] × N  →  DONE / STOPPED  →  IDLE
@@ -28,7 +31,8 @@ import signal
 import time
 from datetime import datetime
 
-_CIRCLE_SIZE = 16   # total number of ports in the circular array
+_CIRCLE_SIZE  = 16   # total number of ports in the circular array
+_SCREEN_COUNT = 2    # HDMI touch screens driven by screen_controls
 
 
 class StateMachine:
@@ -41,14 +45,17 @@ class StateMachine:
         BNC:id:PULSE:duration_ms
     """
 
-    def __init__(self, command_queue, sensor_array, pose_queue=None, beamer_queue=None):
+    def __init__(self, command_queue, sensor_array, pose_queue=None, beamer_queue=None,
+                 screen_queue=None):
         self.command_queue = command_queue
         self.sensor_array  = sensor_array   # multiprocessing.Array('i', 16)
         self.pose_queue    = pose_queue     # optional Queue for DLC-based ITI
         self.beamer_queue  = beamer_queue   # optional Queue for beamer projection
+        self.screen_queue  = screen_queue   # optional Queue for touch-screen patterns
         self._calib        = None           # BeamerCalibration, loaded at run()
         self._shadow       = False          # protocol["beamer"]["shadow"] for this session
         self._field_color  = [255, 255, 255]  # stable shadow-field colour for this session
+        self._screens      = {}             # protocol["screens"] for this session
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -72,11 +79,13 @@ class StateMachine:
         return True
 
     def _all_off(self):
-        """Safety: silence every LED and pump, and blank the beamer."""
+        """Safety: silence every LED and pump, blank the beamer and the screens."""
         for i in range(1, _CIRCLE_SIZE + 1):
             self._send(f"LED:{i}:OFF")
             self._send(f"MOS:{i}:OFF:0")
         self._beamer({"cmd": "clear"})
+        for s in range(1, _SCREEN_COUNT + 1):
+            self._screen(s, "black")
 
     # ── Beamer ────────────────────────────────────────────────────────────────
 
@@ -140,21 +149,48 @@ class StateMachine:
             "color":       self._region_color(region),
         })
 
+    # ── Touch screens ─────────────────────────────────────────────────────────
+
+    def _screen(self, screen_id: int, pattern: str):
+        """Show *pattern* on one screen; drop silently if the queue is full/absent."""
+        if self.screen_queue is None:
+            return
+        try:
+            self.screen_queue.put_nowait({"screen_id": screen_id,
+                                          "pattern_id": pattern})
+        except Exception:
+            pass
+
+    def _screens_apply(self, phase: str) -> list:
+        """Show the protocol's *phase* ("trial" / "iti") patterns on the screens.
+
+        With "randomize" on, the trial patterns are shuffled across the screens at
+        the start of every trial, so which screen carries which cue is
+        unpredictable. Returns the patterns actually shown (empty if disabled).
+        """
+        if not self._screens.get("enabled", False):
+            return []
+        patterns = list(self._screens.get(phase, []) or [])[:_SCREEN_COUNT]
+        if phase == "trial" and self._screens.get("randomize", False):
+            random.shuffle(patterns)
+        for i, pattern in enumerate(patterns):
+            self._screen(i + 1, pattern)
+        return patterns
+
     # ── Mouse session log ─────────────────────────────────────────────────────
 
     @staticmethod
     def _mouse_json_path(protocol: dict) -> str | None:
         """Return path to {mouse_id}.json inside the mouse folder, or None."""
         meta = protocol.get("_meta", {})
-        cohort = meta.get("cohort_id", "")
-        mouse  = meta.get("mouse_id", "")
-        if not cohort or not mouse:
+        mouse = meta.get("mouse_id", "")
+        if not mouse:
             return None
         try:
             from shared_states import data_path
         except Exception:
             return None
-        return os.path.join(data_path, cohort, mouse, f"{mouse}.json")
+        return os.path.join(data_path, mouse, f"{mouse}.json")
 
     @staticmethod
     def _load_mouse_log(path: str) -> dict:
@@ -273,9 +309,13 @@ class StateMachine:
         # Beamer trial baseline: dark (Light mode) or full lit field (Shadow mode).
         self._beamer_baseline(self._shadow)
 
+        # Touch-screen cues for this trial (shuffled across screens if randomised).
+        screen_patterns = self._screens_apply("trial")
+
         for p in led_ports:
             self._send(f"LED:{p}:ON")
-        print(f"[StateMachine] Trial {trial_num}: started  reward ports={reward_ports}")
+        print(f"[StateMachine] Trial {trial_num}: started  reward ports={reward_ports}"
+              + (f"  screens={screen_patterns}" if screen_patterns else ""))
 
         trial_conf  = protocol["trial"]
         end_type    = trial_conf["end_type"]
@@ -344,6 +384,9 @@ class StateMachine:
         import math
         iti_type = iti_config.get("type", "time")
         shadow = self._shadow
+
+        # Touch screens switch to their ITI patterns for the whole interval.
+        self._screens_apply("iti")
 
         if iti_type == "time":
             # Beamer stays at the trial baseline for the fixed duration.
@@ -445,6 +488,9 @@ class StateMachine:
         self._field_color = self._session_field_color(protocol)
         self._load_calib()
 
+        # Touch-screen patterns for this session ("screens": null in older protocols).
+        self._screens = protocol.get("screens") or {}
+
         reward_locations = self._assign_locations(protocol)
         if reward_locations is None:
             print("[StateMachine] ERROR: reward location constraints are infeasible "
@@ -541,7 +587,8 @@ class StateMachine:
 
 def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
                            sensor_array, protocol_queue, session_done,
-                           pose_sm_queue=None, beamer_queue=None):
+                           pose_sm_queue=None, beamer_queue=None,
+                           screen_queue=None):
     """Long-running process that hosts the StateMachine.
 
     Lifecycle:
@@ -561,7 +608,7 @@ def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
     signal.signal(signal.SIGTERM, _handle_term)
 
     machine = StateMachine(command_queue, sensor_array, pose_queue=pose_sm_queue,
-                           beamer_queue=beamer_queue)
+                           beamer_queue=beamer_queue, screen_queue=screen_queue)
     print("[StateMachine] Process ready — waiting for activation.")
 
     while sm_running.value:

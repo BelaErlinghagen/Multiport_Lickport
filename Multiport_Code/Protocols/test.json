@@ -21,11 +21,11 @@
       "type": "fixed",
       "fixed_map": {
         "1": 3,
-        "2": 14
+        "2": 13
       },
       "min_spacing": 4
     },
-    "led_mode": "neighbors",
+    "led_mode": "all",
     "led_neighbors": 1
   },
   "trial": {
@@ -50,18 +50,18 @@
       "duration_max_s": 3.0
     },
     "random_region": {
-      "diameter_cm": 23.5,
-      "brightness": 18,
+      "diameter_cm": 15.0,
+      "brightness": 8,
       "color": [
         255,
         255,
-        255
+        0
       ],
-      "margin_x_cm": 1.5,
-      "margin_y_cm": 1.0,
-      "margin_radius_cm": 26.5,
+      "margin_x_cm": 1.0,
+      "margin_y_cm": 1.5,
+      "margin_radius_cm": 28.0,
       "duration_type": "fixed",
-      "duration_s": 2.0,
+      "duration_s": 0.5,
       "duration_max_s": 3.0
     }
   },
