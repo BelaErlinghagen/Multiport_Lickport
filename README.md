@@ -1,7 +1,7 @@
 # The Multiport Setup - a behavioral setup for mice with 16 reward ports
 
 <p align="middle">
-  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/MultiportComplete.jpg" width="250" />
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/MultiportSetup.png" width="500" />
 </p>
 <center>
   <i>Figure 1: 3D CAD models for the Lick-O-Tron (Left: Front, Middle: Back, Right: Case).</i>
