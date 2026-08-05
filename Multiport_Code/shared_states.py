@@ -1,3 +1,5 @@
+from pathlib import Path
+
 ### Serial Controls
 
 serial_ports = ['/dev/ttyACM0', '/dev/ttyACM1']
@@ -46,7 +48,7 @@ speaker_device = "default"
 # is stored for reference only.
 beamer_screen_index     = 2
 beamer_lens_distance_cm = 196
-beamer_calibration_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/beamer_calibration.json"
+beamer_calibration_path = str(Path(__file__).resolve().parent / "config" / "beamer_calibration.json")
 
 ### Screens
 # The two Raspberry Pi touch screens are wired to the PC as extra displays.

@@ -229,18 +229,24 @@ class BeamerProjector:
     def _place_on_beamer_screen(self):
         """Move the window onto the configured extended-display screen, fullscreen.
 
-        Returns the target screen geometry (used for the calibration default size).
+        If that screen doesn't exist (the beamer isn't plugged in, or the display
+        indices shifted after a cabling change) the window stays hidden instead of
+        falling back to the primary display — a fullscreen projection window there
+        just blacks out the control monitor. Commands are still accepted and simply
+        not projected, matching how screen_controls handles a missing touch screen.
+
+        Returns the geometry the calibration should assume for its default size.
         """
         screens = self.app.screens()
         idx = int(getattr(shared_states, "beamer_screen_index", 1))
         if not screens:
-            self.window.showFullScreen()
-            return self.window.geometry()
+            return QtCore.QRect(0, 0, 1920, 1080)
         if idx < 0 or idx >= len(screens):
             print(f"[Beamer] screen index {idx} unavailable "
-                  f"({len(screens)} screen(s)); using primary. Projection may "
-                  f"cover the control monitor.")
-            idx = 0
+                  f"({len(screens)} screen(s)); the projection window stays hidden "
+                  f"until the beamer is connected. Check "
+                  f"shared_states.beamer_screen_index against the current displays.")
+            return screens[0].geometry()
         screen = screens[idx]
         geo = screen.geometry()
         # Position on the target screen *before* going fullscreen so the window

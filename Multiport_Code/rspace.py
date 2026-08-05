@@ -21,8 +21,8 @@ Stateless helpers (no network) are module-level functions and can be used direct
 ``generate_filepaths``, ``build_renamed_name`` and ``rename_and_organize_files``.
 
 For applications that want to persist one set of credentials (as the bundled GUI
-does), an optional convenience layer stores them in a config file *inside the
-application folder* (``<project>/config/config.json`` — overridable via the
+does), an optional convenience layer stores them in a config file *next to this
+module* (``config/config.json`` — overridable via the
 ``RSPACE_CONFIG_DIR`` environment variable) via ``load_credentials`` /
 ``save_credentials``, and offers module-level functions (``get_tags``,
 ``list_all_folders``, ``create_entry`` …) that operate through a default client
@@ -764,15 +764,16 @@ class RSpaceClient:
 
 # ── Drafts / autosave (in-folder JSON) ──────────────────────────────────────────────
 # Stores in-progress entry drafts as JSON files inside the application folder
-# (``<project>/Autosaved``), so an unsaved note survives a crash and can be reloaded.
+# (``Autosaved/`` next to this module), so an unsaved note survives a crash and can
+# be reloaded.
 
 def autosave_dir():
-    """Return the drafts directory: ``$RSPACE_AUTOSAVE_DIR`` if set, else
-    ``<project>/Autosaved`` (this file lives in ``<project>/src``)."""
+    """Return the drafts directory: ``$RSPACE_AUTOSAVE_DIR`` if set, else the
+    ``Autosaved`` folder next to this module."""
     override = os.environ.get("RSPACE_AUTOSAVE_DIR")
     if override:
         return Path(override)
-    return Path(__file__).resolve().parent.parent / "Autosaved"
+    return Path(__file__).resolve().parent / "Autosaved"
 
 
 def save_draft(draft_id, data):
@@ -819,20 +820,18 @@ def delete_draft(path):
 # ── Stored-credentials convenience layer (optional) ─────────────────────────────────
 # Persists a single set of credentials and exposes module-level functions that operate
 # through a default client built from them. The config lives *inside the application
-# folder* (``<project>/config/config.json``) so the whole app is self-contained and
-# portable — nothing is written to per-user/system locations (which on Windows domain
-# machines get redirected to network shares and cause trouble). Applications that don't
-# want this can ignore it and use RSpaceClient directly.
+# folder* (``config/config.json`` next to this module) so the whole app is self-
+# contained and portable — nothing is written to per-user/system locations (which on
+# Windows domain machines get redirected to network shares and cause trouble).
+# Applications that don't want this can ignore it and use RSpaceClient directly.
 
 def _config_dir():
-    """Return the config directory: ``$RSPACE_CONFIG_DIR`` if set, else ``<project>/config``.
-
-    This file lives in ``<project>/src``, so the project root is its parent's parent.
-    """
+    """Return the config directory: ``$RSPACE_CONFIG_DIR`` if set, else the ``config``
+    folder next to this module."""
     override = os.environ.get("RSPACE_CONFIG_DIR")
     if override:
         return Path(override)
-    return Path(__file__).resolve().parent.parent / "config"
+    return Path(__file__).resolve().parent / "config"
 
 
 def _config_file():
