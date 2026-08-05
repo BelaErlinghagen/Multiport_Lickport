@@ -56,6 +56,7 @@ __all__ = [
     "autosave_dir", "save_draft", "list_drafts", "load_draft", "delete_draft",
     # stored-credentials convenience
     "load_credentials", "save_credentials", "has_credentials", "default_client",
+    "load_setting", "save_setting",
     "load_lab_group", "save_lab_group", "load_project", "save_project",
     "load_upload_enabled", "save_upload_enabled",
     "check_connection", "test_credentials",
@@ -936,6 +937,25 @@ def save_credentials(api_key, url):
 def has_credentials():
     """True if an API key has been configured."""
     return bool(load_credentials()[0])
+
+
+def load_setting(key, default=None):
+    """Return one value from the config file, or `default` if unset or blank.
+
+    Generic accessor for applications that want to keep their own settings next to
+    the credentials rather than in a second file (the Multiport GUI stores its Data
+    and Protocols folders this way).
+    """
+    value = _read_config().get(key)
+    return default if value is None or value == "" else value
+
+
+def save_setting(key, value):
+    """Persist one config value, preserving the other keys."""
+    cfg = _read_config()
+    cfg[key] = value
+    _write_config(cfg)
+    return value
 
 
 def load_lab_group():

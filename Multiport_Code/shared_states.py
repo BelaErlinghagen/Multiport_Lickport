@@ -60,8 +60,27 @@ beamer_calibration_path = str(Path(__file__).resolve().parent / "config" / "beam
 screen_indices = [1, 3]
 
 ### Data Handling
-data_path      = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/Data"
-protocols_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/Protocols"
+# The Data and Protocols folders are set by the user in the GUI (Settings…) and
+# stored in config/config.json; the values below are only the defaults used until
+# one is chosen. Always call the accessors instead of caching their result — the
+# folders can be changed while the app is running, and a spawned process reads the
+# file fresh.
+DEFAULT_DATA_PATH      = str(Path(__file__).resolve().parent / "Data")
+DEFAULT_PROTOCOLS_PATH = str(Path(__file__).resolve().parent / "Protocols")
+
+
+def get_data_path():
+    """Folder holding the recordings, as Data/<mouse>/<session>/<timestamp>_<session>/."""
+    # Imported here rather than at module scope: shared_states is pulled in by every
+    # process at startup, and rspace drags in `requests`.
+    import rspace
+    return rspace.load_setting("data_path", DEFAULT_DATA_PATH)
+
+
+def get_protocols_path():
+    """Folder holding the protocol JSON files."""
+    import rspace
+    return rspace.load_setting("protocols_path", DEFAULT_PROTOCOLS_PATH)
 # Sensor/DLC rows are buffered in RAM and appended to the session CSV this often.
 # A crash therefore costs at most this many seconds of table data — lower it for
 # more safety, raise it for fewer disk writes. Camera frames are unaffected: they

@@ -187,7 +187,8 @@ class StateMachine:
         if not mouse:
             return None
         try:
-            from shared_states import data_path
+            from shared_states import get_data_path
+            data_path = get_data_path()
         except Exception:
             return None
         return os.path.join(data_path, mouse, f"{mouse}.json")

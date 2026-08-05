@@ -37,7 +37,8 @@ class data_saver:
         rows.clear()
 
     def start_saving(self, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag):
-        from shared_states import data_path
+        from shared_states import get_data_path
+        data_path = get_data_path()
         # create mouse and session folders if they do not exist yet
         mouse_path = data_path + f"/{mouse_id}"
         session_path = mouse_path + f"/{session_id}"

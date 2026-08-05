@@ -1,7 +1,8 @@
 """gui/experiment_page.py — Experiment control tab.
 
 Section order (top → bottom):
-  0. RSpace bar       — connection status (left) + settings button (right)
+  0. Status bar       — RSpace connection status (left) + Settings button (right,
+                        opens SettingsDialog: Data/Protocols folders + RSpace)
   1. Experiment Info  — Mouse / Session editable comboboxes, merged from the local
                         Data folder and RSpace (origin shown by item colour)
   2. Selected Protocol— file picker + summary
@@ -15,9 +16,9 @@ When a recording stops the session is written up — protocol details, the rewar
 ports that were actually chosen, and the comments — and that write-up is always
 saved as JSON next to the recordings, in Data/<mouse>/<session>/<entry>_rspace.json.
 It is additionally uploaded as a new entry in the selected RSpace notebook unless
-uploading is switched off in RSpace settings (rspace.load_upload_enabled) or the
+uploading is switched off in Settings (rspace.load_upload_enabled) or the
 upload fails; either way the record stays "pending" and can be sent later from
-RSpace settings → Pending entries…. Naming/tag conventions come from rspace.py:
+Settings → Pending entries…. Naming/tag conventions come from rspace.py:
 the entry is named "YYYYMMDD_HHMM_<session>" (matching rspace.ENTRY_NAME_RE) and
 the mouse is identified by its "id_<mouse>" tag rather than by the name.
 """
@@ -31,6 +32,7 @@ from multiprocessing import Process, Value
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 import rspace
+import shared_states
 from data_saving import saving_process
 
 
@@ -271,10 +273,10 @@ def document_id(result):
 
 
 def data_root():
-    """Return shared_states.data_path, or "" if it cannot be read."""
+    """Return the configured Data folder, or "" if it cannot be read."""
     try:
-        from shared_states import data_path
-        return data_path
+        from shared_states import get_data_path
+        return get_data_path()
     except Exception:
         return ""
 
@@ -334,29 +336,109 @@ def wait_for_all_tasks(msec=5000):
         task.wait(msec)
 
 
-# ── RSpace settings dialog ────────────────────────────────────────────────────
+# ── Settings dialog ───────────────────────────────────────────────────────────
 
-class RSpaceSettingsDialog(QtWidgets.QDialog):
-    """Set the API key / server URL and pick the project folder + notebook.
+class SettingsDialog(QtWidgets.QDialog):
+    """Application settings, in two groups.
 
-    The project folder is the one holding the "mice" folder; the notebook is where
+    Folders — where recordings are written and where protocols are kept. Both are
+    stored in config.json (see shared_states.get_data_path / get_protocols_path),
+    not in the source, so they can be moved to another disk without editing code.
+
+    RSpace — the API key / server URL plus the project folder and notebook. The
+    project folder is the one holding the "mice" folder; the notebook is where
     session entries get created. Both are persisted via rspace.save_project().
-
     Uploading can be switched off here: sessions are then only written up locally
     (see build_entry_record) and can be pushed later from the pending dialog.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("RSpace settings")
+        self.setWindowTitle("Settings")
         self.setModal(True)
-        self.setMinimumSize(520, 640)
+        self.setMinimumSize(560, 760)
         self._tasks = []
 
         api_key, url = rspace.load_credentials()
         self._project_id, self._notebook_id = rspace.load_project()
 
         lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(self._build_folders_group())
+        lay.addWidget(self._build_rspace_group(api_key, url), 1)
+
+        btns = QtWidgets.QHBoxLayout()
+        load_btn = QtWidgets.QPushButton("Load folders")
+        load_btn.clicked.connect(self._load_tree)
+        pending_btn = QtWidgets.QPushButton("Pending entries…")
+        pending_btn.clicked.connect(self._open_pending)
+        cancel = QtWidgets.QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        save = QtWidgets.QPushButton("Save")
+        save.clicked.connect(self._save)
+        btns.addWidget(load_btn)
+        btns.addWidget(pending_btn)
+        btns.addStretch()
+        btns.addWidget(cancel)
+        btns.addWidget(save)
+        lay.addLayout(btns)
+
+        if api_key:
+            self._load_tree()
+
+    # -- construction --
+
+    def _build_folders_group(self):
+        """Data / Protocols folder pickers."""
+        box = QtWidgets.QGroupBox("Folders")
+        form = QtWidgets.QFormLayout(box)
+
+        self._data_edit = QtWidgets.QLineEdit(shared_states.get_data_path())
+        self._proto_edit = QtWidgets.QLineEdit(shared_states.get_protocols_path())
+        form.addRow("Data folder:", self._folder_row(self._data_edit, "Select Data folder"))
+        form.addRow("Protocols folder:",
+                    self._folder_row(self._proto_edit, "Select Protocols folder"))
+
+        self._folders_lbl = QtWidgets.QLabel("")
+        self._folders_lbl.setWordWrap(True)
+        self._folders_lbl.setStyleSheet("color:#888; font-size:9px;")
+        form.addRow(self._folders_lbl)
+        self._check_folders()
+        for edit in (self._data_edit, self._proto_edit):
+            edit.textChanged.connect(self._check_folders)
+        return box
+
+    def _folder_row(self, edit, caption):
+        """A path field with a Browse… button next to it."""
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        browse = QtWidgets.QPushButton("Browse…")
+        browse.clicked.connect(lambda: self._browse_folder(edit, caption))
+        h.addWidget(edit, 1)
+        h.addWidget(browse)
+        return row
+
+    def _browse_folder(self, edit, caption):
+        start = edit.text().strip() or os.path.expanduser("~")
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, caption, start)
+        if path:
+            edit.setText(path)
+
+    def _check_folders(self):
+        """Warn about folders that don't exist yet — they are created on save."""
+        missing = [name for name, edit in (("Data", self._data_edit),
+                                           ("Protocols", self._proto_edit))
+                   if edit.text().strip() and not os.path.isdir(edit.text().strip())]
+        self._folders_lbl.setText(
+            f"{' and '.join(missing)} folder does not exist yet — it will be created "
+            f"when you save." if missing else
+            "Recordings go to <Data>/<mouse>/<session>/; protocols are the .json "
+            "files offered in the Protocol tab.")
+
+    def _build_rspace_group(self, api_key, url):
+        """API key / URL, upload toggle, and the project-folder + notebook trees."""
+        box = QtWidgets.QGroupBox("RSpace")
+        lay = QtWidgets.QVBoxLayout(box)
 
         form = QtWidgets.QFormLayout()
         self._url_edit = QtWidgets.QLineEdit(url)
@@ -403,25 +485,7 @@ class RSpaceSettingsDialog(QtWidgets.QDialog):
         self._load_lbl = QtWidgets.QLabel("")
         self._load_lbl.setStyleSheet("color:#888; font-size:10px;")
         lay.addWidget(self._load_lbl)
-
-        btns = QtWidgets.QHBoxLayout()
-        load_btn = QtWidgets.QPushButton("Load folders")
-        load_btn.clicked.connect(self._load_tree)
-        pending_btn = QtWidgets.QPushButton("Pending entries…")
-        pending_btn.clicked.connect(self._open_pending)
-        cancel = QtWidgets.QPushButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        save = QtWidgets.QPushButton("Save")
-        save.clicked.connect(self._save)
-        btns.addWidget(load_btn)
-        btns.addWidget(pending_btn)
-        btns.addStretch()
-        btns.addWidget(cancel)
-        btns.addWidget(save)
-        lay.addLayout(btns)
-
-        if api_key:
-            self._load_tree()
+        return box
 
     # -- connection test --
 
@@ -550,6 +614,24 @@ class RSpaceSettingsDialog(QtWidgets.QDialog):
 
     # -- save --
 
+    def _save_folders(self):
+        """Persist the Data / Protocols folders, creating them if needed.
+
+        A blank field falls back to the default rather than being stored, so an
+        accidentally cleared box can't leave the app with nowhere to write.
+        """
+        for key, edit, default in (
+                ("data_path", self._data_edit, shared_states.DEFAULT_DATA_PATH),
+                ("protocols_path", self._proto_edit, shared_states.DEFAULT_PROTOCOLS_PATH)):
+            path = edit.text().strip() or default
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as exc:
+                # Keep the setting anyway: the folder may live on a share that is
+                # simply not mounted right now.
+                print(f"[Settings] could not create {path}: {exc}")
+            rspace.save_setting(key, path)
+
     @staticmethod
     def _selected_id(tree, fallback):
         """The id of `tree`'s selected node, or `fallback` if there isn't a usable one."""
@@ -560,6 +642,7 @@ class RSpaceSettingsDialog(QtWidgets.QDialog):
         return fallback
 
     def _save(self):
+        self._save_folders()
         rspace.save_credentials(self._key_edit.text(), self._url_edit.text())
         rspace.save_upload_enabled(self._upload_chk.isChecked())
         # Keep the stored folder/notebook when nothing is selected — the tree may
@@ -638,7 +721,7 @@ class PendingUploadsDialog(QtWidgets.QDialog):
         if not self._pending:
             self._status.setText("Nothing pending — every session write-up has been uploaded.")
         elif not rspace.has_credentials():
-            self._status.setText("No API key configured — set one in RSpace settings first.")
+            self._status.setText("No API key configured — set one in Settings first.")
         else:
             _, nb_id = rspace.load_project()
             targets = [e for e in self._pending
@@ -646,7 +729,7 @@ class PendingUploadsDialog(QtWidgets.QDialog):
             self._status.setText(
                 f"{len(self._pending)} pending."
                 + (f"  {len(targets)} of them have no notebook to go to — select one "
-                   "in RSpace settings." if targets else ""))
+                   "in Settings." if targets else ""))
 
     def _select_all(self):
         for i in range(self._list.count()):
@@ -841,8 +924,8 @@ class ExperimentPage(QtWidgets.QWidget):
         self._rs_lbl.setStyleSheet("color:#aaa; font-size:10px;")
         bar.addWidget(self._rs_dot)
         bar.addWidget(self._rs_lbl, 1)
-        rs_btn = QtWidgets.QPushButton("RSpace settings…")
-        rs_btn.clicked.connect(self._open_rspace_settings)
+        rs_btn = QtWidgets.QPushButton("Settings…")
+        rs_btn.clicked.connect(self._open_settings)
         bar.addWidget(rs_btn)
         return bar
 
@@ -1077,9 +1160,12 @@ class ExperimentPage(QtWidgets.QWidget):
 
     # ── RSpace ────────────────────────────────────────────────────
 
-    def _open_rspace_settings(self):
-        dlg = RSpaceSettingsDialog(self)
+    def _open_settings(self):
+        dlg = SettingsDialog(self)
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            # The Data folder may have moved, and the mouse/session lists are read
+            # from it, so rebuild them alongside the connection status.
+            self._refresh_mouse_combo()
             self._refresh_rspace_status()
 
     def _set_rspace_status(self, ok, msg):
@@ -1093,7 +1179,7 @@ class ExperimentPage(QtWidgets.QWidget):
 
     def _refresh_rspace_status(self):
         if not rspace.has_credentials():
-            self._set_rspace_status(False, "not configured — open RSpace settings")
+            self._set_rspace_status(False, "not configured — open Settings")
             return
         self._rs_lbl.setText("RSpace: checking…")
         _run_task(self, rspace.check_connection, self._on_status)
@@ -1209,8 +1295,8 @@ class ExperimentPage(QtWidgets.QWidget):
     def _browse_protocol(self):
         """Open a file dialog to pick a protocol JSON; load and show a summary."""
         try:
-            from shared_states import protocols_path
-            start_dir = protocols_path
+            from shared_states import get_protocols_path
+            start_dir = get_protocols_path()
         except Exception:
             start_dir = ""
 
@@ -1459,7 +1545,7 @@ class ExperimentPage(QtWidgets.QWidget):
         if not rspace.load_upload_enabled():
             self._rec_status.setText(
                 "Idle — RSpace upload is switched off." + where +
-                "  Use RSpace settings → Pending entries… to upload it later.")
+                "  Use Settings → Pending entries… to upload it later.")
             return
         if not (self._rspace_ok and record.get("notebook_id")):
             self._rec_status.setText(
@@ -1491,4 +1577,4 @@ class ExperimentPage(QtWidgets.QWidget):
             # The record stays pending, so nothing is lost — it can be retried.
             self._rec_status.setText(
                 f"Idle — RSpace upload failed: {result}. The write-up is saved "
-                "locally; retry from RSpace settings → Pending entries…")
+                "locally; retry from Settings → Pending entries…")

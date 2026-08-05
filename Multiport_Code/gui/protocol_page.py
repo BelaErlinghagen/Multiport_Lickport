@@ -1,7 +1,8 @@
 """gui/protocol_page.py — Protocol editor tab.
 
 Lets the user create, load, edit, and save behavioural protocols as .json files.
-Protocols are stored in shared_states.protocols_path.
+Protocols are stored in the folder chosen in the Settings dialog
+(shared_states.get_protocols_path()).
 
 Section layout (inside a QScrollArea):
   ── Session ─────────────────────────────────────────────────────
@@ -1234,7 +1235,8 @@ class ProtocolPage(QtWidgets.QWidget):
 
     def _protocols_dir(self) -> str:
         try:
-            from shared_states import protocols_path
+            from shared_states import get_protocols_path
+            protocols_path = get_protocols_path()
             os.makedirs(protocols_path, exist_ok=True)
             return protocols_path
         except Exception:
