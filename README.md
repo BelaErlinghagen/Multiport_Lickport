@@ -1,3 +1,14 @@
+# The Multiport Setup - a behavioral setup for mice with 16 reward ports
+
+<p align="middle">
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/MultiportComplete.jpg" width="250" />
+</p>
+<center>
+  <i>Figure 1: 3D CAD models for the Lick-O-Tron (Left: Front, Middle: Back, Right: Case).</i>
+</center>
+
+
+
 # Documentation for the Lick-O-Tron and the PORTMASTER
 
 The Lick-O-Tron Lickport and the PORTMASTER connectivity board are the two major components that act together in the automated Multiport system.
@@ -24,7 +35,7 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
   <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-TronCase.png" width="250" />
 </p>
 <center>
-  <i>Figure 1: 3D CAD models for the Lick-O-Tron (Left: Front, Middle: Back, Right: Case).</i>
+  <i>Figure 2: 3D CAD models for the Lick-O-Tron (Left: Front, Middle: Back, Right: Case).</i>
 </center>
 
 ### Assembly
