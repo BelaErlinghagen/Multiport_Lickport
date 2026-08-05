@@ -62,6 +62,13 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
 
 ## The PORTMASTER
 
+<p align="middle">
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/PORTMASTER/Portmaster.jpg" width="250" />
+</p>
+<center>
+  <i>Figure 3: The PORTMASTER.</i>
+</center>
+
 In order to control up to 16 Lick-O-Tron lickports, the PORTMASTER was designed: two Arduino Mega Microcontroller which are connected within the Multiport-Setup to the Computer via serial connection. The 
 
 ### Design
