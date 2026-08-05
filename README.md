@@ -4,7 +4,7 @@
   <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/MultiportSetup.png" width="1000" />
 </p>
 <center>
-  <i>Figure 1: 3D CAD models for the Lick-O-Tron (Left: Front, Middle: Back, Right: Case).</i>
+  <i>Figure 1: The Multiport Setup. A) Complete view of the MultiportSetup. B) Testing adjustments to the setup to show that the capacitive sensor of the Lick-O-Tron detects mouse licks. A Basler daA1440 was used to record the lickport. The mouse was given condensed milk (white droplet in C) manually through the shown tube. C) Top: Timeline over the entire session. Sensor activations are marked as blue bars. Bottom: Zoom into one lick detection. </i>
 </center>
 
 
@@ -63,10 +63,10 @@ The Arduino's job is to register licks via a capacitive sensor (a needle that is
 ## The PORTMASTER
 
 <p align="middle">
-  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/PORTMASTER/Portmaster.jpg" width="250" />
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/PORTMASTER/Portmaster.jpg" width="700" />
 </p>
 <center>
-  <i>Figure 3: The PORTMASTER.</i>
+  <i>Figure 3: The PORTMASTER rack, lid opened.</i>
 </center>
 
 In order to control up to 16 Lick-O-Tron lickports, the PORTMASTER was designed: two Arduino Mega Microcontroller which are connected within the Multiport-Setup to the Computer via serial connection. The 
