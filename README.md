@@ -74,5 +74,13 @@ In order to control up to 16 Lick-O-Tron lickports, the PORTMASTER was designed:
 ### Design
 
 ### Assembly
+#### Parts
+| Item | Quantity | Manufactured by | EAN |
+| :---------- | ----------: | :---------- | ----------: |
+| Arduino Mega 2560 Rev3  | 2 | Arduino | 7630049200067 |
+| 8 band ribbon cable | - | - | - |
+| 8-Way IDC Connector Female for Cable, 1 Row | 32 | Wurth Elektronik | 661008151923 (Mf. part#) |
+| PORTMASTER PCB | 1 | Eurocircuits | None: see Folder in Repo |
+| RSP-100-5 SMPSU 5V DC 20A 100W | 1 | MEAN WELL | 4711287435657 |
 
 ### Usage
