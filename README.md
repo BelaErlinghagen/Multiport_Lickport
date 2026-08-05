@@ -10,8 +10,8 @@ The Lick-O-Tron and the PORTMASTER were conceptualized and designed by Bela Erli
 The idea behind the Lick-O-Tron was to create a lickport for behavioral mouse experiments that can:
 
 1) Register lick events via a capacitive sensor.
-2) Be connected to two peristaltic pumps which can independently eject precise volumes of liquids.
-3) Allow for flexible control of a LED that is located next to the needle.
+2) Be connected to up to two peristaltic pumps which can independently eject precise volumes of liquids.
+3) Allow for flexible control of an LED that is located next to the needle.
 
 ### Design
 
