@@ -31,6 +31,7 @@ from multiprocessing import Process, Value
 
 from PyQt5 import QtWidgets, QtGui, QtCore
 
+import console_log
 import rspace
 import shared_states
 from data_saving import saving_process
@@ -46,6 +47,11 @@ MOUSE_DOC_PREFIX = "#"
 # Every session entry is tagged with its mouse (id_<mouse>) and, since this rig only
 # runs behaviour, m_behavior. The user may additionally mark a session as recorded
 # alongside imaging or ephys — those are the only extra tags on offer.
+# BNC triggers that fire one pulse (the rest are trains) — mirrors
+# ProtocolPage._BNC_SINGLE_TRIGGERS, used only to format the write-up.
+_BNC_SINGLE = ("start_of_session", "end_of_session",
+               "start_of_trial", "end_of_trial")
+
 AUTO_METHOD_TAG = f"{rspace.METHOD_PREFIX}behavior"
 OPTIONAL_METHOD_TAGS = (f"{rspace.METHOD_PREFIX}invivo_imaging",
                         f"{rspace.METHOD_PREFIX}invivo_ephys")
@@ -188,6 +194,17 @@ def build_entry_html(protocol, meta, reward_ports, comments):
         detail = _sound_detail(protocol["sounds"][key])
         out.append(f"<li><b>{label}:</b> {e(detail)}</li>" if detail
                    else f"<li><b>{label}:</b> off</li>")
+
+    armed = [o for o in protocol["bnc"]["outputs"] if o["enabled"] and o["triggers"]]
+    if armed:
+        for o in armed:
+            detail = ", ".join(
+                (f"{t['type']} {t['pulse_ms']} ms" if t["type"] in _BNC_SINGLE
+                 else f"{t['type']} {t['frequency_hz']:g} Hz / {t['pulse_ms']} ms")
+                for t in o["triggers"])
+            out.append(f"<li><b>BNC {e(str(o['id']))}:</b> {e(detail)}</li>")
+    else:
+        out.append("<li><b>BNC:</b> none</li>")
 
     out.append(f"<li><b>Intertrial:</b> {e(str(iti['type']))} — "
                f"{e(_iti_detail(iti))}</li>")
@@ -889,6 +906,9 @@ class ExperimentPage(QtWidgets.QWidget):
         self._cam_flag       = None
         self._sensor_flag    = None
         self._dlc_flag       = None
+        # Built by _start_recording, which owns the path so the console log can be
+        # opened before the saving child is even spawned.
+        self._recording_folder = None
 
         # RSpace state
         self._tasks           = []    # live _Task threads (kept from the GC)
@@ -1019,8 +1039,11 @@ class ExperimentPage(QtWidgets.QWidget):
         self._sum_session = QtWidgets.QLabel()
         self._sum_rewards = QtWidgets.QLabel()
         self._sum_trial   = QtWidgets.QLabel()
-        for lbl in (self._sum_session, self._sum_rewards, self._sum_trial):
+        self._sum_bnc     = QtWidgets.QLabel()
+        for lbl in (self._sum_session, self._sum_rewards, self._sum_trial,
+                    self._sum_bnc):
             lbl.setStyleSheet("color:#ccc; font-size:10px;")
+            lbl.setWordWrap(True)
             summary_layout.addWidget(lbl)
         self._proto_summary.setVisible(False)
         root.addWidget(self._proto_summary)
@@ -1400,6 +1423,15 @@ class ExperimentPage(QtWidgets.QWidget):
                     else "ends when all rewards collected")
         self._sum_trial.setText(f"Trial: {t_detail}")
 
+        # Strict read, so a protocol predating the BNC block cannot be started —
+        # _browse_protocol catches the KeyError and says which key is missing.
+        armed = [o for o in d["bnc"]["outputs"] if o["enabled"] and o["triggers"]]
+        self._sum_bnc.setText(
+            "BNC: none" if not armed else
+            "BNC: " + ",  ".join(
+                f"{o['id']} [" + ", ".join(t["type"] for t in o["triggers"]) + "]"
+                for o in armed))
+
         self._proto_summary.setVisible(True)
 
     # ── Recording controls ────────────────────────────────────────
@@ -1418,6 +1450,20 @@ class ExperimentPage(QtWidgets.QWidget):
         if self._loaded_protocol is None:
             self._rec_status.setText("Load a protocol first.")
             return
+
+        # The recording folder used to be built inside the saving child, ~1 s after
+        # Start and with a timestamp the parent never saw. It is created here now so
+        # the console log can be opened at t=0 and the child is handed a path rather
+        # than inventing one.
+        recording_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session}"
+        recording_folder = os.path.join(self._data_path(), mouse, session, recording_id)
+        try:
+            os.makedirs(os.path.join(recording_folder, "Image_Arrays"), exist_ok=True)
+        except OSError as exc:
+            self._rec_status.setText(f"Could not create the recording folder: {exc}")
+            return
+        self._recording_folder = recording_folder
+        console_log.start_log(recording_folder)
 
         # Comments and the lick counts belong to one session.
         self._comments = []
@@ -1457,6 +1503,7 @@ class ExperimentPage(QtWidgets.QWidget):
                 mouse, session,
                 self._cam_flag, self._sensor_flag, self._dlc_flag,
                 self._saving_running,
+                recording_folder,
             ),
             daemon=True,
         )
@@ -1519,6 +1566,11 @@ class ExperimentPage(QtWidgets.QWidget):
         self._refresh_session_combo()
 
         self._push_rspace_entry(mouse, session, entry)
+
+        # Last: the RSpace upload runs on a worker thread and may print after this
+        # point, and that output belongs to the console, not to the session log.
+        self._recording_folder = None
+        console_log.stop_log()
 
     def _check_session_done(self):
         """Called every 500 ms while recording; auto-stop on natural session end."""

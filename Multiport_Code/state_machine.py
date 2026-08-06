@@ -37,11 +37,143 @@ import json
 import os
 import random
 import signal
+import threading
 import time
 from datetime import datetime
 
 _CIRCLE_SIZE  = 16   # total number of ports in the circular array
 _SCREEN_COUNT = 2    # HDMI touch screens driven by screen_controls
+
+# BNC trigger families (mirrors ProtocolPage._BNC_*_TRIGGERS).
+_BNC_TRAIN_TRIGGERS = ("entire_session", "during_trial", "during_intertrial")
+
+
+class _BncScheduler:
+    """Emits BNC pulse trains from a daemon thread.
+
+    The trains have to keep running while the main thread is between loops — during
+    the mouse-log write at session start, between a trial ending and the intertrial
+    starting, inside _assign_locations' retry loop. Weaving pulse deadlines into the
+    three polling loops would leave every one of those as a silent gap, so the
+    trains get a thread of their own and the main thread only says which phase is
+    active.
+
+    Single-shot triggers are NOT handled here — they fire straight from the main
+    thread at their hook point, so their ordering against the LEDs, screens and tone
+    stays deterministic.
+    """
+
+    # Wake at least this often, so a phase change or a stop is honoured promptly.
+    _TICK_CAP = 0.05
+
+    def __init__(self, send):
+        self._send   = send            # StateMachine._send
+        self._trains = []
+        self._phase  = None            # None | "trial" | "iti"
+        self._lock   = threading.Lock()
+        self._stop   = threading.Event()
+        self._thread = None
+
+    def configure(self, bnc_config: dict) -> list:
+        """Build the train list from protocol["bnc"]. Read strictly."""
+        trains = []
+        for out in bnc_config["outputs"]:
+            if not out["enabled"]:
+                continue
+            for trig in out["triggers"]:
+                if trig["type"] not in _BNC_TRAIN_TRIGGERS:
+                    continue
+                hz = float(trig["frequency_hz"])
+                period = 1.0 / hz
+                pulse = int(trig["pulse_ms"])
+                # Re-triggering a pin that is already high extends the pulse rather
+                # than making an edge, so a pulse at least as long as the period
+                # would latch the line high for the whole train. The editor refuses
+                # to save that, but a hand-edited file still has to be safe to run.
+                limit = int(period * 1000) - 1
+                if pulse > limit:
+                    print(f"[StateMachine] BNC {out['id']}: pulse {pulse} ms is not "
+                          f"shorter than the {period * 1000:.0f} ms period — "
+                          f"clamped to {max(limit, 1)} ms.")
+                    pulse = max(limit, 1)
+                trains.append({"bnc": int(out["id"]), "trigger": trig["type"],
+                               "period": period, "hz": hz, "pulse_ms": pulse,
+                               "next_at": 0.0, "count": 0, "on": False})
+        with self._lock:
+            self._trains = trains
+        return trains
+
+    def start(self):
+        if not self._trains:
+            return
+        self._stop.clear()
+        with self._lock:
+            self._phase = None
+            self._reconcile_locked(time.monotonic())   # arms entire_session
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="bnc-scheduler")
+        self._thread.start()
+
+    def set_phase(self, phase):
+        """phase: "trial" | "iti" | None. Safe to call when no trains are running."""
+        if self._thread is None:
+            return
+        with self._lock:
+            self._phase = phase
+            self._reconcile_locked(time.monotonic())
+
+    def stop(self):
+        if self._thread is None:
+            return
+        with self._lock:
+            self._phase = None
+            self._reconcile_locked(time.monotonic())   # prints the stop lines
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._thread = None
+
+    # -- internals --
+
+    def _wanted(self, t) -> bool:
+        return (t["trigger"] == "entire_session"
+                or (t["trigger"] == "during_trial" and self._phase == "trial")
+                or (t["trigger"] == "during_intertrial" and self._phase == "iti"))
+
+    def _reconcile_locked(self, now):
+        """Switch trains on/off for the current phase. Caller holds the lock."""
+        for t in self._trains:
+            want = self._wanted(t)
+            if want and not t["on"]:
+                # Fire at once: the first pulse of a during-trial train marks the
+                # trial onset, it does not wait a period for it.
+                t["on"], t["next_at"], t["count"] = True, now, 0
+                print(f"[StateMachine] BNC {t['bnc']} train started "
+                      f"({t['trigger']}, {t['hz']:g} Hz, {t['pulse_ms']} ms).")
+            elif not want and t["on"]:
+                t["on"] = False
+                print(f"[StateMachine] BNC {t['bnc']} train stopped "
+                      f"({t['trigger']}) — {t['count']} pulse(s).")
+
+    def _loop(self):
+        while not self._stop.is_set():
+            now = time.monotonic()
+            with self._lock:
+                next_at = now + self._TICK_CAP
+                for t in self._trains:
+                    if not t["on"]:
+                        continue
+                    if t["next_at"] <= now:
+                        # Never print here: a train must produce no per-pulse output.
+                        self._send(f"BNC:{t['bnc']}:PULSE:{t['pulse_ms']}")
+                        t["count"] += 1
+                        t["next_at"] += t["period"]
+                        if t["next_at"] <= now:
+                            # More than a period behind (a long GC pause, a blocked
+                            # queue). Resync rather than fire a catch-up burst the
+                            # hardware would merge into one pulse anyway.
+                            t["next_at"] = now + t["period"]
+                    next_at = min(next_at, t["next_at"])
+            self._stop.wait(max(0.0, min(next_at - time.monotonic(), self._TICK_CAP)))
 
 
 class StateMachine:
@@ -81,14 +213,28 @@ class StateMachine:
         self._speaker = None
         self._speaker_tried = False
 
+        # BNC outputs
+        self._bnc_cfg: dict = {}
+        self._bnc = _BncScheduler(self._send)
+        self._dropped_cmds = 0
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _send(self, cmd: str):
-        """Put a command on the hardware queue; drop silently if full."""
+        """Put a command on the hardware queue; count it if the queue is full.
+
+        Still non-blocking — a stalled serial process must never freeze the trial
+        loop. But a dropped command is an invisible missing TTL edge or a pump that
+        never fired, so the count is reported once at the end of the session.
+
+        Called from the scheduler thread as well as the main one;
+        multiprocessing.Queue.put_nowait is thread-safe and the counter is only a
+        diagnostic, so a lost increment does not matter.
+        """
         try:
             self.command_queue.put_nowait(cmd)
         except Exception:
-            pass
+            self._dropped_cmds += 1
 
     def _sleep(self, duration: float, sm_stop, sm_active) -> bool:
         """Sleep *duration* seconds with 20 ms polling granularity.
@@ -222,6 +368,24 @@ class StateMachine:
         except Exception as exc:
             # A dead speaker must never abort a running experiment.
             print(f"[StateMachine] sound '{key}' failed: {exc}")
+
+    # ── BNC outputs ───────────────────────────────────────────────────────────
+
+    def _bnc_fire(self, when: str):
+        """Emit every single-pulse BNC trigger of kind *when*.
+
+        Trains are the scheduler's job; these fire inline so their ordering against
+        the LEDs, screens and tone is deterministic.
+        """
+        for out in self._bnc_cfg["outputs"]:
+            if not out["enabled"]:
+                continue
+            for trig in out["triggers"]:
+                if trig["type"] != when:
+                    continue
+                pulse = int(trig["pulse_ms"])
+                self._send(f"BNC:{out['id']}:PULSE:{pulse}")
+                print(f"[StateMachine] BNC {out['id']} pulse ({when}, {pulse} ms).")
 
     # ── Touch screens ─────────────────────────────────────────────────────────
 
@@ -477,6 +641,8 @@ class StateMachine:
               + (f"  screens={screen_patterns}" if screen_patterns else ""))
 
         self._play_sound("trial_start")
+        self._bnc_fire("start_of_trial")
+        self._bnc.set_phase("trial")
 
         trial_conf  = protocol["trial"]
         end_type    = trial_conf["end_type"]
@@ -490,6 +656,9 @@ class StateMachine:
             if sm_stop.value or not sm_active.value:
                 for p in led_ports:
                     self._send(f"LED:{p}:OFF")
+                # No end-of-trial pulse or tone on an emergency stop, but the
+                # during-trial train must still be switched off.
+                self._bnc.set_phase(None)
                 return False
 
             # ── Trial end conditions ──────────────────────────────
@@ -531,6 +700,8 @@ class StateMachine:
             self._send(f"LED:{p}:OFF")
 
         # Only on a normal end — an emergency stop returns above, silently.
+        self._bnc.set_phase(None)
+        self._bnc_fire("end_of_trial")
         self._play_sound("trial_end")
 
         print(f"[StateMachine] Trial {trial_num}: ended  "
@@ -540,6 +711,18 @@ class StateMachine:
     # ── Intertrial interval ───────────────────────────────────────────────────
 
     def _run_iti(self, iti_config: dict, sm_stop, sm_active) -> bool:
+        """Run the intertrial interval, with the BNC intertrial phase around it.
+
+        A thin wrapper so the phase is cleared on every one of the body's exit
+        paths — normal completion, a stop flag, or the no-calibration fallback.
+        """
+        self._bnc.set_phase("iti")
+        try:
+            return self._run_iti_body(iti_config, sm_stop, sm_active)
+        finally:
+            self._bnc.set_phase(None)
+
+    def _run_iti_body(self, iti_config: dict, sm_stop, sm_active) -> bool:
         """Run the intertrial interval between two trials.
 
         Returns True on normal completion, False if a stop flag fires.
@@ -669,6 +852,10 @@ class StateMachine:
         self._speaker       = None
         self._speaker_tried = False
         self._switch_log    = []
+        self._dropped_cmds  = 0
+
+        self._bnc_cfg = protocol["bnc"]
+        self._bnc.configure(self._bnc_cfg)
 
         locations = self._assign_locations(protocol)
         if locations is None:
@@ -747,32 +934,48 @@ class StateMachine:
         # no time limit of its own.
         sess_deadline = sess_start + float(sess_length) if sess_type == "time" else None
 
-        while True:
-            if sm_stop.value or not sm_active.value:
-                stopped = True
-                break
-            if sess_type == "time" and time.monotonic() - sess_start >= sess_length:
-                break
-            if sess_type == "trials" and trial_num >= sess_length:
-                break
+        # try/finally so the scheduler thread is always stopped — an emergency stop,
+        # an infeasible protocol or an exception must never leave it pulsing.
+        self._bnc.start()
+        try:
+            self._bnc_fire("start_of_session")
 
-            trial_num += 1
-            if not self._run_trial(trial_num, protocol, sm_stop, sm_active,
-                                   sess_deadline):
-                stopped = True
-                break
+            while True:
+                if sm_stop.value or not sm_active.value:
+                    stopped = True
+                    break
+                if sess_type == "time" and time.monotonic() - sess_start >= sess_length:
+                    break
+                if sess_type == "trials" and trial_num >= sess_length:
+                    break
 
-            # Run ITI only if the session will continue after this trial
-            session_continues = (
-                (sess_type == "time"   and time.monotonic() - sess_start < sess_length) or
-                (sess_type == "trials" and trial_num < sess_length)
-            )
-            if session_continues:
-                if not self._run_iti(protocol["intertrial"], sm_stop, sm_active):
+                trial_num += 1
+                if not self._run_trial(trial_num, protocol, sm_stop, sm_active,
+                                       sess_deadline):
                     stopped = True
                     break
 
+                # Run ITI only if the session will continue after this trial
+                session_continues = (
+                    (sess_type == "time"   and time.monotonic() - sess_start < sess_length) or
+                    (sess_type == "trials" and trial_num < sess_length)
+                )
+                if session_continues:
+                    if not self._run_iti(protocol["intertrial"], sm_stop, sm_active):
+                        stopped = True
+                        break
+
+            # Fires on a stop too: whatever is on the other end of the cable needs
+            # to be told the session is over however it ended.
+            self._bnc_fire("end_of_session")
+        finally:
+            self._bnc.stop()
+
         self._all_off()
+
+        if self._dropped_cmds:
+            print(f"[StateMachine] WARNING: {self._dropped_cmds} hardware "
+                  f"command(s) dropped — the command queue was full.")
 
         # ── Update session log with end time ──────────────────────────────────
         if json_path:
@@ -810,6 +1013,9 @@ def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
 
     Called by main.py as a multiprocessing.Process target.
     """
+    from console_log import tag_process
+    tag_process("StateMachine")
+
     command_queue.cancel_join_thread()
     protocol_queue.cancel_join_thread()
 

@@ -11,6 +11,11 @@ from state_machine import state_machine_process
 
 
 def main():
+    # Before any child is spawned: the children inherit fds 1/2, and that
+    # inheritance is what puts every process's output on one capture pipe.
+    import console_log
+    console_log.install_capture()
+
     cam_shape          = (500, 500)
     timestamp_value    = Queue(maxsize=2)
     dlc_queue          = Queue(maxsize=2)   # camera → DLC (full-res frames)
@@ -21,7 +26,11 @@ def main():
     sensor_array       = Array('i', 16)    # shared sensors
     camera_running     = Value('b', True)
     dlc_running        = Value('b', True)
-    command_queue      = Queue(maxsize=100) # GUI → Arduino commands
+    # 1000, not 100: a dropped command is an invisible missing TTL edge or a pump
+    # that never fired. sensor_process drains the whole queue at 100 Hz so the
+    # steady-state depth stays below 1 even with four BNC trains running; the
+    # headroom is for the 32-command _all_off() burst landing while it is stalled.
+    command_queue      = Queue(maxsize=1000) # GUI → Arduino commands
     beamer_queue       = Queue(maxsize=8)   # GUI/SM → beamer projection commands
     beamer_running     = Value('b', True)
     screen_queue       = Queue(maxsize=8)   # GUI/SM → touch-screen pattern commands
@@ -142,6 +151,10 @@ def main():
     if screen_proc.is_alive():
         screen_proc.kill()
         screen_proc.join()
+
+    # Last of all: with every child gone, nothing can still be writing into the
+    # capture pipe, so the pump can see EOF, drain the tail and close the log.
+    console_log.shutdown()
 
 if __name__ == "__main__":
     import multiprocessing as mp

@@ -248,7 +248,11 @@ class CleaningPage(QtWidgets.QWidget):
         pump_header.addStretch()
         pump_header.addWidget(QtWidgets.QLabel("Duration (ms):"))
         self.pump_duration = QtWidgets.QSpinBox()
-        self.pump_duration.setRange(1, 60000)
+        # 32767, not 60000: the firmware parses the duration into a 16-bit int, so
+        # 60000 wraps to -5536, `duration > 0` is false, and handleMOSFET takes its
+        # "continuous ON — no auto-turnoff" branch. The pump then stays on until
+        # someone hits ALL OFF.
+        self.pump_duration.setRange(1, 32767)
         self.pump_duration.setValue(100)
         self.pump_duration.setFixedWidth(80)
         pump_header.addWidget(self.pump_duration)
@@ -269,7 +273,8 @@ class CleaningPage(QtWidgets.QWidget):
         bnc_header.addStretch()
         bnc_header.addWidget(QtWidgets.QLabel("Duration (ms):"))
         self.bnc_duration = QtWidgets.QSpinBox()
-        self.bnc_duration.setRange(1, 60000)
+        # Same 16-bit ceiling as the pump duration above.
+        self.bnc_duration.setRange(1, 32767)
         self.bnc_duration.setValue(100)
         self.bnc_duration.setFixedWidth(80)
         bnc_header.addWidget(self.bnc_duration)

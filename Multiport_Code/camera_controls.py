@@ -89,6 +89,9 @@ class TrackingCamera:
             self.cam.Close()
 
 def camera_process(shared_image, dlc_queue, cam_shape, running_flag):
+    from console_log import tag_process
+    tag_process("Camera")
+
     # Prevent Queue feeder threads from blocking this process's atexit.
     shared_image.cancel_join_thread()
     dlc_queue.cancel_join_thread()

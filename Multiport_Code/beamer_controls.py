@@ -340,6 +340,9 @@ class BeamerProjector:
 
 
 def beamer_process(beamer_queue, running_flag):
+    from console_log import tag_process
+    tag_process("Beamer")
+
     # Prevent Queue feeder threads from blocking this process's atexit.
     beamer_queue.cancel_join_thread()
 

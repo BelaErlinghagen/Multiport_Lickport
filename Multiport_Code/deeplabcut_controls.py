@@ -95,6 +95,9 @@ def dlc_process(dlc_queue, pose_queue, pose_display_queue, dlc_running,
 
     Called by main.py as a multiprocessing.Process target.
     """
+    from console_log import tag_process
+    tag_process("DLC")
+
     import os
     # Must be set before TF/DLCLive is imported (happens inside DLCTracker.__init__).
     # Without this TF pre-allocates most VRAM, starving Qt's OpenGL context.

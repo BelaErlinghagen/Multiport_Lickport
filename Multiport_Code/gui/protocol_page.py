@@ -112,6 +112,22 @@ class ProtocolPage(QtWidgets.QWidget):
                 {"id": 2, "trial": "black", "iti": "black"},
             ],
         },
+        # Four TTL outputs. ids 1-2 are Arduino 1's BNC 1-2, ids 3-4 Arduino 2's —
+        # see SerialControls._BNC_MAP, which deliberately exempts BNC from the
+        # lickport lookup tables. Each output owns an ordered list of triggers and
+        # several may be active at once (e.g. a session-start marker plus a
+        # during-trial train). A trigger row is
+        #     {"type": ..., "frequency_hz": ..., "pulse_ms": ...}
+        # and always carries both values whatever its type, so flipping a row
+        # between a single pulse and a train never loses the other one.
+        "bnc": {
+            "outputs": [
+                {"id": 1, "enabled": False, "triggers": []},
+                {"id": 2, "enabled": False, "triggers": []},
+                {"id": 3, "enabled": False, "triggers": []},
+                {"id": 4, "enabled": False, "triggers": []},
+            ],
+        },
     }
 
     # Touch-screen patterns (keys match screen_controls.normalize_pattern).
@@ -152,6 +168,37 @@ class ProtocolPage(QtWidgets.QWidget):
     _SOUND_KEYS = ("trial_start", "trial_end")
     _SOUND_LABELS = {"trial_start": "Play a tone at trial start",
                      "trial_end":   "Play a tone at trial end"}
+
+    # ── BNC outputs ───────────────────────────────────────────────────────────
+    _BNC_COUNT = 4
+    # Which physical connector each protocol id reaches (matches serial_controls).
+    _BNC_PORT_LABELS = {1: "Arduino 1 · BNC 1", 2: "Arduino 1 · BNC 2",
+                        3: "Arduino 2 · BNC 1", 4: "Arduino 2 · BNC 2"}
+
+    _BNC_SINGLE_TRIGGERS = ("start_of_session", "end_of_session",
+                            "start_of_trial",   "end_of_trial")
+    _BNC_TRAIN_TRIGGERS  = ("entire_session", "during_trial", "during_intertrial")
+    _BNC_TRIGGER_LABELS = {
+        "start_of_session":  "Single pulse — session start",
+        "end_of_session":    "Single pulse — session end",
+        "start_of_trial":    "Single pulse — trial start",
+        "end_of_trial":      "Single pulse — trial end",
+        "entire_session":    "Train — whole session",
+        "during_trial":      "Train — during trials",
+        "during_intertrial": "Train — during intertrials",
+    }
+    _BNC_TRIGGER_KEYS = {v: k for k, v in _BNC_TRIGGER_LABELS.items()}
+    _BNC_TRIGGER_DEFAULT = {"type": "start_of_trial",
+                            "frequency_hz": 1.0, "pulse_ms": 10}
+
+    # The firmware parses the duration into a 16-bit int; 32768 and above wrap
+    # negative and the off-timer never fires.
+    _BNC_MAX_PULSE_MS = 32767
+    # Pulses are generated on the PC and travel GUI queue → serial thread → UART,
+    # which costs 5-25 ms of jitter. Past ~20 Hz that is a large fraction of the
+    # period and the train stops being a train.
+    _BNC_MAX_HZ = 20.0
+    _BNC_JITTER_MS = 25    # amber-warning margin between pulse width and period
 
     def __init__(self, beamer_queue=None):
         super().__init__()
@@ -202,6 +249,11 @@ class ProtocolPage(QtWidgets.QWidget):
         # One (trial, iti) combo pair per reward — rebuilt when the count changes
         self._screen_dyn_rows: list[tuple[QtWidgets.QComboBox,
                                           QtWidgets.QComboBox]] = []
+
+        # BNC outputs — one block per output, each holding a variable-length list of
+        # trigger rows. Unlike the reward and screen tables (sized by a count) these
+        # are add/remove lists, so rows are appended and detached individually.
+        self._bnc_blocks: list[dict] = []   # {"chk", "body", "container", "rows"}
 
         # ITI widget refs (nullable; reset each time _rebuild_iti_section runs)
         self._iti_type_combo: QtWidgets.QComboBox | None = None        # static (set once in _build_ui)
@@ -581,6 +633,27 @@ class ProtocolPage(QtWidgets.QWidget):
 
         self._iti_type_combo.currentTextChanged.connect(self._rebuild_iti_section)
 
+        sl.addWidget(self._make_separator())
+
+        # ── BNC outputs ───────────────────────────────────────────
+        # Last, because the triggers reference the trial and intertrial phases
+        # defined by the sections above.
+        sl.addWidget(self._section_label("BNC Outputs"))
+        bnc_note = QtWidgets.QLabel(
+            "TTL pulses on the four BNC connectors. Each output can carry several "
+            "triggers — a marker pulse and a train may run on the same connector, "
+            "though two pulses landing together read as one edge downstream.\n"
+            "Pulse timing is generated on the PC and is accurate to roughly "
+            "±25 ms, so trains above ~10 Hz jitter noticeably. The pulse must "
+            "always be shorter than the interval between pulses: re-triggering a "
+            "line that is still high only extends the pulse, so it would never "
+            "return low.")
+        bnc_note.setWordWrap(True)
+        bnc_note.setStyleSheet("color:#777; font-size:9px;")
+        sl.addWidget(bnc_note)
+        for bnc_id in range(1, self._BNC_COUNT + 1):
+            sl.addWidget(self._build_bnc_block(bnc_id))
+
         sl.addStretch()
 
     # ── Layout helpers ────────────────────────────────────────────────────────
@@ -683,6 +756,168 @@ class ProtocolPage(QtWidgets.QWidget):
         self._sound_w[key] = {"chk": chk, "freq": freq, "len": length,
                               "vol": vol, "vol_lbl": vol_lbl, "body": body}
         return block
+
+    # ── BNC outputs ───────────────────────────────────────────────────────────
+
+    def _build_bnc_block(self, bnc_id: int) -> QtWidgets.QWidget:
+        """Enable checkbox + add/remove trigger list for one BNC output."""
+        block = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(block)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        chk = QtWidgets.QCheckBox(f"BNC {bnc_id}   ({self._BNC_PORT_LABELS[bnc_id]})")
+        chk.setStyleSheet("margin-left:8px;")
+        layout.addWidget(chk)
+
+        body = QtWidgets.QWidget()
+        body_l = QtWidgets.QVBoxLayout(body)
+        body_l.setContentsMargins(8, 0, 0, 0)
+        body_l.setSpacing(2)
+
+        container = QtWidgets.QWidget()
+        container.setLayout(QtWidgets.QVBoxLayout())
+        container.layout().setContentsMargins(0, 0, 0, 0)
+        container.layout().setSpacing(2)
+        body_l.addWidget(container)
+
+        add_btn = QtWidgets.QPushButton("+ Add trigger")
+        add_btn.setFixedWidth(120)
+        add_btn.clicked.connect(lambda _, i=bnc_id: self._bnc_add_trigger(i))
+        body_l.addWidget(add_btn)
+        layout.addWidget(body)
+
+        # Index is bnc_id - 1, so the handlers can address blocks by id.
+        self._bnc_blocks.append({"chk": chk, "body": body,
+                                 "container": container, "rows": []})
+        chk.toggled.connect(body.setVisible)
+        body.setVisible(chk.isChecked())
+        return block
+
+    def _bnc_add_trigger(self, bnc_id: int, trigger: dict | None = None):
+        """Append one trigger row to BNC *bnc_id*.
+
+        The frequency spin is built for every row whatever the trigger type and
+        merely hidden for the single-pulse types, so a row switched to a single
+        pulse and back keeps its frequency — the same reason the screens block
+        writes all three modes' settings on every save.
+        """
+        trig = dict(self._BNC_TRIGGER_DEFAULT if trigger is None else trigger)
+        block = self._bnc_blocks[bnc_id - 1]
+
+        row_w = QtWidgets.QWidget()
+        row_l = QtWidgets.QHBoxLayout(row_w)
+        row_l.setContentsMargins(0, 0, 0, 0)
+        row_l.setSpacing(4)
+
+        type_combo = QtWidgets.QComboBox()
+        type_combo.addItems(list(self._BNC_TRIGGER_LABELS.values()))
+        type_combo.setCurrentText(self._BNC_TRIGGER_LABELS[trig["type"]])
+        type_combo.setMinimumWidth(230)
+        row_l.addWidget(type_combo)
+
+        freq = QtWidgets.QDoubleSpinBox()
+        freq.setRange(0.1, self._BNC_MAX_HZ)
+        freq.setDecimals(2)
+        freq.setSingleStep(0.5)
+        freq.setValue(float(trig["frequency_hz"]))
+        freq.setSuffix(" Hz")
+        freq.setFixedWidth(90)
+        freq_w = self._labeled_row("Frequency:", freq)
+        row_l.addWidget(freq_w)
+
+        row_l.addWidget(QtWidgets.QLabel("Pulse:"))
+        pulse = QtWidgets.QSpinBox()
+        pulse.setRange(1, self._BNC_MAX_PULSE_MS)
+        pulse.setValue(int(trig["pulse_ms"]))
+        pulse.setSuffix(" ms")
+        pulse.setFixedWidth(100)
+        row_l.addWidget(pulse)
+
+        rm = QtWidgets.QPushButton("−")
+        rm.setFixedWidth(28)
+        row_l.addWidget(rm)
+        row_l.addStretch()
+
+        warn = QtWidgets.QLabel("")
+        warn.setWordWrap(True)
+
+        row_holder = QtWidgets.QWidget()
+        hl = QtWidgets.QVBoxLayout(row_holder)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+        hl.addWidget(row_w)
+        hl.addWidget(warn)
+
+        row = {"w": row_holder, "type": type_combo, "freq": freq,
+               "freq_w": freq_w, "pulse": pulse, "warn": warn}
+        block["rows"].append(row)
+        block["container"].layout().addWidget(row_holder)
+
+        rm.clicked.connect(lambda _, i=bnc_id, r=row: self._bnc_remove_trigger(i, r))
+        type_combo.currentTextChanged.connect(lambda _, r=row: self._bnc_row_changed(r))
+        freq.valueChanged.connect(lambda _, r=row: self._bnc_row_changed(r))
+        pulse.valueChanged.connect(lambda _, r=row: self._bnc_row_changed(r))
+        self._bnc_row_changed(row)
+
+    def _bnc_remove_trigger(self, bnc_id: int, row: dict):
+        """Drop one trigger row. Unlike the count-driven tables these rows come and
+        go one at a time, so they are deleted rather than just detached."""
+        block = self._bnc_blocks[bnc_id - 1]
+        if row in block["rows"]:
+            block["rows"].remove(row)
+        row["w"].setParent(None)
+        row["w"].deleteLater()
+
+    def _bnc_row_changed(self, row: dict):
+        """Show the frequency only for trains, and warn when the pulse is too wide.
+
+        Re-triggering a pin that is already high does not make an edge — the
+        firmware simply moves the off-time out. So a pulse at least as long as the
+        period latches the line high for the whole train.
+        """
+        key = self._BNC_TRIGGER_KEYS[row["type"].currentText()]
+        is_train = key in self._BNC_TRAIN_TRIGGERS
+        row["freq_w"].setVisible(is_train)
+        if not is_train:
+            row["warn"].setText("")
+            return
+
+        period_ms = 1000.0 / row["freq"].value()
+        pulse_ms = row["pulse"].value()
+        if pulse_ms >= period_ms:
+            row["warn"].setText(
+                f"⚠  Pulse {pulse_ms} ms ≥ period {period_ms:.0f} ms — the line "
+                f"would stay high for the whole train. Shorten the pulse or lower "
+                f"the frequency.")
+            row["warn"].setStyleSheet("color:#d04040; font-size:10px;")
+        elif pulse_ms > period_ms - self._BNC_JITTER_MS:
+            row["warn"].setText(
+                f"⚠  Only {period_ms - pulse_ms:.0f} ms of gap — PC timing jitter "
+                f"is ±{self._BNC_JITTER_MS} ms, so some pulses may merge.")
+            row["warn"].setStyleSheet("color:#e06c00; font-size:10px;")
+        else:
+            row["warn"].setText(
+                f"{period_ms:.0f} ms period, {pulse_ms} ms high "
+                f"({100 * pulse_ms / period_ms:.0f} % duty).")
+            row["warn"].setStyleSheet("color:#777; font-size:9px;")
+
+    def _bnc_errors(self) -> list:
+        """Blocking problems in the BNC block (empty when it is fine)."""
+        errs = []
+        for i, block in enumerate(self._bnc_blocks, start=1):
+            if not block["chk"].isChecked():
+                continue          # a disabled output is never emitted
+            for n, row in enumerate(block["rows"], start=1):
+                key = self._BNC_TRIGGER_KEYS[row["type"].currentText()]
+                if key not in self._BNC_TRAIN_TRIGGERS:
+                    continue
+                period_ms = 1000.0 / row["freq"].value()
+                if row["pulse"].value() >= period_ms:
+                    errs.append(
+                        f"BNC {i}, trigger {n}: pulse {row['pulse'].value()} ms is "
+                        f"not shorter than the {period_ms:.0f} ms period.")
+        return errs
 
     # ── Dynamic section builders ──────────────────────────────────────────────
 
@@ -1476,6 +1711,25 @@ class ProtocolPage(QtWidgets.QWidget):
                           for i, (t, it) in enumerate(self._screen_dyn_rows)],
         }
 
+        # ── BNC ───────────────────────────────────────────────────
+        # Every row writes both frequency_hz and pulse_ms whatever its type, so
+        # flipping a row between single pulse and train never loses a value.
+        bnc = {
+            "outputs": [
+                {
+                    "id":       i + 1,
+                    "enabled":  bool(block["chk"].isChecked()),
+                    "triggers": [
+                        {"type":         self._BNC_TRIGGER_KEYS[r["type"].currentText()],
+                         "frequency_hz": round(r["freq"].value(), 3),
+                         "pulse_ms":     int(r["pulse"].value())}
+                        for r in block["rows"]
+                    ],
+                }
+                for i, block in enumerate(self._bnc_blocks)
+            ],
+        }
+
         return {
             "session": {
                 "type":   sess_type,
@@ -1518,6 +1772,7 @@ class ProtocolPage(QtWidgets.QWidget):
             },
             "intertrial": iti,
             "screens": screens,
+            "bnc": bnc,
         }
 
     def _apply_protocol(self, d: dict):
@@ -1654,6 +1909,19 @@ class ProtocolPage(QtWidgets.QWidget):
             iti_combo.setCurrentText(self._PATTERN_LABELS[row["iti"]])
         self._update_screens_visibility()
 
+        # ── BNC ──────────────────────────────────────────────────
+        outputs = {o["id"]: o for o in d["bnc"]["outputs"]}
+        for bnc_id, block in enumerate(self._bnc_blocks, start=1):
+            out = outputs[bnc_id]
+            for row in list(block["rows"]):
+                self._bnc_remove_trigger(bnc_id, row)
+            block["chk"].blockSignals(True)
+            block["chk"].setChecked(bool(out["enabled"]))
+            block["chk"].blockSignals(False)
+            block["body"].setVisible(bool(out["enabled"]))
+            for trig in out["triggers"]:
+                self._bnc_add_trigger(bnc_id, trig)
+
         # ── Intertrial ───────────────────────────────────────────
         iti = d["intertrial"]
         _iti_label = {"time": "Fixed time", "fixed_region": "Fixed region",
@@ -1741,6 +2009,15 @@ class ProtocolPage(QtWidgets.QWidget):
         self._path_label.setStyleSheet("color:#888; font-size:10px;")
 
     def _save_protocol(self):
+        # A train whose pulse is not shorter than its period would leave the BNC
+        # latched high for the whole train, so refuse to write it out.
+        errors = self._bnc_errors()
+        if errors:
+            QtWidgets.QMessageBox.warning(
+                self, "BNC settings",
+                "This protocol cannot be saved:\n\n• " + "\n• ".join(errors))
+            return
+
         init_dir  = (os.path.dirname(self._current_path)
                      if self._current_path else self._protocols_dir())
         init_name = (os.path.basename(self._current_path)

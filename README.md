@@ -7,15 +7,53 @@
   <i>Figure 1: The Multiport Setup. A) Complete view of the MultiportSetup. B) Testing adjustments to the setup to show that the capacitive sensor of the Lick-O-Tron detects mouse licks. A Basler daA1440 was used to record the lickport. The mouse was given condensed milk (white droplet in C) manually through the shown tube. C) Top: Timeline over the entire session. Sensor activations are marked as blue bars. Bottom: Zoom into one lick detection. </i>
 </center>
 
+## Components of the Multiport Setup
+
+### Arena
+
+The arena of the Multiport Setup is constructed from 16 red acrylic wall panels, which are held together by 16 connector pieces. This circular assembly is standing on a sheet of acrylic that has been roughened on one side, so that it is more comfortable to walk on for the mice and so that light that is projected onto the floor of the arena does not get reflected.
+
+In addition to the circular Multiport arena, two inlets were created to create a Y-Maze.
+
+### Lick-O-Tron and PORTMASTER
+
+The Lick-O-Tron is a self built lickport module, which consists of a capacitive sensor, an LED and a MOSFET relay to trigger a pump/valve. 
+
+The PORTMASTER is a hub to connect all of the Lick-O-Trons with the master Arduinos and deliver power to the pumps. 
+
+More information about these two components can be found below.
+
+### Computer
+
+The computer (a Lenovo Thinkstation) used on this build had the following specifications:
+
+| CPU | Intel(R) Core(TM) i7-14700K |
+| GPU | Nvidia GeForce RTX 4060 |
+| OS | Ubuntu 24.04 |
+
+In order to run live inference with DeepLabCut, CUDA was installed alongside the necessary Nvidia GPU drivers. Pixi was used to manage the python environment of the software, the .lock and .toml files can be found in the repo.
+
+### Projector
+
+A BenQ Cinema Master Projector was mounted ~ 200cm above the arena floor.
+
+### Camera
+
+A Basler daA3840-45uc camera with an Evetar Lens (E3417A F2.4 f2.5mm 1/1.8") were mounted 40cm below the arena floor.
+
+### Screens
+
+In the Y-Maze configuration, two adafruit (5" 800x480 HDMI Backpack) screens were used to display patterns for the mice. The screens were directly connected to the computer via HDMI.
+
+
+### Credit
+The Lick-O-Tron and the PORTMASTER were conceptualized and designed by Bela Erlinghagen, with extensive support by Trace Robbins (https://github.com/R-Trace) and Ben Escribano (https://github.com/BenjaminEscribano) from the iBehave CADRE (Website: https://ibehave.nrw/ibots-platform/cadre/ , Github: https://github.com/iBehave-CADRE).
 
 
 # Documentation for the Lick-O-Tron and the PORTMASTER
 
 The Lick-O-Tron Lickport and the PORTMASTER connectivity board are the two major components that act together in the automated Multiport system.
 The design, assembly and usage of both modules are explained below in detail. Files to recreate the two modules can be found in their respective folders.
-
-### Credit
-The Lick-O-Tron and the PORTMASTER were conceptualized and designed by Bela Erlinghagen, with extensive support by Trace Robbins (https://github.com/R-Trace) and Ben Escribano (https://github.com/BenjaminEscribano) from the iBehave CADRE (Website: https://ibehave.nrw/ibots-platform/cadre/ , Github: https://github.com/iBehave-CADRE).
 
 ## The Lick-O-Tron Lickport
 The idea behind the Lick-O-Tron was to create a lickport for behavioral mouse experiments that can:
@@ -85,7 +123,7 @@ In order to add the pump, solder two wires to the solder flags and on their othe
 ### Usage
 
 <p align="middle">
-  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-Tron_insetup.jpg" width="700" />
+  <img src="https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/Lick-O-Tron/Lick-O-Tron_insetup.jpg" width="500" />
 </p>
 <center>
   <i>Figure 4: All pieces together.</i>
@@ -108,6 +146,10 @@ In order to control up to 16 Lick-O-Tron lickports, the PORTMASTER was designed:
 
 ### Design
 
+The PORTMASTER is designed to: 
+- enable users to power up to 5 6V pumps comfortably
+- provide an easily accessible interface between the Arduinos and the computer/BNCs/power supply
+
 ### Assembly
 #### Parts
 | Item | Quantity | Manufactured by | EAN |
@@ -118,4 +160,16 @@ In order to control up to 16 Lick-O-Tron lickports, the PORTMASTER was designed:
 | PORTMASTER PCB | 1 | Eurocircuits | None: see Folder in Repo |
 | RSP-100-5 SMPSU 5V DC 20A 100W | 1 | MEAN WELL | 4711287435657 |
 
+The remaining parts that can be seen in Figure 5 have been left out on purpose, because they are specific to the spatial properties of where the Multiport_Setup and especially the PORTMASTER was housed.
+
+#### Step 1: Solder pins and connector pieces to the PCB
+
+In order to connect the 2 Arduino Mega to the PCB, first the pins and connector pieces for the power supply and BNCs have to be soldered onto the PCB.
+
+#### Step 2: Wiring
+
+Once the Arduinos are in pace, all that is left to do is the wiring. To connect to the 16 Lick-O-Trons, an 8 band ribbon cable can be used, together with two 8-Way IDC connectors, one that goes on the Lick-O-Trons and one that goes on the PORTMASTER. Then, the power supply needs to be connected to power and to the PCB (Safety: make sure to properly ground the casing of the PORTMASTER). In the build showcased here, male BNC plugs were also connected to the PCB.
+
 ### Usage
+
+The PORTMASTER can be connected to a computer via two USB-B to USB-A cables. It can then be utilized with the ![custom software](https://github.com/BelaErlinghagen/Multiport_Lickport/tree/main/Multiport_Code).

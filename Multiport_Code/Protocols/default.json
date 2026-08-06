@@ -118,5 +118,29 @@
         "iti": "black"
       }
     ]
+  },
+  "bnc": {
+    "outputs": [
+      {
+        "id": 1,
+        "enabled": false,
+        "triggers": []
+      },
+      {
+        "id": 2,
+        "enabled": false,
+        "triggers": []
+      },
+      {
+        "id": 3,
+        "enabled": false,
+        "triggers": []
+      },
+      {
+        "id": 4,
+        "enabled": false,
+        "triggers": []
+      }
+    ]
   }
 }

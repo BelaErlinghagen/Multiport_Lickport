@@ -6,12 +6,23 @@ import queue
 
 
 class SerialControls:
-    def __init__(self, baudrate = 115200):
+    # Protocol BNC id → (board index, board-local BNC id 1-2).
+    # The BNCs are NOT lickports. The lookup tables map the 16 lickports onto the
+    # two boards' 8 channels each; running a BNC id through them turned BNC:2 into
+    # BNC:4 and BNC:4 into BNC:8, both rejected by the firmware, which only knows
+    # ids 1-2. So BNC gets its own straight-through table.
+    _BNC_MAP = {1: (0, 1), 2: (0, 2), 3: (1, 1), 4: (1, 2)}
+
+    def __init__(self, baudrate = 115200, verbose = None):
         print("Initializing Serial Communication.")
         self.serial_arduino1 = serial.Serial(shared_states.serial_ports[0], baudrate, timeout = 1)
         self.serial_arduino2 = serial.Serial(shared_states.serial_ports[1], baudrate, timeout = 1)
         print("[INFO] Serial connections initialized.")
-        
+
+        # Per-command tracing. Off by default — see shared_states.serial_verbose.
+        self.verbose = (bool(getattr(shared_states, "serial_verbose", False))
+                        if verbose is None else bool(verbose))
+
         self.latest_active_pins = {0:[], 1:[]}
 
         self.write_queue = queue.Queue()
@@ -36,17 +47,32 @@ class SerialControls:
         self.reader_arduino2.start()
         self.writer_thread.start()
     
-    def _serial_object_mapping(self, input_id):
-        if input_id <= 8:
-            serial_object = self.serial_arduino1
-            new_id = list(shared_states.lookup_tables[0].keys())[list(shared_states.lookup_tables[0].values()).index(input_id)]
-        elif input_id >= 9:
-            serial_object = self.serial_arduino2
-            new_id = list(shared_states.lookup_tables[1].keys())[list(shared_states.lookup_tables[1].values()).index(input_id)] 
-            
-        else: return input_id
+    def _serial_object_mapping(self, kind, input_id):
+        """Return (serial object, board-local id) for one command.
 
-        return serial_object, new_id
+        *kind* is the command's first field ("LED" / "MOS" / "BNC").
+
+        BNC ids 1-4 address the four connectors directly (1-2 on Arduino 1, 3-4 on
+        Arduino 2). LED and MOS ids are global lickport numbers 1-16 and go through
+        the lookup tables, which say which board carries a port and what its local
+        1-8 channel is.
+        """
+        input_id = int(input_id)
+
+        if kind == "BNC":
+            if input_id not in self._BNC_MAP:
+                raise ValueError(f"BNC id {input_id} out of range (1-4)")
+            board, local_id = self._BNC_MAP[input_id]
+            return (self.serial_arduino1 if board == 0 else self.serial_arduino2), local_id
+
+        if input_id <= 8:
+            serial_object, table = self.serial_arduino1, shared_states.lookup_tables[0]
+        else:
+            serial_object, table = self.serial_arduino2, shared_states.lookup_tables[1]
+        for local_id, global_id in table.items():
+            if global_id == input_id:
+                return serial_object, local_id
+        raise ValueError(f"{kind} id {input_id} is not in the lookup tables")
 
     
     def _reader_loop(self, serial_object, arduino_index):
@@ -96,25 +122,32 @@ class SerialControls:
                     continue
                 
                 command_string = ":".join(cmd_parts)
-                print(f"Processing: {command_string}")
-                
+                # Tracing is off by default: a BNC train would print two lines per
+                # pulse and drown both the console and the session log.
+                if self.verbose:
+                    print(f"Processing: {command_string}")
+
                 # Extract input_id (assuming it's the second element)
                 try:
                     input_id = int(cmd_parts[1])
                 except ValueError:
                     print(f"[ERROR] Invalid input_id: {cmd_parts[1]}")
                     continue
-                
+
                 # Get the correct serial object and mapped ID
-                serial_object, new_id = self._serial_object_mapping(input_id)
-                
+                serial_object, new_id = self._serial_object_mapping(cmd_parts[0], input_id)
+
                 # Reconstruct the command with the NEW mapped ID
                 if len(cmd_parts) == 3:
                     final_command = f"{cmd_parts[0]}:{new_id}:{cmd_parts[2]}"
                 elif len(cmd_parts) == 4:
                     final_command = f"{cmd_parts[0]}:{new_id}:{cmd_parts[2]}:{cmd_parts[3]}"
-                
-                print(f"Sending to {serial_object.port}: {final_command}")
+                else:
+                    print(f"[WARN] Unsupported command length: {command_string}")
+                    continue
+
+                if self.verbose:
+                    print(f"Sending to {serial_object.port}: {final_command}")
                 serial_object.write((final_command + '\r\n').encode('utf-8'))
                 serial_object.flush()
                 
@@ -166,6 +199,9 @@ class SerialControls:
         if self.serial_arduino2: self.serial_arduino2.close()
 
 def sensor_process(sensor_array, timestamp_value, command_queue=None):
+    from console_log import tag_process
+    tag_process("Serial")
+
     # Prevent Queue feeder threads from blocking this process's atexit.
     # Without this, terminating the process while the pipe is full causes a
     # deadlock: main waits for this process to exit, this process waits for

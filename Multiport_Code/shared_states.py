@@ -3,7 +3,13 @@ from pathlib import Path
 ### Serial Controls
 
 serial_ports = ['/dev/ttyACM0', '/dev/ttyACM1']
+# Lickport id → (board, board-local channel). BNC ids do NOT go through this — they
+# address the four connectors directly, see SerialControls._BNC_MAP.
 lookup_tables= [{1:1,2:3,3:5,4:2,5:6,6:7,7:8,8:4},{1:16,2:13,3:15,4:9,5:12,6:11,7:10,8:14}]
+# Per-command serial tracing ("Processing: …" / "Sending to …"). Off by default: it
+# is two console lines per command, so a BNC train at 10 Hz would bury everything
+# else — and those lines now land in the session console log too.
+serial_verbose = False
 
 ### Camera controls
 # Two Basler cameras are connected to the PC; select the tracking camera by its

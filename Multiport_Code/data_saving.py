@@ -36,27 +36,23 @@ class data_saver:
         print(f"[Saving] flushed {len(rows)} row(s) to {os.path.basename(csv_path)}")
         rows.clear()
 
-    def start_saving(self, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag):
-        from shared_states import get_data_path
-        data_path = get_data_path()
-        # create mouse and session folders if they do not exist yet
-        mouse_path = data_path + f"/{mouse_id}"
-        session_path = mouse_path + f"/{session_id}"
-        try:
-            if not os.path.exists(mouse_path):
-                os.makedirs(mouse_path)
-            if not os.path.exists(session_path):
-                os.makedirs(session_path)
-        except Exception as e:
-            print(f"Folder Creation Error during Saving: {e}")
+    def start_saving(self, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag,
+                     recording_folder=None):
+        if recording_folder is None:
+            # Standalone use (the __main__ demo below). The GUI always passes a
+            # folder it created itself, so it owns the path from the moment Start is
+            # pressed and can open the session console log there immediately.
+            from shared_states import get_data_path
+            recording_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session_id}"
+            recording_folder = os.path.join(get_data_path(), mouse_id, session_id,
+                                            recording_id)
+        recording_id = os.path.basename(recording_folder)
+        # exist_ok: the folder normally already exists because the GUI made it.
+        # Without it, a pre-existing folder raised FileExistsError inside this daemon
+        # thread, which then died silently while the GUI still showed "Recording".
+        os.makedirs(os.path.join(recording_folder, "Image_Arrays"), exist_ok=True)
 
-        current_time = current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
-        recording_id = f"{current_time}_{session_id}"
-        recording_folder = f"{session_path}/{recording_id}"
-        os.makedirs(recording_folder)
-        os.makedirs(f"{recording_folder}/Image_Arrays")
-
-        print(f"Saving Data for {mouse_id}, Session: {session_id} at {data_path}")
+        print(f"[Saving] {mouse_id} / {session_id} → {recording_folder}")
 
         # Rows are buffered here and appended to the CSV every chunk_seconds, so a
         # crash mid-session only loses the rows since the last flush.
@@ -107,7 +103,10 @@ class data_saver:
 
 
     
-def saving_process(camera_data, sensor_data, dlc_data, timestamp_queue, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag, running_flag):
+def saving_process(camera_data, sensor_data, dlc_data, timestamp_queue, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag, running_flag, recording_folder=None):
+    from console_log import tag_process
+    tag_process("Saving")
+
     saver = data_saver(camera_data, sensor_data, dlc_data, timestamp_queue)
     saving_thread = None
 
@@ -130,7 +129,8 @@ def saving_process(camera_data, sensor_data, dlc_data, timestamp_queue, mouse_id
             # To DO: move mouse id and so on in here so that it can be flexibly deployed
             saving_thread = Thread(
                 target=saver.start_saving,
-                args=(mouse_id, session_id, camera_flag, sensor_flag, dlc_flag),
+                args=(mouse_id, session_id, camera_flag, sensor_flag, dlc_flag,
+                      recording_folder),
                 daemon=True
             )
             saving_thread.start()

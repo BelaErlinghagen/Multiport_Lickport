@@ -233,6 +233,9 @@ class ScreenControls:
 
 
 def screen_process(screen_queue, running_flag):
+    from console_log import tag_process
+    tag_process("Screens")
+
     # Prevent Queue feeder threads from blocking this process's atexit.
     screen_queue.cancel_join_thread()
 
