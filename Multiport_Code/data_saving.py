@@ -2,21 +2,28 @@
 
 One row every 50 ms holding both what the sensors saw and what the setup was doing:
 the lick sensors, the DLC pose, and the live state of every actuator (pumps, LEDs,
-speaker, beamer, touch screens, BNC lines) read out of the shared hardware_state.
+speaker, beamer, touch screens, BNC lines) read out of the shared hardware_state,
+plus the state machine's per-port reward verdict.
 
 Camera frames are *not* saved here any more. They used to be written one .npy per
 sample — 4 MB each, pulled out of dlc_queue and therefore stolen from DeepLabCut.
 The camera process now encodes them straight to chunked MP4 instead
 (camera_controls.TrackingCamera._video_tick → video_writer.ChunkedVideoWriter).
 
-Reading a session back — the bit-string columns must be read as strings, or pandas
+Reading a session back — the 16-character columns must be read as strings, or pandas
 parses "0010000000000000" as the integer 10000000000000 and the leading zeros (i.e.
 the first channels) are lost:
 
-    df = pd.read_csv(path, dtype={"Sensors": str, "Pumps": str,
-                                  "LEDs": str, "BNCs": str})
+    df = pd.read_csv(path, dtype={"Sensors": str, "Pumps": str, "LEDs": str,
+                                  "BNCs": str, "Rewards": str})
     pumps_on = [i + 1 for i, c in enumerate(df.Pumps[0]) if c == "1"]
     beamer   = json.loads(df.Beamer[0]) if pd.notna(df.Beamer[0]) else None
+
+Rewards is the one that is *not* a bit-string: each character is a 0-6 code (see
+hardware_state.REWARD_*), so read it with `[int(c) for c in s]` rather than testing
+for "1". It says which ports were rewarded this trial and how each one ended —
+complete, partial, or a probability miss — which the Pumps column cannot, now that
+one reward is a train of pulses spread over several licks.
 
 Video frames align by index: row N of {prefix}_frames.csv gives the wall-clock
 timestamp of frame N of the MP4, on the same clock as the Timestamp column here.
@@ -54,14 +61,16 @@ class data_saver:
         """Snapshot every actuator for one CSV row.
 
         The 16-item states are packed bit-strings ("0010000000000000") — fixed width,
-        no whitespace to guess at, and `[int(c) for c in s]` reads them back. The
-        beamer is the one structured field, so it goes in as compact JSON, and is
-        None whenever nothing is being projected.
+        no whitespace to guess at, and `[int(c) for c in s]` reads them back. Rewards
+        uses the same shape but 0-6 codes rather than flags. The beamer is the one
+        structured field, so it goes in as compact JSON, and is None whenever nothing
+        is being projected.
         """
         hw = self.hw
         if hw is None:
             return {'Pumps': None, 'LEDs': None, 'Speakers': None,
-                    'Beamer': None, 'Screens': None, 'BNCs': None}
+                    'Beamer': None, 'Screens': None, 'BNCs': None,
+                    'Rewards': None}
 
         beamer = hardware_state.read_beamer(hw)
         if beamer is not None:
@@ -76,6 +85,7 @@ class data_saver:
             'Beamer':   beamer,
             'Screens':  hardware_state.screen_names(hw),
             'BNCs':     hardware_state.bnc_bits(hw),
+            'Rewards':  hardware_state.reward_codes(hw),
         }
 
     @staticmethod

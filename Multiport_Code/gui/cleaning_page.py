@@ -8,7 +8,9 @@ import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 import shared_states
+from pump_calibration import PumpCalibration
 from speaker_controls import SpeakerControls
+from gui.pump_calibration_dialog import PumpCalibrationDialog
 
 
 class CleaningPage(QtWidgets.QWidget):
@@ -20,9 +22,15 @@ class CleaningPage(QtWidgets.QWidget):
       3. Screens       — pattern test for the two HDMI screens (via screen_queue)
       4. ALL OFF safety button  ← sits directly above LED controls
       5. LEDs          — manual toggle controls
-      6. Pumps         — manual pulse controls
+      6. Pumps         — manual dose in µL + calibration wizard
       7. BNC           — manual pulse controls
       8. Automated Cleaning Cycle
+
+    The pump block asks for a volume, not a duration, and delivers it as the same
+    train of short pulses a session uses — so pressing a port here is a direct test
+    of whether that pump still matches its calibration. The cleaning cycle below it
+    stays in seconds: flushing a line is not a reward and wants the pump simply held
+    open.
     """
 
     _BTN_SIZE = 44   # px, square grid buttons
@@ -55,8 +63,35 @@ class CleaningPage(QtWidgets.QWidget):
         self._cleaning_timer = QtCore.QTimer(self)
         self._cleaning_timer.timeout.connect(self._cleaning_tick)
 
-        # Root layout fills the entire widget — no scroll area
-        root = QtWidgets.QVBoxLayout(self)
+        # Manual dose state. Its own timer and queue, deliberately separate from the
+        # cleaning cycle's: _stop_cleaning stops that timer and clears its queues, so
+        # sharing them would make the two features cancel each other.
+        self.pump_calib = PumpCalibration()
+        self._manual_pending: dict = {}   # {pump_id: pulses left to fire}
+        self._manual_timer = QtCore.QTimer(self)
+        self._manual_timer.timeout.connect(self._manual_tick)
+
+        # Everything scrolls, like the Protocol and Experiment tabs. This is not
+        # cosmetic: with all eight sections laid out at once the page asks for a
+        # ~1080 px minimum height, which put the *window's* minimum above the
+        # control monitor's work area (1200 px monitor − 32 px top bar − 37 px
+        # title bar = 1131 px). A window that cannot fit a monitor's work area is
+        # one the window manager will not place there at all — it silently opened
+        # across the touch panels instead. Adding another section here must never
+        # be able to do that again.
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        content = QtWidgets.QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        root = QtWidgets.QVBoxLayout(content)
         root.setSpacing(10)
         root.setContentsMargins(10, 10, 10, 10)
 
@@ -242,29 +277,44 @@ class CleaningPage(QtWidgets.QWidget):
         root.addLayout(led_grid)
         root.addWidget(self._separator())
 
-        # ── 5. Pumps — manual pulse ───────────────────────────────
+        # ── 5. Pumps — manual dose ────────────────────────────────
+        # In µL, not ms: this is the block used to check whether a pump still
+        # matches its calibration, so it has to ask for a dose the same way a
+        # protocol does. The pump is never held on — the dose is delivered as a
+        # train of short pulses, exactly as a session delivers a reward.
         pump_header = QtWidgets.QHBoxLayout()
-        pump_header.addWidget(self._section_label("Pumps — Manual Pulse"))
+        pump_header.addWidget(self._section_label("Pumps — Manual Dose"))
         pump_header.addStretch()
-        pump_header.addWidget(QtWidgets.QLabel("Duration (ms):"))
-        self.pump_duration = QtWidgets.QSpinBox()
-        # 32767, not 60000: the firmware parses the duration into a 16-bit int, so
-        # 60000 wraps to -5536, `duration > 0` is false, and handleMOSFET takes its
-        # "continuous ON — no auto-turnoff" branch. The pump then stays on until
-        # someone hits ALL OFF.
-        self.pump_duration.setRange(1, 32767)
-        self.pump_duration.setValue(100)
-        self.pump_duration.setFixedWidth(80)
-        pump_header.addWidget(self.pump_duration)
+        pump_header.addWidget(QtWidgets.QLabel("Volume (µL):"))
+        self.pump_volume = QtWidgets.QDoubleSpinBox()
+        self.pump_volume.setRange(0.1, 50.0)
+        self.pump_volume.setSingleStep(0.5)
+        self.pump_volume.setDecimals(2)
+        self.pump_volume.setValue(5.0)
+        self.pump_volume.setFixedWidth(90)
+        self.pump_volume.valueChanged.connect(lambda _v: self._update_pump_buttons())
+        pump_header.addWidget(self.pump_volume)
+
+        self._calib_btn = QtWidgets.QPushButton("Calibrate pumps…")
+        self._calib_btn.setFixedHeight(26)
+        self._calib_btn.clicked.connect(self._open_pump_calibration)
+        pump_header.addWidget(self._calib_btn)
         root.addLayout(pump_header)
 
         pump_grid = self._make_grid()
+        self._pump_buttons = {}
         for i in range(1, 17):
             btn = QtWidgets.QPushButton(str(i))
             btn.setFixedSize(self._BTN_SIZE, self._BTN_SIZE)
             btn.clicked.connect(lambda _, n=i: self._pulse_pump(n))
             pump_grid.addWidget(btn, (i - 1) // 8, (i - 1) % 8)
+            self._pump_buttons[i] = btn
         root.addLayout(pump_grid)
+
+        self._pump_hint = QtWidgets.QLabel("")
+        self._pump_hint.setStyleSheet("color:#888; font-size:10px;")
+        self._pump_hint.setWordWrap(True)
+        root.addWidget(self._pump_hint)
         root.addWidget(self._separator())
 
         # ── 6. BNC ────────────────────────────────────────────────
@@ -489,14 +539,105 @@ class CleaningPage(QtWidgets.QWidget):
             "QPushButton { background:#007acc; border-radius:4px; }" if on else ""
         )
 
+    # ── Manual dose (volume → pulse train) ────────────────────────
+
+    _MAX_CONCURRENT_PUMPS = 3   # same ceiling the cleaning cycle respects
+
     def _pulse_pump(self, pump_id: int):
-        self._send(f"MOS:{pump_id}:ON:{self.pump_duration.value()}")
+        """Queue the pulses that deliver the requested volume at *pump_id*.
+
+        No pump is ever held on: the dose is a train of shared_states.pump_pulse_ms
+        pulses at pump_refractory_ms, the same cadence a session uses, so what comes
+        out here is what a mouse would get for that volume in a protocol.
+        """
+        plan = self.pump_calib.pulses_for(pump_id, self.pump_volume.value())
+        if plan is None:
+            QtWidgets.QMessageBox.information(
+                self, "Not calibrated",
+                f"Pump {pump_id} has no measured µL/pulse, so a volume cannot be "
+                "converted into pulses.\n\nUse “Calibrate pumps…” first.")
+            return
+        n_pulses, actual_ul = plan
+        # Re-clicking a port restarts its dose rather than stacking two trains.
+        self._manual_pending[pump_id] = n_pulses
+        self._pump_hint.setText(
+            f"Pump {pump_id}: {n_pulses} × {int(shared_states.pump_pulse_ms)} ms "
+            f"≈ {actual_ul:.2f} µL "
+            f"(≈ {self.pump_calib.min_delivery_s(n_pulses):.1f} s)")
+        if not self._manual_timer.isActive():
+            self._manual_tick()   # first pulse without waiting out an interval
+            self._manual_timer.start(int(shared_states.pump_refractory_ms))
+
+    def _manual_tick(self):
+        """Fire one pulse for each pending pump, up to the concurrency cap."""
+        if not self._manual_pending:
+            self._manual_timer.stop()
+            return
+        for pump_id in list(self._manual_pending)[:self._MAX_CONCURRENT_PUMPS]:
+            self._send(f"MOS:{pump_id}:ON:{int(shared_states.pump_pulse_ms)}")
+            self._manual_pending[pump_id] -= 1
+            if self._manual_pending[pump_id] <= 0:
+                del self._manual_pending[pump_id]
+        if not self._manual_pending:
+            self._manual_timer.stop()
+
+    def _stop_manual_doses(self):
+        """Cancel every queued manual pulse. Nothing may fire after this returns."""
+        self._manual_timer.stop()
+        self._manual_pending.clear()
+
+    def _update_pump_buttons(self):
+        """Grey out pumps with no calibration and show what the volume costs."""
+        volume = self.pump_volume.value()
+        uncalibrated = []
+        for pump_id, btn in self._pump_buttons.items():
+            plan = self.pump_calib.pulses_for(pump_id, volume)
+            btn.setEnabled(plan is not None)
+            if plan is None:
+                uncalibrated.append(pump_id)
+                btn.setToolTip(f"Pump {pump_id} is not calibrated — "
+                               "run “Calibrate pumps…”")
+            else:
+                n, actual = plan
+                btn.setToolTip(f"Pump {pump_id}: {n} pulses ≈ {actual:.2f} µL")
+        if uncalibrated:
+            self._pump_hint.setText(
+                "Not calibrated: " + ", ".join(str(p) for p in uncalibrated)
+                + " — those pumps cannot deliver a volume yet.")
+        elif not self._manual_pending:
+            self._pump_hint.setText("")
+
+    def _open_pump_calibration(self):
+        """Run the calibration wizard, with nothing else driving the pumps."""
+        # Two writers on the same pumps would corrupt a measurement, and the wizard
+        # counts every pulse it fires — so anything else pumping has to stop first.
+        if self._cleaning_active:
+            self._stop_cleaning()
+        self._stop_manual_doses()
+        dlg = PumpCalibrationDialog(self.command_queue, self)
+        dlg.exec_()
+        self.pump_calib.reload(force=True)
+        self._update_pump_buttons()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Cheap — PumpCalibration.reload() short-circuits on an unchanged mtime.
+        self.pump_calib.reload()
+        self._update_pump_buttons()
 
     def _pulse_bnc(self, bnc_id: int):
         self._send(f"BNC:{bnc_id}:PULSE:{self.bnc_duration.value()}")
 
     def _all_off(self):
-        """Immediately turn off all LEDs and all pumps."""
+        """Immediately turn off all LEDs and all pumps.
+
+        This button's whole job is being final, so it cancels the queued work as
+        well as the hardware: without that, a manual dose or a cleaning cycle would
+        switch a pump straight back on a fraction of a second later.
+        """
+        self._stop_manual_doses()
+        if self._cleaning_active:
+            self._stop_cleaning()
         for i in range(1, 17):
             self._send(f"LED:{i}:OFF")
             self._send(f"MOS:{i}:OFF:0")

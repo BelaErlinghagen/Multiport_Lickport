@@ -25,6 +25,23 @@ which a 20 Hz CSV sampler would alias into a meaningless flicker, so the schedul
 publishes the *span* a train is running in `bnc_train` while sensor_process latches
 individual pulses in `bnc_pulse`. Each array has exactly one writer, so they never
 fight, and the reader ORs them into one column.
+
+`reward_state` is the odd one out: not an actuator but the state machine's per-port
+verdict on each reward, so the CSV can say *why* a port stopped being pumped. A
+reward is now a volume delivered over several licks (see pump_calibration.py), so
+"the pump fired" no longer implies "the reward was collected" and the two have to be
+recorded separately. One digit per port:
+
+    0  not a reward port this trial (or no trial running)
+    1  reward available, no contact yet
+    2  delivering — probability roll hit, target volume not yet reached
+    3  complete   — full volume delivered
+    4  partial    — closed out short, by the stall timeout or at trial end
+    5  miss       — probability roll failed, nothing delivered
+    6  blocked    — a release-delay lick was ignored (transient, reverts to 1)
+
+Codes 3-5 are terminal and persist to the end of the trial, so any row within a trial
+reports what happened at every port. It has exactly one writer, StateMachine.
 """
 
 from multiprocessing import Array, Value
@@ -39,6 +56,17 @@ SCREEN_COUNT = 2
 # Touch-screen pattern codes stored in `screens`. -1 means "nothing set yet"; the
 # names come from screen_controls.PATTERN_* via normalize_pattern().
 SCREEN_PATTERNS = {0: "black", 1: "circles", 2: "zigzag"}
+
+# Per-port reward codes stored in `reward_state` — see the module docstring. Named
+# constants because the state machine sets them from four different places and a
+# bare 4 in the middle of a trial loop says nothing.
+REWARD_NONE       = 0
+REWARD_AVAILABLE  = 1
+REWARD_DELIVERING = 2
+REWARD_COMPLETE   = 3
+REWARD_PARTIAL    = 4
+REWARD_MISS       = 5
+REWARD_BLOCKED    = 6
 
 
 class HardwareState:
@@ -61,6 +89,7 @@ class HardwareState:
         self.beamer_seq    = Value('i', 0)        # seqlock guarding the three above
         self.screens_used  = Value('b', 0)        # protocol screens.mode != "none"
         self.screens       = Array('i', SCREEN_COUNT)
+        self.reward_state  = Array('b', PUMP_COUNT)  # REWARD_* code per lickport
 
 
 # ── Beamer seqlock ────────────────────────────────────────────────────────────
@@ -128,12 +157,40 @@ def bnc_bits(hw):
     return bits(t or p for t, p in zip(hw.bnc_train, hw.bnc_pulse))
 
 
+def reward_codes(hw):
+    """Per-port reward state as "0030100000000000" — one REWARD_* digit per lickport.
+
+    Deliberately not bits(): these are 0-6 codes, not flags, so a reader wants
+    `[int(c) for c in s]` and not a truthiness test. Same fixed-width string shape as
+    the other 16-item columns, and the same leading-zero hazard when read back.
+    """
+    if hw is None:
+        return "0" * PUMP_COUNT
+    return "".join(str(int(v)) for v in hw.reward_state)
+
+
+def set_reward_state(hw, port, code):
+    """Publish one port's REWARD_* code (1-based port, ignored when hw is None)."""
+    if hw is None or not (1 <= port <= PUMP_COUNT):
+        return
+    hw.reward_state[port - 1] = code
+
+
+def clear_reward_states(hw):
+    """Back to REWARD_NONE everywhere — called at the end of every trial."""
+    if hw is None:
+        return
+    for i in range(PUMP_COUNT):
+        hw.reward_state[i] = REWARD_NONE
+
+
 def reset(hw):
     """Zero every actuator field. Called at session start so nothing carries over."""
     if hw is None:
         return
     for i in range(PUMP_COUNT):
         hw.pumps[i] = 0
+        hw.reward_state[i] = REWARD_NONE
     for i in range(LED_COUNT):
         hw.leds[i] = 0
     for i in range(BNC_COUNT):

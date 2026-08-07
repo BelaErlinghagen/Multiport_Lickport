@@ -9,10 +9,11 @@ CLAUDE.md
 # Pycache — matches at any depth (Multiport_Code/ and gui/)
 __pycache__/
 
-# Local configuration: the RSpace API key and the rig's beamer calibration.
-# Machine-specific and secret, so they stay out of the repo.
+# Local configuration: the RSpace API key and the rig's beamer and pump
+# calibrations. Machine-specific and secret, so they stay out of the repo.
 config/config.json
 config/beamer_calibration.json
+config/pump_calibration.json
 
 # Unsaved RSpace entry drafts
 Autosaved/

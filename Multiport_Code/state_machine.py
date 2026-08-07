@@ -24,6 +24,13 @@ Trial tones go through a SpeakerControls owned directly by this class rather tha
 queue and a process of its own: it opens no audio device until the first tone and
 plays through a daemon thread, so it never blocks the trial loop.
 
+Rewards are volumes, not durations. A pump held on for more than ~10 ms shoots the
+liquid instead of forming a droplet, so a reward is a train of 10 ms pulses gated by
+the animal's own licking — one pulse per lick until the protocol's µL are delivered.
+The µL/pulse per port comes from pump_calibration.py, and a session refuses to start
+if any of its reward ports is uncalibrated. See _run_trial for the delivery rules and
+shared_states' Pumps block for why the inter-pulse floor is what it is.
+
 The protocol is read strictly — every key ProtocolPage writes must be present, so a
 malformed protocol raises KeyError rather than silently running on defaults. The
 `_meta` block is the exception: the GUI injects it at runtime and a standalone run
@@ -41,11 +48,27 @@ import threading
 import time
 from datetime import datetime
 
+import hardware_state as _hw_state
+import shared_states
+
 _CIRCLE_SIZE  = 16   # total number of ports in the circular array
 _SCREEN_COUNT = 2    # HDMI touch screens driven by screen_controls
 
 # BNC trigger families (mirrors ProtocolPage._BNC_*_TRIGGERS).
 _BNC_TRAIN_TRIGGERS = ("entire_session", "during_trial", "during_intertrial")
+
+# ── Reward delivery (see pump_calibration.py and shared_states' Pumps block) ───
+# Bound once at import: these are rig constants, and re-reading them per pulse
+# inside the trial loop would only invite them changing halfway through a session.
+_PUMP_PULSE_MS      = int(shared_states.pump_pulse_ms)
+_PUMP_REFRACTORY_S  = shared_states.pump_refractory_ms / 1000.0
+_DELIVERY_TIMEOUT_S = float(shared_states.pump_delivery_timeout_s)
+
+# How long a REWARD_BLOCKED code is held before the port reverts to AVAILABLE. A
+# release-delay lick is instantaneous, and the CSV samples every 50 ms, so without a
+# latch the event would fall between two rows and never be recorded. Same reasoning
+# and same value as serial_controls._ActuatorTracker._MIN_LATCH_S.
+_BLOCKED_LATCH_S = 0.06
 
 
 class _BncScheduler:
@@ -219,6 +242,7 @@ class StateMachine:
         # or None when nothing is watching. See _publish_progress.
         self.progress      = progress
         self._calib        = None           # BeamerCalibration, loaded at run()
+        self._pump_calib   = None           # PumpCalibration, loaded at run()
         self._shadow       = False          # derived from the active ITI region
         self._field_color  = [255, 255, 255]  # stable shadow-field colour for this session
         self._screens      = {}             # protocol["screens"] for this session
@@ -228,6 +252,11 @@ class StateMachine:
         self._reward_locations: dict = {}     # {reward_id: port}, mutated by switching
         self._screen_anchor_ports: list = []  # port each screen is pinned to (or None)
         self._switch_log: list = []           # [{"trial", "rewards", "ports"}]
+        # One record per reward outcome, written to the mouse log at session end. A
+        # reward is now a volume delivered over several licks, so how much the animal
+        # actually got is no longer implied by "the port was rewarded".
+        self._delivery_log: list = []
+        self._reward_latches: dict = {}       # port → monotonic deadline (CSV codes)
 
         # Reward delay (session-scoped: sampled once, measured from session start)
         self._delay_cfg: dict = {}
@@ -245,12 +274,17 @@ class StateMachine:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _send(self, cmd: str):
+    def _send(self, cmd: str) -> bool:
         """Put a command on the hardware queue; count it if the queue is full.
 
         Still non-blocking — a stalled serial process must never freeze the trial
         loop. But a dropped command is an invisible missing TTL edge or a pump that
         never fired, so the count is reported once at the end of the session.
+
+        Returns whether the command was actually queued. Reward delivery needs the
+        answer: a dropped MOS is a droplet that never left the cannula, and counting
+        it toward the target volume would make the delivery log lie about how much
+        the animal drank.
 
         Called from the scheduler thread as well as the main one;
         multiprocessing.Queue.put_nowait is thread-safe and the counter is only a
@@ -258,8 +292,10 @@ class StateMachine:
         """
         try:
             self.command_queue.put_nowait(cmd)
+            return True
         except Exception:
             self._dropped_cmds += 1
+            return False
 
     def _sleep(self, duration: float, sm_stop, sm_active) -> bool:
         """Sleep *duration* seconds with 20 ms polling granularity.
@@ -292,6 +328,92 @@ class StateMachine:
         # speaker (silenced out-of-band, behind its timer's back) is left.
         if self.hw is not None:
             self.hw.speaker.value = 0
+        # No trial is running, so no port is offering a reward.
+        self._clear_reward_states()
+
+    # ── Reward state → CSV ────────────────────────────────────────────────────
+
+    def _set_reward_state(self, port: int, code: int, latch_until: float = None):
+        """Publish one port's REWARD_* code for the session CSV.
+
+        *latch_until* holds a transient code (only REWARD_BLOCKED) for at least one
+        CSV sample period before it reverts to REWARD_AVAILABLE; see
+        _BLOCKED_LATCH_S. Terminal codes are passed without one and simply stand
+        until the trial ends.
+        """
+        _hw_state.set_reward_state(self.hw, port, code)
+        if latch_until is not None:
+            self._reward_latches[port] = latch_until
+        else:
+            self._reward_latches.pop(port, None)
+
+    def _sweep_reward_latches(self, now: float):
+        """Revert expired transient reward codes. Called every pass of the trial loop."""
+        if not self._reward_latches:
+            return
+        for port in [p for p, deadline in self._reward_latches.items() if deadline <= now]:
+            _hw_state.set_reward_state(self.hw, port, _hw_state.REWARD_AVAILABLE)
+            del self._reward_latches[port]
+
+    def _clear_reward_states(self):
+        """Back to REWARD_NONE everywhere — the trial is over, no port is rewarded."""
+        self._reward_latches.clear()
+        _hw_state.clear_reward_states(self.hw)
+
+    # ── Reward delivery bookkeeping ───────────────────────────────────────────
+
+    def _log_delivery(self, trial_num, port, rid, requested_ul, delivered_ul,
+                      pulses, outcome, elapsed_s):
+        """Record one reward outcome for the mouse log.
+
+        Volumes are the µL figures; the CSV's Rewards column carries the same
+        outcomes at 20 Hz for alignment with the video and the licks.
+        """
+        self._delivery_log.append({
+            "trial":        trial_num,
+            "port":         port,
+            "reward_id":    rid,
+            "requested_ul": round(float(requested_ul), 3),
+            "delivered_ul": round(float(delivered_ul), 3),
+            "pulses":       int(pulses),
+            "outcome":      outcome,
+            "duration_s":   round(float(elapsed_s), 2),
+        })
+
+    def _close_partial(self, trial_num, port, state, collected):
+        """Close out a reward the animal stopped collecting before it was complete."""
+        delivered = state["pulses_done"] * state["ul_per_pulse"]
+        elapsed   = time.monotonic() - state["started"]
+        print(f"[StateMachine] Trial {trial_num}: port {port} partial — "
+              f"{delivered:.2f} of {state['target_ul']:.2f} µL "
+              f"({state['pulses_done']}/{state['pulses_total']} pulses)")
+        self._log_delivery(trial_num, port, state["rid"], state["requested_ul"],
+                           delivered, state["pulses_done"], "partial", elapsed)
+        self._set_reward_state(port, _hw_state.REWARD_PARTIAL)
+        collected.add(port)
+
+    def _close_partials(self, trial_num, delivery: dict, collected):
+        """Close out every still-paying port. Empties *delivery*."""
+        for port in list(delivery):
+            self._close_partial(trial_num, port, delivery[port], collected)
+            del delivery[port]
+
+    # ── Pump calibration ──────────────────────────────────────────────────────
+
+    def _load_pump_calib(self):
+        """Load the per-pump µL/pulse table for this session.
+
+        Deliberately not folded into _load_calib below: that method's single
+        try/except would let a beamer import failure silently null the pump
+        calibration too, and the session would then refuse to start for a reason
+        that has nothing to do with the pumps.
+        """
+        try:
+            from pump_calibration import PumpCalibration
+            self._pump_calib = PumpCalibration()
+        except Exception as exc:
+            print(f"[StateMachine] Pump calibration unavailable: {exc}")
+            self._pump_calib = None
 
     # ── Beamer ────────────────────────────────────────────────────────────────
 
@@ -668,15 +790,20 @@ class StateMachine:
                 and self._delay_active())
 
     def _reward_params(self, cfg: dict) -> tuple:
-        """(probability, duration_ms) for one reward.
+        """(probability, volume_ul) for one reward.
 
         Equalise mode replaces both with the delay block's values once the delay
         has passed; until then each reward keeps its own.
+
+        Called exactly once per port per trial, at first contact — never again while
+        that port is paying out. An equalise delay elapsing mid-delivery would
+        otherwise move the target volume underneath a port that is already
+        delivering, possibly below what it has already given.
         """
         d = self._delay_cfg
         if d["enabled"] and d["mode"] == "equalise" and not self._delay_active():
-            return float(d["probability"]), int(d["duration_ms"])
-        return float(cfg["probability"]), int(cfg["duration_ms"])
+            return float(d["probability"]), float(d["volume_ul"])
+        return float(cfg["probability"]), float(cfg["volume_ul"])
 
     # ── LED activation ────────────────────────────────────────────────────────
 
@@ -704,9 +831,25 @@ class StateMachine:
                    sess_deadline: float | None = None) -> bool:
         """Execute one trial.
 
-        Each rewarded port can be collected at most once per trial.
-        On sensor trigger: roll probability; if hit, pulse the pump; regardless,
-        turn off the LED and mark the port collected.
+        Each rewarded port can be collected at most once per trial, but collecting
+        it is no longer a single event: a reward is a *volume*, delivered as a train
+        of short pulses gated by the animal's own licking (see pump_calibration.py
+        for why a long pulse is not an option — the pump shoots the liquid instead
+        of forming a droplet).
+
+        Per port, per trial:
+          • First contact rolls the probability once. A miss closes the port out
+            immediately with nothing delivered, exactly as before.
+          • A hit snapshots the target volume and the pulse count it needs, then
+            every subsequent high sensor sample — no sooner than
+            pump_refractory_ms after the last one — buys one more pulse.
+          • The port is collected when the volume is reached, or closed out as
+            "partial" when the animal stops licking for pump_delivery_timeout_s.
+
+        The refractory is a hard floor, not a preference: sensor_array is a 10 Hz
+        sample-and-hold (the firmware only sends STATUS every 100 ms), so a shorter
+        one would fire several pulses off a single sensor reading and the lick
+        gating would stop meaning anything. See shared_states.pump_refractory_ms.
 
         *sess_deadline* is a time.monotonic() stamp for the end of the session. It
         bounds the "all rewards collected" end type, which otherwise has no time
@@ -745,13 +888,26 @@ class StateMachine:
         duration    = float(trial_conf["duration_s"])
 
         collected   = set()
+        # Per-port delivery state for ports that rolled a hit and are paying out.
+        # Everything in here is snapshotted at the roll and never re-read from the
+        # protocol, so nothing can move a target volume under a port mid-delivery.
+        delivery: dict = {}
         trial_start = time.monotonic()
+
+        # Publish the trial's reward layout so the CSV records which ports were
+        # rewarded, not just which pumps fired.
+        for p in reward_ports:
+            self._set_reward_state(p, _hw_state.REWARD_AVAILABLE)
 
         while True:
             # ── Stop checks ───────────────────────────────────────
             if sm_stop.value or not sm_active.value:
                 for p in led_ports:
                     self._send(f"LED:{p}:OFF")
+                # An in-flight reward is cut short by the stop; record what the
+                # animal actually got rather than losing it.
+                self._close_partials(trial_num, delivery, collected)
+                self._clear_reward_states()
                 # No end-of-trial pulse or tone on an emergency stop, but the
                 # during-trial train must still be switched off.
                 self._bnc.set_phase(None)
@@ -766,30 +922,99 @@ class StateMachine:
                 break
 
             # ── Sensor polling ────────────────────────────────────
-            for port in reward_ports:
-                if port in collected:
-                    continue
-                if int(self.sensor_array[port - 1]) == 1:
+            now = time.monotonic()
+            for port in [p for p in reward_ports if p not in collected]:
+                high  = int(self.sensor_array[port - 1]) == 1
+                state = delivery.get(port)
+
+                # ── Not yet paying out: this is the roll ──────────
+                if state is None:
+                    if not high:
+                        continue
                     # Release delay: the port is inert, so the lick is ignored
-                    # entirely — no pulse, and the reward stays available.
+                    # entirely — no pulse, no roll, and the reward stays available.
                     if self._release_blocked():
+                        self._set_reward_state(port, _hw_state.REWARD_BLOCKED,
+                                               latch_until=now + _BLOCKED_LATCH_S)
                         continue
 
-                    rid  = port_to_rid[port]
-                    prob, dur = self._reward_params(configs[rid])
+                    rid        = port_to_rid[port]
+                    prob, vol  = self._reward_params(configs[rid])
 
-                    if random.random() < prob:
-                        print(f"[StateMachine] Trial {trial_num}: "
-                              f"reward at port {port} (p={prob:.2f}) → MOS pulse {dur} ms")
-                        self._send(f"MOS:{port}:ON:{dur}")
-                    else:
+                    if random.random() >= prob:
                         print(f"[StateMachine] Trial {trial_num}: "
                               f"contact at port {port} — probability miss (p={prob:.2f})")
+                        self._log_delivery(trial_num, port, rid, vol, 0.0, 0,
+                                           "miss", 0.0)
+                        self._set_reward_state(port, _hw_state.REWARD_MISS)
+                        collected.add(port)
+                        continue
 
-                    # Mark collected; LED stays on until end of trial
+                    plan = (self._pump_calib.pulses_for(port, vol)
+                            if self._pump_calib is not None else None)
+                    if plan is None:
+                        # run() refuses to start an uncalibrated session, so this is
+                        # a should-not-happen. Close the port out rather than divide
+                        # by None and take the whole session down with it.
+                        print(f"[StateMachine] ERROR: port {port} has no pump "
+                              f"calibration — no reward delivered.")
+                        self._log_delivery(trial_num, port, rid, vol, 0.0, 0,
+                                           "uncalibrated", 0.0)
+                        self._set_reward_state(port, _hw_state.REWARD_PARTIAL)
+                        collected.add(port)
+                        continue
+
+                    n_pulses, actual_ul = plan
+                    state = {
+                        "rid":          rid,
+                        "requested_ul": vol,
+                        "target_ul":    actual_ul,
+                        "ul_per_pulse": actual_ul / n_pulses,
+                        "pulses_total": n_pulses,
+                        "pulses_done":  0,
+                        "next_ok_at":   0.0,     # first pulse fires on this same pass
+                        "last_pulse":   now,
+                        "started":      now,
+                    }
+                    delivery[port] = state
+                    self._set_reward_state(port, _hw_state.REWARD_DELIVERING)
+                    print(f"[StateMachine] Trial {trial_num}: reward at port {port} "
+                          f"(p={prob:.2f}) → {actual_ul:.2f} µL in {n_pulses} pulse(s)")
+
+                # ── Paying out: one pulse per lick, refractory apart ──
+                if high and now >= state["next_ok_at"]:
+                    if self._send(f"MOS:{port}:ON:{_PUMP_PULSE_MS}"):
+                        state["pulses_done"] += 1
+                        state["last_pulse"]   = now
+                    state["next_ok_at"] = now + _PUMP_REFRACTORY_S
+
+                if state["pulses_done"] >= state["pulses_total"]:
+                    delivered = state["pulses_done"] * state["ul_per_pulse"]
+                    elapsed   = now - state["started"]
+                    print(f"[StateMachine] Trial {trial_num}: port {port} collected — "
+                          f"{delivered:.2f} µL in {state['pulses_done']} pulse(s) "
+                          f"over {elapsed:.1f} s")
+                    self._log_delivery(trial_num, port, state["rid"],
+                                       state["requested_ul"], delivered,
+                                       state["pulses_done"], "complete", elapsed)
+                    self._set_reward_state(port, _hw_state.REWARD_COMPLETE)
                     collected.add(port)
+                    del delivery[port]
+                elif now - state["last_pulse"] >= _DELIVERY_TIMEOUT_S:
+                    # The animal walked away mid-reward. Without this the port never
+                    # becomes collected, and an "all rewards collected" trial in a
+                    # *trials*-type session has no sess_deadline to fall back on —
+                    # the loop would spin until someone hit stop.
+                    self._close_partial(trial_num, port, state, collected)
+                    del delivery[port]
 
+            self._sweep_reward_latches(now)
             time.sleep(0.02)
+
+        # Anything still mid-delivery when the trial ends is recorded as partial —
+        # the animal did drink some of it, and a silent drop would make the mouse log
+        # disagree with the pump pulses in the CSV.
+        self._close_partials(trial_num, delivery, collected)
 
         # Turn off any remaining LEDs
         for p in led_ports:
@@ -802,6 +1027,7 @@ class StateMachine:
 
         print(f"[StateMachine] Trial {trial_num}: ended  "
               f"({len(collected)}/{len(reward_ports)} collected)")
+        self._clear_reward_states()
         return True
 
     # ── Intertrial interval ───────────────────────────────────────────────────
@@ -941,6 +1167,7 @@ class StateMachine:
         self._shadow      = bool(region["shadow"]) if region else False
         self._field_color = self._region_color(region) if region else [255, 255, 255]
         self._load_calib()
+        self._load_pump_calib()
 
         # Touch-screen patterns for this session. The CSV logs the screens only when
         # they are actually in use — in "none" mode the column stays empty rather
@@ -958,6 +1185,8 @@ class StateMachine:
         self._speaker       = None
         self._speaker_tried = False
         self._switch_log    = []
+        self._delivery_log  = []
+        self._reward_latches = {}
         self._dropped_cmds  = 0
 
         self._bnc_cfg = protocol["bnc"]
@@ -969,6 +1198,20 @@ class StateMachine:
                   f"(count={protocol['rewards']['count']}, "
                   f"spacing={protocol['rewards']['distribution']['min_spacing']}). "
                   "Aborting session.")
+            session_done.value = True
+            return
+
+        # Every reward port must have a measured µL/pulse or the protocol's volumes
+        # mean nothing. Checked here rather than earlier because a random
+        # distribution does not know its ports until _assign_locations has run.
+        # ExperimentPage gates this too, before it creates any files; this is the
+        # backstop for a session started any other way.
+        missing = (self._pump_calib.uncalibrated_ports(locations.values())
+                   if self._pump_calib is not None else sorted(locations.values()))
+        if missing:
+            print("[StateMachine] ERROR: no pump calibration for port(s) "
+                  f"{', '.join(str(p) for p in missing)}. Run the calibration wizard "
+                  "on the Cleaning/Testing tab. Aborting session.")
             session_done.value = True
             return
 
@@ -1011,6 +1254,7 @@ class StateMachine:
             # never changes the port set, so this stays the session's port list.
             "reward_ports":  reward_ports,
             "reward_switches": [],
+            "reward_deliveries": [],
             "reward_delay_s":  round(delay_s, 3) if self._delay_cfg["enabled"] else None,
         }
 
@@ -1095,6 +1339,17 @@ class StateMachine:
             print(f"[StateMachine] WARNING: {self._dropped_cmds} hardware "
                   f"command(s) dropped — the command queue was full.")
 
+        # Session totals. Volume delivered is no longer implied by the reward count,
+        # so it is worth one line rather than making the user open the mouse log.
+        if self._delivery_log:
+            total_ul = sum(d["delivered_ul"] for d in self._delivery_log)
+            counts   = {}
+            for d in self._delivery_log:
+                counts[d["outcome"]] = counts.get(d["outcome"], 0) + 1
+            breakdown = ", ".join(f"{n} {name}" for name, n in sorted(counts.items()))
+            print(f"[StateMachine] Delivered {total_ul:.2f} µL over "
+                  f"{len(self._delivery_log)} reward(s): {breakdown}.")
+
         # ── Update session log with end time ──────────────────────────────────
         if json_path:
             end_str = datetime.now().strftime("%H:%M:%S")
@@ -1104,6 +1359,7 @@ class StateMachine:
                         and entry.get("start_time") == start_str):
                     entry["end_time"] = end_str
                     entry["reward_switches"] = self._switch_log
+                    entry["reward_deliveries"] = self._delivery_log
                     break
             self._save_mouse_log(json_path, log)
 

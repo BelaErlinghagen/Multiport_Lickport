@@ -39,6 +39,21 @@ DLC_CROP = (100, 2100, 1000, 3000)   # → 2000 × 2000
 # HDMI beamer instead of the speakers.
 speaker_device = "default"
 
+### Control monitor
+# Where the main GUI window opens, as a hardcoded (x, y, width, height) rect on
+# the X virtual desktop — the control monitor's position in `xrandr
+# --listmonitors`, i.e. DP-0 at +0+0. It is deliberately *not* a screens() index
+# like the beamer/touch screens below: those indices reshuffle when a display is
+# re-plugged or comes up in a different order, and the GUI is the one window the
+# experimenter must always be able to reach. Without this GNOME places the window
+# on whichever monitor the pointer happens to be on, which on this rig means the
+# GUI opens across the two 800×480 touch panels.
+#
+# The window is fitted to the work area of whatever display sits at this position
+# (so the GNOME bar and dock stay reachable); if no display is there, the rect is
+# used as-is.
+control_screen_geometry = (0, 0, 1920, 1200)
+
 ### Beamer
 # The beamer is an HDMI-connected extended display. beamer_screen_index selects
 # which QApplication.screens() entry the projection window opens on. The current
@@ -55,6 +70,48 @@ speaker_device = "default"
 beamer_screen_index     = 2
 beamer_lens_distance_cm = 196
 beamer_calibration_path = str(Path(__file__).resolve().parent / "config" / "beamer_calibration.json")
+
+### Pumps
+# Rewards are set as a *volume* (µL) in the protocol, not as a pump-on duration. The
+# volume is delivered as a train of short pulses, one per lick, using the per-pump
+# µL/pulse measured by the calibration wizard (see pump_calibration.py).
+#
+# pump_pulse_ms is the whole point of the scheme: energising a pump for longer makes
+# it shoot the liquid across the arena instead of forming a droplet at the cannula.
+# Changing it invalidates every measurement on disk — a 10 ms energisation is
+# dominated by the pump's startup transient, so the volume per pulse is not
+# proportional to the pulse width. PumpCalibration warns if the file disagrees.
+pump_pulse_ms = 10
+
+# HARD FLOOR, not a tuning knob. The firmware sends STATUS only every 100 ms
+# (PortMasterArduinoCode.ino STATUS_INTERVAL) and SerialControls._reader_loop only
+# updates its state when a STATUS line arrives, so sensor_array is a 10 Hz
+# sample-and-hold: the state machine's 20 ms poll re-reads the same held value five
+# times. A refractory below ~100 ms therefore fires several pulses off a *single*
+# sensor sample and the lick gating stops meaning anything. 150 ms = 100 ms STATUS
+# plus reader/writer/poll jitter.
+#
+# It is also what keeps pulses countable in the session CSV: _ActuatorTracker widens
+# each 10 ms pulse to 60 ms (_MIN_LATCH_S) and the CSV samples at 50 ms, so the 90 ms
+# gap guarantees at least one "0" row between two pulses. At 100 ms spacing adjacent
+# pulses merge into one run.
+pump_refractory_ms = 150
+
+# A reward is closed out as "partial" when this long passes with no pulse. Without it
+# a mouse that licks once and walks away leaves the port mid-delivery forever, and an
+# "all rewards collected" trial in a *trials*-type session has no session deadline to
+# fall back on — the trial loop would spin until the user hits stop.
+pump_delivery_timeout_s = 10.0
+
+# Ceiling on the pulses one reward may take, whatever the calibration says. At the
+# refractory above this is ~15 s of uninterrupted licking, already longer than a
+# typical bout; a weak pump plus a large volume would otherwise silently ask for a
+# reward the animal cannot physically collect.
+pump_max_pulses = 100
+
+# Per-pump µL/pulse, written by the calibration wizard on the Cleaning/Testing tab.
+# Machine-specific, so it is git-ignored like the beamer calibration.
+pump_calibration_path = str(Path(__file__).resolve().parent / "config" / "pump_calibration.json")
 
 ### Screens
 # The two Raspberry Pi touch screens are wired to the PC as extra displays.

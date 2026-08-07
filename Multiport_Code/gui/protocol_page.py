@@ -8,7 +8,7 @@ Section layout (inside a QScrollArea):
   ── Session ─────────────────────────────────────────────────────
   ── Rewards ─────────────────────────────────────────────────────
       • number of rewards (dropdown 1-16)
-      • per-reward config  (dynamic table: duration, probability)
+      • per-reward config  (dynamic table: volume, probability)
       • distribution       (fixed port map  OR  random + spacing)
       • sporadic switching (two rewards trade lickports mid-session)
       • delay              (release OR equalise, from session start)
@@ -24,6 +24,15 @@ Section layout (inside a QScrollArea):
 
 Protocols are read strictly — every key in DEFAULT_PROTOCOL must be present, so a
 malformed file raises KeyError at load rather than silently running with defaults.
+That is what rejects protocols written before rewards became volumes: they carry
+`duration_ms` where `volume_ul` is now required, and there is no honest way to
+convert one into the other (a pump's output is not proportional to how long it is
+energised), so they have to be rebuilt rather than guessed at.
+
+Rewards are set in µL. How many pulses that costs depends on the per-pump
+calibration (pump_calibration.py), which is why each volume carries a live hint —
+the editor is the only place the user can notice that a requested volume rounds
+badly or would take longer to drink than the trial lasts.
 """
 
 import json
@@ -31,6 +40,9 @@ import os
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import pyqtSignal
+
+import shared_states
+from pump_calibration import PumpCalibration
 
 
 class ProtocolPage(QtWidgets.QWidget):
@@ -46,8 +58,8 @@ class ProtocolPage(QtWidgets.QWidget):
         "rewards": {
             "count": 2,
             "configs": [
-                {"id": 1, "duration_ms": 500, "probability": 1.0},
-                {"id": 2, "duration_ms": 500, "probability": 1.0},
+                {"id": 1, "volume_ul": 5.0, "probability": 1.0},
+                {"id": 2, "volume_ul": 5.0, "probability": 1.0},
             ],
             "distribution": {
                 "type": "fixed",
@@ -66,7 +78,7 @@ class ProtocolPage(QtWidgets.QWidget):
                 "duration_max_s": 30.0,
                 # Applied to every reward once an "equalise" delay elapses.
                 "probability": 1.0,
-                "duration_ms": 500,
+                "volume_ul": 5.0,
             },
         },
         "trial": {
@@ -169,6 +181,17 @@ class ProtocolPage(QtWidgets.QWidget):
     _SOUND_LABELS = {"trial_start": "Play a tone at trial start",
                      "trial_end":   "Play a tone at trial end"}
 
+    # ── Reward volume ─────────────────────────────────────────────────────────
+    # 50 µL is far above any sensible single reward; the cap is there to stop a
+    # typo, not to express a policy. What actually constrains a volume is the
+    # pump_max_pulses ceiling and how long the animal must lick to collect it —
+    # both of which the live hint next to each spin box reports.
+    _VOL_MIN, _VOL_MAX, _VOL_STEP = 0.1, 50.0, 0.5
+    # Flag a rounding error worse than this. A strong pump at 2 µL/pulse turns a
+    # requested 1 µL into 2 µL, and the editor is the only place to catch that
+    # before an animal is in the arena.
+    _VOL_ROUND_WARN = 0.10
+
     # ── BNC outputs ───────────────────────────────────────────────────────────
     _BNC_COUNT = 4
     # Which physical connector each protocol id reaches (matches serial_controls).
@@ -216,9 +239,16 @@ class ProtocolPage(QtWidgets.QWidget):
         self._reg_shadow = False
         self._rnd_shadow = False
 
+        # Per-pump µL/pulse, used only for the live hints beside each volume. The
+        # editor must stay usable on an uncalibrated rig — PumpCalibration never
+        # raises, and the hints simply say "not calibrated" instead.
+        self._pump_calib = PumpCalibration()
+
         # Dynamic section state — populated by rebuild helpers
-        self._reward_rows: list[tuple[QtWidgets.QSpinBox,
-                                      QtWidgets.QDoubleSpinBox]] = []
+        # (volume spin, probability spin, hint label) per reward
+        self._reward_rows: list[tuple[QtWidgets.QDoubleSpinBox,
+                                      QtWidgets.QDoubleSpinBox,
+                                      QtWidgets.QLabel]] = []
         self._fixed_port_combos: list[QtWidgets.QComboBox] = []
         self._min_spacing_spin: QtWidgets.QSpinBox | None = None
         self._spacing_warn_lbl: QtWidgets.QLabel | None   = None
@@ -232,7 +262,8 @@ class ProtocolPage(QtWidgets.QWidget):
         self._delay_enabled_chk = self._delay_mode_combo = None
         self._delay_dur_type = self._delay_dur_spin = self._delay_dur_max_spin = None
         self._delay_dur_fixed_w = self._delay_dur_max_w = None
-        self._delay_eq_prob_spin = self._delay_eq_dur_spin = self._delay_eq_w = None
+        self._delay_eq_prob_spin = self._delay_eq_vol_spin = self._delay_eq_w = None
+        self._delay_eq_hint_lbl = None
         self._delay_body_w = None
 
         # Trial sounds — one entry per _SOUND_KEYS, each a dict of widget refs
@@ -461,21 +492,29 @@ class ProtocolPage(QtWidgets.QWidget):
         self._delay_eq_prob_spin.setDecimals(2)
         self._delay_eq_prob_spin.setValue(1.0)
         self._delay_eq_prob_spin.setFixedWidth(90)
-        self._delay_eq_dur_spin = QtWidgets.QSpinBox()
-        self._delay_eq_dur_spin.setRange(1, 30000)
-        self._delay_eq_dur_spin.setValue(500)
-        self._delay_eq_dur_spin.setFixedWidth(100)
+        self._delay_eq_vol_spin = self._make_volume_spin()
+        self._delay_eq_hint_lbl = QtWidgets.QLabel()
+        self._delay_eq_hint_lbl.setStyleSheet("color:#888; font-size:10px;")
+        self._delay_eq_vol_spin.valueChanged.connect(
+            lambda _v: self._update_volume_hint(self._delay_eq_vol_spin,
+                                                self._delay_eq_hint_lbl))
         eq_layout.addWidget(self._labeled_row("Equalised probability:",
                                               self._delay_eq_prob_spin))
-        eq_layout.addWidget(self._labeled_row("Equalised duration (ms):",
-                                              self._delay_eq_dur_spin))
+        eq_vol_row = self._labeled_row("Equalised volume (µL):",
+                                       self._delay_eq_vol_spin)
+        # Index 2 = right after the label and the spin box, before _labeled_row's
+        # trailing stretch, so the hint sits next to the value it describes.
+        eq_vol_row.layout().insertWidget(2, self._delay_eq_hint_lbl)
+        eq_layout.addWidget(eq_vol_row)
         dl_layout.addWidget(self._delay_eq_w)
 
         delay_note = QtWidgets.QLabel(
             "Release: the reward ports are inert until the delay passes — a lick does "
             "nothing and does not use the reward up.\n"
             "Equalise: until the delay passes each reward uses its own probability and "
-            "duration; afterwards every reward uses the equalised values above.\n"
+            "volume; afterwards every reward uses the equalised values above. A reward "
+            "already being delivered when the delay elapses finishes at its old "
+            "volume.\n"
             "The clock runs once from the start of the session, not once per trial.")
         delay_note.setWordWrap(True)
         delay_note.setStyleSheet("color:#777; font-size:9px;")
@@ -602,7 +641,7 @@ class ProtocolPage(QtWidgets.QWidget):
 
         # Connect reward count and distribution type to rebuilds
         self._count_combo.currentIndexChanged.connect(self._rebuild_reward_section)
-        self._dist_type_combo.currentIndexChanged.connect(self._rebuild_dist_section)
+        self._dist_type_combo.currentIndexChanged.connect(self._dist_type_changed)
 
         sl.addWidget(self._make_separator())
 
@@ -919,6 +958,25 @@ class ProtocolPage(QtWidgets.QWidget):
                         f"not shorter than the {period_ms:.0f} ms period.")
         return errs
 
+    def _reward_errors(self) -> list:
+        """Blocking problems in the reward block (empty when it is fine)."""
+        errs = []
+        # Two rewards on one lickport collapse into one: the state machine inverts
+        # the {reward: port} map to decide which reward a lick belongs to, so the
+        # later reward silently wins the port and the earlier one is never
+        # delivered — while an "all rewards collected" trial still waits for both
+        # and can therefore never end.
+        if self._dist_type_combo.currentText() == "Fixed":
+            seen = {}
+            for i, combo in enumerate(self._fixed_port_combos, start=1):
+                port = int(combo.currentText())
+                if port in seen:
+                    errs.append(f"Rewards {seen[port]} and {i} are both on lickport "
+                                f"{port} — give each reward its own port.")
+                else:
+                    seen[port] = i
+        return errs
+
     # ── Dynamic section builders ──────────────────────────────────────────────
 
     def _rebuild_reward_section(self):
@@ -929,7 +987,7 @@ class ProtocolPage(QtWidgets.QWidget):
         self._rebuild_screens_dynamic()
 
     def _rebuild_reward_config(self):
-        """Rebuild the per-reward parameter table (duration + probability)."""
+        """Rebuild the per-reward parameter table (volume + probability + hint)."""
         self._clear_widget(self._reward_config_container)
         container_layout = self._reward_config_container.layout()
         self._reward_rows = []
@@ -939,7 +997,7 @@ class ProtocolPage(QtWidgets.QWidget):
         hdr = QtWidgets.QWidget()
         hdr_l = QtWidgets.QHBoxLayout(hdr)
         hdr_l.setContentsMargins(0, 0, 0, 0)
-        for text, width in [("Reward", 55), ("Duration (ms)", 110), ("Probability", 100)]:
+        for text, width in [("Reward", 55), ("Volume (µL)", 110), ("Probability", 100)]:
             lbl = QtWidgets.QLabel(text)
             lbl.setFixedWidth(width)
             lbl.setStyleSheet("color:#666; font-size:10px;")
@@ -958,11 +1016,8 @@ class ProtocolPage(QtWidgets.QWidget):
             rid_lbl.setStyleSheet("color:#ccc;")
             row_l.addWidget(rid_lbl)
 
-            dur_spin = QtWidgets.QSpinBox()
-            dur_spin.setRange(1, 30000)
-            dur_spin.setValue(500)
-            dur_spin.setFixedWidth(100)
-            row_l.addWidget(dur_spin)
+            vol_spin = self._make_volume_spin()
+            row_l.addWidget(vol_spin)
 
             prob_spin = QtWidgets.QDoubleSpinBox()
             prob_spin.setRange(0.0, 1.0)
@@ -972,9 +1027,19 @@ class ProtocolPage(QtWidgets.QWidget):
             prob_spin.setFixedWidth(90)
             row_l.addWidget(prob_spin)
 
+            # What that volume actually costs in pulses and licking time — see
+            # _volume_hint. Recomputed live so a badly-rounding volume is visible
+            # while it is being typed, not after a session has run.
+            hint = QtWidgets.QLabel()
+            hint.setStyleSheet("color:#888; font-size:10px;")
+            vol_spin.valueChanged.connect(
+                lambda _v, s=vol_spin, h=hint: self._update_volume_hint(s, h))
+            row_l.addWidget(hint)
+
             row_l.addStretch()
             container_layout.addWidget(row_w)
-            self._reward_rows.append((dur_spin, prob_spin))
+            self._reward_rows.append((vol_spin, prob_spin, hint))
+            self._update_volume_hint(vol_spin, hint)
 
     def _rebuild_dist_section(self):
         """Rebuild the distribution panel (fixed port map OR random spacing)."""
@@ -1022,6 +1087,10 @@ class ProtocolPage(QtWidgets.QWidget):
                 port_combo.setCurrentText(str(default_port))
                 used_ports.add(default_port)
                 port_combo.setFixedWidth(80)
+                # Which port a reward sits on decides which pump delivers it, and
+                # pumps differ — so moving a reward changes its pulse count.
+                port_combo.currentIndexChanged.connect(
+                    lambda _i: self._refresh_volume_hints(reload=False))
                 row_l.addWidget(port_combo)
                 row_l.addStretch()
                 dist_layout.addWidget(row_w)
@@ -1172,6 +1241,103 @@ class ProtocolPage(QtWidgets.QWidget):
         self._delay_dur_max_w.setVisible(not fixed)
         self._delay_eq_w.setVisible(
             self._DELAY_MODE_KEYS[self._delay_mode_combo.currentText()] == "equalise")
+
+    # ── Reward volume helpers ─────────────────────────────────────────────────
+
+    def _make_volume_spin(self, val: float = 5.0) -> QtWidgets.QDoubleSpinBox:
+        """Return the µL spin box used for every reward volume in this editor."""
+        sb = QtWidgets.QDoubleSpinBox()
+        sb.setRange(self._VOL_MIN, self._VOL_MAX)
+        sb.setSingleStep(self._VOL_STEP)
+        sb.setDecimals(2)
+        sb.setValue(val)
+        sb.setSuffix(" µL")
+        sb.setFixedWidth(100)
+        return sb
+
+    def _volume_hint(self, volume_ul: float) -> tuple:
+        """(text, is_warning) describing what *volume_ul* costs on this rig.
+
+        A volume only becomes a number of pulses once a pump is calibrated, and
+        which pump depends on the distribution: a fixed map names its ports, a
+        random one could land anywhere, so the hint reports the range across every
+        calibrated port rather than pretending to know.
+        """
+        ports = self._configured_ports()
+        plans = [p for p in (self._pump_calib.pulses_for(port, volume_ul)
+                             for port in ports) if p is not None]
+        if not plans:
+            return ("no pump calibration — run the wizard on the Cleaning/Testing tab",
+                    True)
+
+        pulse_counts = sorted({n for n, _ in plans})
+        actuals      = sorted({a for _, a in plans})
+        n_txt = (f"{pulse_counts[0]}" if len(pulse_counts) == 1
+                 else f"{pulse_counts[0]}–{pulse_counts[-1]}")
+        a_txt = (f"{actuals[0]:.2f}" if len(actuals) == 1
+                 else f"{actuals[0]:.2f}–{actuals[-1]:.2f}")
+        secs  = self._pump_calib.min_delivery_s(pulse_counts[-1])
+
+        # Rounding to whole pulses is the only way a volume can be delivered, so a
+        # large gap between what was asked for and what is deliverable is worth
+        # shouting about rather than silently honouring.
+        worst = max(abs(a - volume_ul) for _, a in plans) / max(volume_ul, 1e-9)
+        plural = "pulse" if pulse_counts == [1] else "pulses"
+        text = f"≈ {a_txt} µL · {n_txt} {plural} · ≥{secs:.1f} s of licking"
+        if len(plans) < len(ports):
+            text += f"  ({len(ports) - len(plans)} port(s) uncalibrated)"
+            return text, True
+        return text, worst > self._VOL_ROUND_WARN
+
+    def _update_volume_hint(self, spin, label):
+        """Refresh one volume hint label from its spin box."""
+        text, warn = self._volume_hint(spin.value())
+        label.setText(text)
+        label.setStyleSheet("color:#c8a000; font-size:10px;" if warn
+                            else "color:#888; font-size:10px;")
+
+    def _configured_ports(self) -> list:
+        """The lickports this protocol could use — the fixed map, or all 16.
+
+        A random distribution draws its ports at session start, so every port has to
+        be calibrated for it to be startable; saying so here is more useful than a
+        hint that only becomes wrong later.
+        """
+        # getattr: the hints are built by _rebuild_reward_config, which _build_ui
+        # can reach before the distribution panel exists.
+        combo = getattr(self, "_dist_type_combo", None)
+        if (combo is not None and combo.currentText() == "Fixed"
+                and self._fixed_port_combos):
+            return [int(c.currentText()) for c in self._fixed_port_combos]
+        return list(range(1, 17))
+
+    def _refresh_volume_hints(self, reload: bool = True):
+        """Update every volume hint, optionally re-reading the calibration file.
+
+        Reloaded when the tab is shown, so the hints follow a wizard run on the
+        Cleaning/Testing tab without the user having to restart the app; not
+        reloaded when only the reward layout moved.
+        """
+        if reload:
+            self._pump_calib.reload()
+        for vol_spin, _prob, hint in self._reward_rows:
+            self._update_volume_hint(vol_spin, hint)
+        if self._delay_eq_vol_spin is not None and self._delay_eq_hint_lbl is not None:
+            self._update_volume_hint(self._delay_eq_vol_spin, self._delay_eq_hint_lbl)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Cheap: PumpCalibration.reload() short-circuits on an unchanged mtime.
+        self._refresh_volume_hints()
+
+    def _dist_type_changed(self):
+        """The distribution panel changed shape — rebuild it, then re-hint.
+
+        A random distribution can put a reward on any lickport, so the hint has to
+        widen from one port's pulse count to the range across all sixteen.
+        """
+        self._rebuild_dist_section()
+        self._refresh_volume_hints(reload=False)
 
     # ── ITI section ───────────────────────────────────────────────────────────
 
@@ -1609,10 +1775,10 @@ class ProtocolPage(QtWidgets.QWidget):
         n = int(self._count_combo.currentText())
 
         configs = []
-        for i, (dur_spin, prob_spin) in enumerate(self._reward_rows):
+        for i, (vol_spin, prob_spin, _hint) in enumerate(self._reward_rows):
             configs.append({
                 "id": i + 1,
-                "duration_ms": dur_spin.value(),
+                "volume_ul": round(vol_spin.value(), 3),
                 "probability": round(prob_spin.value(), 4),
             })
 
@@ -1754,7 +1920,7 @@ class ProtocolPage(QtWidgets.QWidget):
                     "duration_s":     self._delay_dur_spin.value(),
                     "duration_max_s": self._delay_dur_max_spin.value(),
                     "probability":    round(self._delay_eq_prob_spin.value(), 4),
-                    "duration_ms":    self._delay_eq_dur_spin.value(),
+                    "volume_ul":      round(self._delay_eq_vol_spin.value(), 3),
                 },
             },
             "trial": {
@@ -1775,6 +1941,33 @@ class ProtocolPage(QtWidgets.QWidget):
             "bnc": bnc,
         }
 
+    # Raised by _require_volumes so _load_protocol can tell "this file predates
+    # volume rewards" apart from "this file is broken in some other way" and say so.
+    class LegacyProtocolError(Exception):
+        pass
+
+    @staticmethod
+    def _require_volumes(d: dict):
+        """Reject a protocol that still sets rewards as pump-on durations.
+
+        There is deliberately no conversion. A pump's output is not proportional to
+        how long it is energised — most of a short pulse is the startup transient —
+        so any ms → µL guess would be a fabricated number driving a real experiment.
+        """
+        try:
+            legacy = ("duration_ms" in d["rewards"]["delay"]
+                      or any("duration_ms" in c for c in d["rewards"]["configs"]))
+        except (KeyError, TypeError):
+            return          # not this problem; the strict read below will report it
+        if legacy:
+            raise ProtocolPage.LegacyProtocolError(
+                "This protocol predates volume-based rewards: it sets pump "
+                "durations (duration_ms) where a volume (volume_ul) is now "
+                "required.\n\nMilliseconds cannot be converted to microlitres — a "
+                "pump's output is not proportional to how long it runs — so the "
+                "reward volumes have to be entered again.\n\nStart from New and "
+                "re-enter the settings, then save over the old file.")
+
     def _apply_protocol(self, d: dict):
         """Populate all widgets from a protocol dict.
 
@@ -1786,6 +1979,12 @@ class ProtocolPage(QtWidgets.QWidget):
         `is not None` widget guards below are a different thing: they test whether
         the sub-widgets for the *selected* ITI type currently exist.
         """
+        # Probe before touching a single widget. This method applies top-down, so a
+        # KeyError partway through used to leave the editor holding a mix of the old
+        # and the new protocol which the user could then Save. Harmless while it was
+        # theoretical; every protocol written before rewards became volumes hits it.
+        self._require_volumes(d)
+
         # ── Session ──────────────────────────────────────────────
         sess = d["session"]
         self._sess_type_combo.blockSignals(True)
@@ -1810,10 +2009,11 @@ class ProtocolPage(QtWidgets.QWidget):
 
         # Populate reward config rows
         configs = {cfg["id"]: cfg for cfg in rw["configs"]}
-        for i, (dur_spin, prob_spin) in enumerate(self._reward_rows):
+        for i, (vol_spin, prob_spin, hint) in enumerate(self._reward_rows):
             cfg = configs[i + 1]
-            dur_spin.setValue(int(cfg["duration_ms"]))
+            vol_spin.setValue(float(cfg["volume_ul"]))
             prob_spin.setValue(float(cfg["probability"]))
+            self._update_volume_hint(vol_spin, hint)
 
         # ── Distribution ─────────────────────────────────────────
         dist = rw["distribution"]
@@ -1867,7 +2067,8 @@ class ProtocolPage(QtWidgets.QWidget):
         self._delay_dur_spin.setValue(float(dl["duration_s"]))
         self._delay_dur_max_spin.setValue(float(dl["duration_max_s"]))
         self._delay_eq_prob_spin.setValue(float(dl["probability"]))
-        self._delay_eq_dur_spin.setValue(int(dl["duration_ms"]))
+        self._delay_eq_vol_spin.setValue(float(dl["volume_ul"]))
+        self._update_volume_hint(self._delay_eq_vol_spin, self._delay_eq_hint_lbl)
         self._update_delay_visibility()
 
         # ── Trial ────────────────────────────────────────────────
@@ -1999,6 +2200,8 @@ class ProtocolPage(QtWidgets.QWidget):
             self._current_path = path
             self._path_label.setText(os.path.basename(path))
             self._path_label.setStyleSheet("color:#ccc; font-size:10px;")
+        except self.LegacyProtocolError as e:
+            QtWidgets.QMessageBox.warning(self, "Outdated protocol", str(e))
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Load error", str(e))
 
@@ -2010,11 +2213,12 @@ class ProtocolPage(QtWidgets.QWidget):
 
     def _save_protocol(self):
         # A train whose pulse is not shorter than its period would leave the BNC
-        # latched high for the whole train, so refuse to write it out.
-        errors = self._bnc_errors()
+        # latched high for the whole train, and two rewards sharing a lickport can
+        # never both be collected — refuse to write either out.
+        errors = self._reward_errors() + self._bnc_errors()
         if errors:
             QtWidgets.QMessageBox.warning(
-                self, "BNC settings",
+                self, "Protocol settings",
                 "This protocol cannot be saved:\n\n• " + "\n• ".join(errors))
             return
 

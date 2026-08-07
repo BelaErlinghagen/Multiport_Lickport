@@ -8,12 +8,12 @@
     "configs": [
       {
         "id": 1,
-        "duration_ms": 500,
+        "volume_ul": 5.0,
         "probability": 1.0
       },
       {
         "id": 2,
-        "duration_ms": 500,
+        "volume_ul": 5.0,
         "probability": 1.0
       }
     ],
@@ -39,7 +39,7 @@
       "duration_s": 10.0,
       "duration_max_s": 30.0,
       "probability": 1.0,
-      "duration_ms": 500
+      "volume_ul": 5.0
     }
   },
   "trial": {

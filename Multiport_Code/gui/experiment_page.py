@@ -36,6 +36,7 @@ import console_log
 import rspace
 import shared_states
 from data_saving import saving_process
+from pump_calibration import PumpCalibration
 from shared_states import recording_basename
 
 
@@ -111,7 +112,7 @@ def _delay_detail(delay):
               else f"random 0–{delay['duration_max_s']} s")
     if delay["mode"] == "equalise":
         return (f"equalise after {timing} from session start "
-                f"(then p={delay['probability']}, {delay['duration_ms']} ms for all)")
+                f"(then p={delay['probability']}, {delay['volume_ul']} µL for all)")
     return f"release after {timing} from session start"
 
 
@@ -216,10 +217,10 @@ def build_entry_html(protocol, meta, reward_ports, comments):
     if configs:
         out.append("<h3>Reward configuration</h3>")
         out.append("<table border='1' cellpadding='4' cellspacing='0'>"
-                   "<tr><th>Reward</th><th>Duration (ms)</th><th>Probability</th></tr>")
+                   "<tr><th>Reward</th><th>Volume (µL)</th><th>Probability</th></tr>")
         for cfg in configs:
             out.append(f"<tr><td>{e(str(cfg['id']))}</td>"
-                       f"<td>{e(str(cfg['duration_ms']))}</td>"
+                       f"<td>{e(str(cfg['volume_ul']))}</td>"
                        f"<td>{e(str(cfg['probability']))}</td></tr>")
         out.append("</table>")
 
@@ -1516,9 +1517,12 @@ class ExperimentPage(QtWidgets.QWidget):
         if rew["delay"]["enabled"]:
             extras.append(f"{rew['delay']['mode']} delay")
         suffix = f"  [{', '.join(extras)}]" if extras else ""
+        # Volumes are the parameter most worth a second look before pressing Start,
+        # so they are spelled out rather than left to the reward count.
+        vols = ", ".join(f"{cfg['volume_ul']:g} µL" for cfg in rew["configs"])
         self._sum_rewards.setText(
             f"Rewards: {rew['count']}  ({rew['distribution']['type']} distribution)"
-            f"{suffix}")
+            f"  —  {vols}{suffix}")
 
         trial  = d["trial"]
         t_detail = (f"{trial['duration_s']} s per trial" if trial["end_type"] == "time"
@@ -1538,6 +1542,25 @@ class ExperimentPage(QtWidgets.QWidget):
 
     # ── Recording controls ────────────────────────────────────────
 
+    def _uncalibrated_reward_ports(self) -> list:
+        """Reward ports of the loaded protocol that have no pump calibration.
+
+        A random distribution does not choose its ports until the state machine
+        runs, so every lickport has to be calibrated for it to be startable —
+        better to say that now than to abort a session ten seconds in.
+        """
+        d = self._loaded_protocol
+        if d is None:
+            return []
+        dist = d["rewards"]["distribution"]
+        if dist["type"] == "fixed":
+            ports = [int(p) for p in dist["fixed_map"].values()]
+        else:
+            ports = list(range(1, 17))
+        # Re-read on every Start: the wizard may have been run since the app opened.
+        calib = PumpCalibration()
+        return calib.uncalibrated_ports(ports)
+
     def _set_id_widgets_enabled(self, enabled: bool):
         for w in (self._mouse_cb, self._session_cb,
                   self._cam_chk, self._sensor_chk, self._dlc_chk):
@@ -1551,6 +1574,21 @@ class ExperimentPage(QtWidgets.QWidget):
             return
         if self._loaded_protocol is None:
             self._rec_status.setText("Load a protocol first.")
+            return
+
+        # Reward volumes are meaningless without a µL/pulse for the pump that has to
+        # deliver them. Checked here, before anything exists on disk: the state
+        # machine checks again, but by the time it runs the console log, the video
+        # and the saving process have all been started and aborting orphans them.
+        uncalibrated = self._uncalibrated_reward_ports()
+        if uncalibrated:
+            ports = ", ".join(str(p) for p in uncalibrated)
+            QtWidgets.QMessageBox.warning(
+                self, "Pumps not calibrated",
+                f"No measured volume per pulse for lickport(s) {ports}.\n\n"
+                "Reward volumes cannot be delivered until those pumps are "
+                "calibrated — use “Calibrate pumps…” on the Cleaning/Testing tab.")
+            self._rec_status.setText(f"Pump(s) {ports} not calibrated.")
             return
 
         # The recording's name used to be built inside the saving child, ~1 s after

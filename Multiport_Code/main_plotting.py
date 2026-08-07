@@ -5,6 +5,7 @@ import traceback
 
 from PyQt5 import QtWidgets, QtGui, QtCore
 
+import shared_states
 from gui import CameraWidget, SensorWidget, CleaningPage, ExperimentPage, ProtocolPage
 
 
@@ -47,6 +48,82 @@ def _install_exception_guard():
         QtCore.QTimer.singleShot(0, report)
 
     sys.excepthook = hook
+
+
+def _control_screen_rect(app):
+    """Resolve where the main window belongs: (QScreen or None, target QRect).
+
+    The control monitor is identified by its **hardcoded** position on the X
+    virtual desktop (shared_states.control_screen_geometry), not by a screens()
+    index: indices reshuffle whenever a display is plugged in or wakes up in a
+    different order, and the one window the experimenter has to be able to reach
+    is not the one to leave up to that. The matching QScreen is only used for its
+    availableGeometry, so the GNOME top bar and dock stay usable; if no screen
+    matches, the hardcoded rect is used verbatim.
+    """
+    x, y, w, h = shared_states.control_screen_geometry
+    target = QtCore.QRect(int(x), int(y), int(w), int(h))
+    for screen in app.screens():
+        if screen.geometry().contains(target.center()):
+            return screen, screen.availableGeometry()
+    print(f"[GUI] no display found at {target.getRect()}; placing the GUI there "
+          f"anyway. Check shared_states.control_screen_geometry against "
+          f"`xrandr --listmonitors`.")
+    return None, target
+
+
+def _place_on_control_screen(window, screen, rect):
+    """Move/resize `window` onto the control monitor.
+
+    Called both before the window is shown and again after it is mapped, because
+    GNOME/Mutter honours an app's requested *size* at map time but overrides its
+    *position*, putting a new window on whichever monitor is "current" — and the
+    touch panels are pointer devices, so that is regularly one of them. Setting
+    the geometry up front only gets the size across; re-asserting it after the
+    map is what actually moves the window back.
+
+    The request is only granted if the window *fits* the monitor's work area —
+    Mutter bounces a move that doesn't, which is what _warn_if_misplaced checks.
+    """
+    window.winId()                          # realize native window
+    handle = window.windowHandle()
+    if handle is not None and screen is not None:
+        handle.setScreen(screen)
+
+    # setGeometry positions the *client* area, so asking for the work area
+    # verbatim pushes the title bar off the top of the screen and the window can
+    # no longer be dragged. Subtract whatever the WM's decoration adds. Before the
+    # window is mapped the frame is not known yet and these are all zero — which
+    # is fine, the post-map calls below correct it.
+    frame, geo = window.frameGeometry(), window.geometry()
+    target = QtCore.QRect(
+        rect.left()   + (geo.left() - frame.left()),
+        rect.top()    + (geo.top()  - frame.top()),
+        rect.width()  - (frame.width()  - geo.width()),
+        rect.height() - (frame.height() - geo.height()),
+    )
+    window.setGeometry(target)              # after setScreen: that can shift it back
+
+
+def _warn_if_misplaced(window, rect):
+    """Complain in the console log if the GUI did not land on the control monitor.
+
+    A window manager will not place a window on a monitor whose work area cannot
+    hold it, and silently drops it on another display instead — no error, the GUI
+    just opens on the touch panels. That is one added GUI section away at any
+    time (the window's minimum height is whatever the tallest tab demands), so
+    the numbers needed to diagnose it are printed rather than left to guesswork.
+    """
+    frame = window.frameGeometry()
+    if rect.contains(frame.center()):
+        return
+    hint = window.minimumSizeHint()
+    print(f"[GUI] the window is at {frame.getRect()}, not on the control monitor "
+          f"{rect.getRect()}. The window manager refuses to place a window that "
+          f"does not fit the monitor's work area, and this one needs at least "
+          f"{hint.width()}×{hint.height()} px plus the title bar — shrink the tab "
+          f"pages (a QScrollArea around the tallest one) or check "
+          f"shared_states.control_screen_geometry.")
 
 
 class _OpaqueWidget(QtWidgets.QWidget):
@@ -252,6 +329,19 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
             self.sensor_timer.start(80)
 
     window = MainWindow()
+    _screen, _rect = _control_screen_rect(app)
+    _place_on_control_screen(window, _screen, _rect)
     window.show()
-    QtCore.QTimer.singleShot(50, window.showMaximized)
+    # Deliberately not showMaximized(): "maximized" means "fill the monitor the WM
+    # thinks this window is on", which is the decision that was sending the GUI to
+    # a touch panel in the first place. An explicit geometry filling the control
+    # monitor's work area looks the same and cannot be redirected.
+    #
+    # Re-assert it a few times rather than once: Mutter places the window when it
+    # maps it, and on a busy start-up (five child processes, three of them opening
+    # fullscreen windows of their own) a single 50 ms callback loses that race.
+    for _delay in (50, 250, 750, 1500):
+        QtCore.QTimer.singleShot(
+            _delay, lambda: _place_on_control_screen(window, _screen, _rect))
+    QtCore.QTimer.singleShot(2500, lambda: _warn_if_misplaced(window, _rect))
     app.exec_()
