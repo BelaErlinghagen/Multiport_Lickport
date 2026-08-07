@@ -1566,6 +1566,28 @@ class ExperimentPage(QtWidgets.QWidget):
                   self._cam_chk, self._sensor_chk, self._dlc_chk):
             w.setEnabled(enabled)
 
+    def _snapshot_camera_calibration(self, file_prefix):
+        """Copy the lens calibration in force into the recording.
+
+        Every frame of this session — video, DLC input, pose coordinates — was
+        rectified with those exact coefficients, and config/camera_calibration.json is
+        overwritten by the next wizard run. Without a copy there is no way to tell
+        afterwards which geometry a session was shot in, which matters most for the
+        recordings a DLC model is trained on. Never fatal: a missing calibration is
+        already reported by the camera process, and a failed copy must not stop a
+        session that is otherwise ready to run.
+        """
+        src = shared_states.camera_calibration_path
+        try:
+            if os.path.exists(src):
+                with open(src, "r") as fh:
+                    data = fh.read()
+                with open(f"{file_prefix}_camera_calibration.json", "w") as fh:
+                    fh.write(data)
+        except Exception as exc:
+            print(f"[Experiment] could not save the camera calibration with the "
+                  f"recording: {exc}")
+
     def _start_recording(self):
         mouse   = self._mouse_cb.currentText().strip()
         session = self._session_cb.currentText().strip()
@@ -1607,6 +1629,7 @@ class ExperimentPage(QtWidgets.QWidget):
         file_prefix = os.path.join(data_path, base)
         self._file_prefix = file_prefix
         console_log.start_log(data_path, f"{base}_console.log")
+        self._snapshot_camera_calibration(file_prefix)
 
         # Comments and the lick counts belong to one session.
         self._comments = []

@@ -11,6 +11,7 @@ import shared_states
 from pump_calibration import PumpCalibration
 from speaker_controls import SpeakerControls
 from gui.pump_calibration_dialog import PumpCalibrationDialog
+from gui.camera_calibration_dialog import CameraCalibrationDialog
 
 
 class CleaningPage(QtWidgets.QWidget):
@@ -35,7 +36,8 @@ class CleaningPage(QtWidgets.QWidget):
 
     _BTN_SIZE = 44   # px, square grid buttons
 
-    def __init__(self, command_queue, beamer_queue=None, screen_queue=None):
+    def __init__(self, command_queue, beamer_queue=None, screen_queue=None,
+                 undistort_enabled=None, undistort_reload=None):
         super().__init__()
         # WA_OpaquePaintEvent: Qt skips its background pre-fill before paintEvent.
         # Our paintEvent then fills every pixel, so the widget is never uninitialized.
@@ -43,6 +45,10 @@ class CleaningPage(QtWidgets.QWidget):
         self.command_queue = command_queue
         self.beamer_queue = beamer_queue   # None if the beamer process isn't wired in
         self.screen_queue = screen_queue   # None if the screen process isn't wired in
+        # Camera-process flags the lens wizard needs: it measures on raw frames, so it
+        # has to be able to switch the correction off and then make the camera reload.
+        self.undistort_enabled = undistort_enabled
+        self.undistort_reload = undistort_reload
         self.frame_provider = None         # set by run_gui: object with latest_frame()
         self._sphere_color = QtGui.QColor(255, 255, 255)  # Test Sphere colour
         self._sphere_shown = False         # is a Test Sphere currently projected?
@@ -112,6 +118,11 @@ class CleaningPage(QtWidgets.QWidget):
         calib_btn = QtWidgets.QPushButton("Calibration")
         calib_btn.clicked.connect(self._open_beamer_calibration)
         beamer_status_row.addWidget(calib_btn)
+        # The lens wizard lives beside the beamer's because it is driven *by* the
+        # beamer — it projects the calibration pattern instead of using a printed one.
+        lens_btn = QtWidgets.QPushButton("Camera lens…")
+        lens_btn.clicked.connect(self._open_camera_calibration)
+        beamer_status_row.addWidget(lens_btn)
         root.addLayout(beamer_status_row)
 
         # Test Sphere — project a light/shadow sphere at an arena position (cm).
@@ -488,6 +499,16 @@ class CleaningPage(QtWidgets.QWidget):
     def _open_beamer_calibration(self):
         self._sphere_shown = False
         BeamerCalibrationDialog(self.beamer_queue, self.frame_provider, self).exec_()
+
+    def _open_camera_calibration(self):
+        """Measure the camera's fisheye distortion off the projected dot grid."""
+        # The wizard drives the beamer itself and needs the arena dark apart from its
+        # own dots, so anything this page is projecting has to go first.
+        self._sphere_shown = False
+        self._send_beamer({"cmd": "clear"})
+        CameraCalibrationDialog(self.beamer_queue, self.frame_provider,
+                                self.undistort_enabled, self.undistort_reload,
+                                self).exec_()
 
     # ── Speaker control ───────────────────────────────────────────
 

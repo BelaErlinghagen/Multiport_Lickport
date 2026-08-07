@@ -48,6 +48,12 @@ def main():
     video_running = Value('b', False)
     video_path    = Array('c', 512)
 
+    # Fisheye correction, owned by the camera process. The calibration wizard needs
+    # to measure on *raw* frames, so it lowers undistort_enabled while it captures,
+    # then raises undistort_reload to make the camera pick up what it just saved.
+    undistort_enabled = Value('b', True)
+    undistort_reload  = Value('b', False)
+
     # State-machine control flags
     sm_active      = Value('b', False)   # set True by ExperimentPage to start a session
     sm_stop        = Value('b', False)   # set True for an emergency stop
@@ -64,7 +70,8 @@ def main():
     # Start camera
     cam_proc = Process(target=camera_process,
                        args=(frame_queue, dlc_queue, cam_shape, camera_running,
-                             video_running, video_path))
+                             video_running, video_path,
+                             undistort_enabled, undistort_reload))
     cam_proc.start()
 
     # Start DLC inference (runs continuously; results go to saving + GUI overlay + SM)
@@ -115,6 +122,8 @@ def main():
         "hw":                 hw,
         "video_running":      video_running,
         "video_path":         video_path,
+        "undistort_enabled":  undistort_enabled,
+        "undistort_reload":   undistort_reload,
         "sm_session_start":   sm_session_start,
         "sm_trial":           sm_trial,
     }

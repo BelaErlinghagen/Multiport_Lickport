@@ -1,13 +1,15 @@
 import signal
 import threading
 import time
+import cv2
 from pypylon import pylon
 from shared_states import camera_serial, camera_exposure_us, camera_gain, DLC_CROP
 import numpy as np
 
 class TrackingCamera:
     def __init__(self, frame_queue, dlc_queue, plotting_shape,
-                 video_running=None, video_path=None):
+                 video_running=None, video_path=None,
+                 undistort_enabled=None, undistort_reload=None):
         print("Initializing Camera.")
         # Two Basler cameras are connected — select the tracking camera by serial
         # so we never grab the wrong one (CreateFirstDevice depends on enumeration
@@ -40,8 +42,45 @@ class TrackingCamera:
         # Set once a start attempt has failed, so a broken encoder is reported once
         # instead of re-spawning ffmpeg on every frame. Cleared when recording stops.
         self._video_failed = False
+        # Fisheye correction. The lens bends straight arena edges into curves, so the
+        # frame is rectified here — before it forks to the video, DeepLabCut and the
+        # preview — and every consumer therefore shares one corrected geometry.
+        # undistort_enabled lets the calibration wizard see raw frames while it
+        # measures; undistort_reload is how it tells us to pick up what it saved.
+        self.undistort_enabled = undistort_enabled
+        self.undistort_reload  = undistort_reload
+        self._calib = None
+        self._maps  = None
         time.sleep(2)
         print("Camera is ready.")
+
+    # ── Lens correction ───────────────────────────────────────────────────────
+
+    def _load_calibration(self):
+        """(Re)read the lens calibration and rebuild the remap tables.
+
+        Building the maps costs ~65 ms, which is why it happens here and not per
+        frame — and why the reload is flag-driven rather than a poll of the file.
+        """
+        from camera_calibration import CameraCalibration
+        if self._calib is None:
+            self._calib = CameraCalibration()
+        else:
+            self._calib.reload(force=True)
+        self._maps = self._calib.build_maps(DLC_CROP)
+        if self._maps is None:
+            # Not fatal by design: the rig still records and tracks, it is just
+            # working in the lens's own bent coordinates. Loud, because a DLC model
+            # trained on corrected frames will quietly do worse on these.
+            print("[Camera] WARNING: no lens calibration — running on RAW (fisheye) "
+                  "frames. Pose coordinates and the camera↔beamer mapping will be "
+                  "distorted; run 'Calibrate camera…' on the Cleaning/Testing tab.")
+        else:
+            print(f"[Camera] lens correction active: {self._calib.describe()}; "
+                  f"{cv2.getNumThreads()} remap thread(s).")
+            note = self._calib.field_note(DLC_CROP)
+            if note:
+                print(f"[Camera] {note}.")
 
     # ── Video recording ───────────────────────────────────────────────────────
 
@@ -146,15 +185,36 @@ class TrackingCamera:
                 getattr(self.cam, _node).SetValue(_val)
             except Exception as exc:
                 print(f"[Camera] Could not set {_node}={_val}: {exc}")
+        # Remap is the one heavy per-frame operation in this process; OpenCV splits it
+        # across row bands. Deliberately a handful of threads, not the whole machine:
+        # DLC, ffmpeg, the GUI and the state machine need cores too, and past ~4 the
+        # remap is already a rounding error next to the frame period.
+        import shared_states
+        cv2.setNumThreads(int(getattr(shared_states, "undistort_threads", 4)))
+        self._load_calibration()
+
         self.cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
         try:
             while self.cam.IsGrabbing() and running_flag.value:
+                if self.undistort_reload is not None and self.undistort_reload.value:
+                    self.undistort_reload.value = False
+                    self._load_calibration()
                 grabResult = self.cam.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
                 if grabResult.GrabSucceeded():
                     img = grabResult.Array
-                    # Arena focus crop (shared with DLC/beamer normalisation).
-                    y0, y1, x0, x1 = DLC_CROP
-                    cropped_img = img[y0:y1, x0:x1]
+                    # Arena focus crop — fused with the fisheye correction when the
+                    # lens is calibrated. The maps are crop-sized but index into the
+                    # *full* frame: remap's cost follows the output size, so reading
+                    # from the 4K frame costs nothing, and it lets the correction
+                    # sample outside the crop rectangle when the zoom asks for it.
+                    if self._maps is not None and (self.undistort_enabled is None
+                                                   or self.undistort_enabled.value):
+                        cropped_img = cv2.remap(img, self._maps[0], self._maps[1],
+                                                cv2.INTER_LINEAR,
+                                                borderMode=cv2.BORDER_CONSTANT)
+                    else:
+                        y0, y1, x0, x1 = DLC_CROP
+                        cropped_img = img[y0:y1, x0:x1]
                     # Record the same cropped arena view DLC sees, so pose
                     # coordinates map onto the video 1:1. Non-blocking — a slow
                     # encoder drops frames rather than stalling this loop.
@@ -193,7 +253,8 @@ class TrackingCamera:
             self.cam.Close()
 
 def camera_process(shared_image, dlc_queue, cam_shape, running_flag,
-                   video_running=None, video_path=None):
+                   video_running=None, video_path=None,
+                   undistort_enabled=None, undistort_reload=None):
     from console_log import tag_process
     tag_process("Camera")
 
@@ -207,7 +268,8 @@ def camera_process(shared_image, dlc_queue, cam_shape, running_flag,
     signal.signal(signal.SIGTERM, _handle_term)
 
     camera = TrackingCamera(shared_image, dlc_queue, cam_shape,
-                            video_running, video_path)
+                            video_running, video_path,
+                            undistort_enabled, undistort_reload)
     camera.run(running_flag)
 
 if __name__ == "__main__":

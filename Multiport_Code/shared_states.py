@@ -32,6 +32,35 @@ camera_gain        = 20.0
 # the beamer calibration feed.
 DLC_CROP = (100, 2100, 1000, 3000)   # → 2000 × 2000
 
+### Camera lens correction
+# The lens is a fisheye, so the camera process rectifies every frame *before* anything
+# forks off it — DeepLabCut, the MP4, the preview and therefore every pose coordinate
+# share one corrected geometry (camera_calibration.py). The correction is fused into
+# the DLC_CROP crop, so it costs one cv2.remap and the output size is unchanged.
+#
+# Measured on this machine, 2000×2000 output sampled from the 4K frame: 11.1 ms on one
+# thread, 2.9 ms on four. At the 20 fps the exposure allows (50 ms/frame) that is ~6 %
+# of the budget. undistort_threads is what OpenCV parallelises the remap across, inside
+# the camera process — a *separate* process would be slower than no offload at all,
+# since shipping one 4 MB frame through a Queue costs 7 ms, more than the remap itself.
+# Kept well below the core count on purpose: DLC, ffmpeg, the GUI and the state machine
+# all want cores too, and 4 threads already buys most of the achievable speedup.
+undistort_threads = 4
+# Magnification of the corrected image about the optical centre. Straightening this
+# lens pushes the periphery *outward* by ~28 %, so at 1.0 the outer edge of the raw
+# view is pushed off the frame and the arena floor loses its border and corners. 0.80
+# shrinks the corrected image until all of it fits, at the cost of showing the arena
+# ~20 % smaller with black wedges in the corners (the wizard's "keep the whole field"
+# figure, rounded down).
+#
+# Raise it toward 0.98 to trade the frame corners — which the projector could not
+# reach with calibration dots, so the correction there is extrapolated — for keeping
+# the arena at close to full resolution. Changing this changes the arena's apparent
+# scale, so re-run the beamer calibration after settling on a value.
+undistort_zoom = 0.80
+# Machine-specific like the beamer and pump calibrations, so it is git-ignored.
+camera_calibration_path = str(Path(__file__).resolve().parent / "config" / "camera_calibration.json")
+
 ### Speaker
 # ALSA device that speaker_controls.py plays tones through (via `aplay -D`).
 # "default" uses the system's current output; set it to "plughw:0,0" to force the

@@ -202,7 +202,9 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
 
             page_clean = CleaningPage(command_queue,
                                       (data_sources or {}).get("beamer_queue"),
-                                      (data_sources or {}).get("screen_queue"))
+                                      (data_sources or {}).get("screen_queue"),
+                                      (data_sources or {}).get("undistort_enabled"),
+                                      (data_sources or {}).get("undistort_reload"))
 
             page_protocol = ProtocolPage((data_sources or {}).get("beamer_queue"))
 
