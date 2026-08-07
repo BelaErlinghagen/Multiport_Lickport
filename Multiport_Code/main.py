@@ -4,6 +4,7 @@ import numpy as np
 from beamer_controls import beamer_process
 from camera_controls import camera_process
 from deeplabcut_controls import dlc_process
+from hardware_state import HardwareState
 from main_plotting import run_gui
 from screen_controls import screen_process
 from serial_controls import sensor_process
@@ -36,6 +37,17 @@ def main():
     screen_queue       = Queue(maxsize=8)   # GUI/SM → touch-screen pattern commands
     screen_running     = Value('b', True)
 
+    # Live actuator state (pumps, LEDs, BNCs, speaker, beamer, screens) for the
+    # session CSV. Built here so every process shares it by inheritance — it must be
+    # passed through Process(args=...), never sent down a Queue.
+    hw = HardwareState()
+
+    # Camera → MP4 recording. The camera process encodes the frames itself (they are
+    # already in that process), so all it needs from the GUI is an on/off flag and
+    # the recording folder the parent created.
+    video_running = Value('b', False)
+    video_path    = Array('c', 512)
+
     # State-machine control flags
     sm_active      = Value('b', False)   # set True by ExperimentPage to start a session
     sm_stop        = Value('b', False)   # set True for an emergency stop
@@ -43,8 +55,16 @@ def main():
     session_done   = Value('b', False)   # SM sets True on natural session end
     protocol_queue = Queue(maxsize=1)    # ExperimentPage puts protocol dict here before sm_active=True
 
+    # Session progress for the GUI's progress bar. The SM posts a wall-clock start
+    # (0.0 = idle) once and the trial number as each trial begins; the GUI
+    # interpolates elapsed time itself, so neither side has to tick in lockstep.
+    sm_session_start = Value('d', 0.0)
+    sm_trial         = Value('i', 0)
+
     # Start camera
-    cam_proc = Process(target=camera_process, args=(frame_queue, dlc_queue, cam_shape, camera_running))
+    cam_proc = Process(target=camera_process,
+                       args=(frame_queue, dlc_queue, cam_shape, camera_running,
+                             video_running, video_path))
     cam_proc.start()
 
     # Start DLC inference (runs continuously; results go to saving + GUI overlay + SM)
@@ -54,7 +74,10 @@ def main():
     dlc_proc.start()
 
     # Start sensor grabbing (also handles outbound commands)
-    sensor_proc = Process(target=sensor_process, args=(sensor_array, timestamp_value, command_queue))
+    # Also mirrors the LED/pump/BNC command stream into `hw` for the session CSV —
+    # this is the one process every hardware command passes through.
+    sensor_proc = Process(target=sensor_process,
+                          args=(sensor_array, timestamp_value, command_queue, hw))
     sensor_proc.start()
 
     # Start beamer projector (fullscreen window on the beamer's extended display)
@@ -70,7 +93,8 @@ def main():
         target=state_machine_process,
         args=(sm_active, sm_stop, sm_running, command_queue,
               sensor_array, protocol_queue, session_done,
-              pose_sm_queue, beamer_queue, screen_queue),
+              pose_sm_queue, beamer_queue, screen_queue, hw,
+              (sm_session_start, sm_trial)),
     )
     sm_proc.start()
 
@@ -88,6 +112,11 @@ def main():
         "protocol_queue":     protocol_queue,
         "beamer_queue":       beamer_queue,
         "screen_queue":       screen_queue,
+        "hw":                 hw,
+        "video_running":      video_running,
+        "video_path":         video_path,
+        "sm_session_start":   sm_session_start,
+        "sm_trial":           sm_trial,
     }
     run_gui(frame_queue, sensor_array, cam_shape, command_queue, data_sources)
 

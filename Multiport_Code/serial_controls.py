@@ -5,13 +5,82 @@ import threading
 import queue
 
 
+class _ActuatorTracker:
+    """Mirror the outbound command stream into shared_states-style live state.
+
+    Every LED / pump / BNC command — from the state machine *and* from the Cleaning
+    tab — passes through the one command_queue this process drains, so parsing them
+    here is the single place that sees all of them.
+
+    LEDs are levels (ON/OFF) and need no bookkeeping. Pumps and BNCs are *pulses*
+    ("MOS:3:ON:500", "BNC:1:PULSE:5") with a duration and no matching off command,
+    so their bit is latched here and expired by sweep() as the loop runs.
+    """
+
+    # A BNC pulse can be 5 ms, far shorter than the 50 ms CSV sampling period, so a
+    # pulse could fire and expire entirely between two rows and never be recorded.
+    # Holding every latch for at least one sample period guarantees it shows up in
+    # one row. It widens sub-60 ms pulses in the log, which is the accepted trade:
+    # the CSV answers "when was this line active", not "what were the exact edges".
+    _MIN_LATCH_S = 0.06
+
+    def __init__(self, hw):
+        self.hw = hw
+        self._pump_until = {}      # channel index → monotonic deadline
+        self._bnc_until  = {}
+
+    def note(self, command_string):
+        """Update the live state from one outbound command. Never raises."""
+        if self.hw is None:
+            return
+        try:
+            parts = command_string.split(":")
+            kind, channel = parts[0], int(parts[1])
+            action = parts[2].upper() if len(parts) > 2 else ""
+            now = time.monotonic()
+
+            if kind == "LED" and 1 <= channel <= len(self.hw.leds):
+                self.hw.leds[channel - 1] = 1 if action == "ON" else 0
+
+            elif kind == "MOS" and 1 <= channel <= len(self.hw.pumps):
+                idx = channel - 1
+                if action == "ON":
+                    duration = float(parts[3]) / 1000.0 if len(parts) > 3 else 0.0
+                    self.hw.pumps[idx] = 1
+                    self._pump_until[idx] = now + max(duration, self._MIN_LATCH_S)
+                else:
+                    self.hw.pumps[idx] = 0
+                    self._pump_until.pop(idx, None)
+
+            elif kind == "BNC" and 1 <= channel <= len(self.hw.bnc_pulse):
+                idx = channel - 1
+                duration = float(parts[3]) / 1000.0 if len(parts) > 3 else 0.0
+                self.hw.bnc_pulse[idx] = 1
+                self._bnc_until[idx] = now + max(duration, self._MIN_LATCH_S)
+        except (ValueError, IndexError):
+            # A malformed command is the writer loop's problem to report; tracking
+            # must never be able to stop a command reaching the hardware.
+            pass
+
+    def sweep(self):
+        """Clear latches whose pulse has elapsed. Called every pass of the loop."""
+        if self.hw is None:
+            return
+        now = time.monotonic()
+        for store, array in ((self._pump_until, self.hw.pumps),
+                             (self._bnc_until, self.hw.bnc_pulse)):
+            for idx in [i for i, deadline in store.items() if deadline <= now]:
+                array[idx] = 0
+                del store[idx]
+
+
 class SerialControls:
     # Protocol BNC id → (board index, board-local BNC id 1-2).
     # The BNCs are NOT lickports. The lookup tables map the 16 lickports onto the
     # two boards' 8 channels each; running a BNC id through them turned BNC:2 into
     # BNC:4 and BNC:4 into BNC:8, both rejected by the firmware, which only knows
     # ids 1-2. So BNC gets its own straight-through table.
-    _BNC_MAP = {1: (0, 1), 2: (0, 2), 3: (1, 1), 4: (1, 2)}
+    _BNC_MAP = {1: (0, 2), 2: (0, 1), 3: (1, 2), 4: (1, 1)}
 
     def __init__(self, baudrate = 115200, verbose = None):
         print("Initializing Serial Communication.")
@@ -198,7 +267,7 @@ class SerialControls:
         if self.serial_arduino1: self.serial_arduino1.close()
         if self.serial_arduino2: self.serial_arduino2.close()
 
-def sensor_process(sensor_array, timestamp_value, command_queue=None):
+def sensor_process(sensor_array, timestamp_value, command_queue=None, hw=None):
     from console_log import tag_process
     tag_process("Serial")
 
@@ -212,6 +281,9 @@ def sensor_process(sensor_array, timestamp_value, command_queue=None):
 
     from serial_controls import SerialControls
     ser_machine = SerialControls()
+    # Mirrors the outbound commands into shared state so the session CSV can record
+    # which pumps, LEDs and BNCs were active (see hardware_state.py).
+    tracker = _ActuatorTracker(hw)
     while True:
         # Drain any pending GUI commands and forward them to the Arduino
         if command_queue is not None:
@@ -219,8 +291,12 @@ def sensor_process(sensor_array, timestamp_value, command_queue=None):
                 try:
                     cmd = command_queue.get_nowait()
                     ser_machine.send_command(cmd)
+                    tracker.note(cmd)
                 except Exception:
                     pass
+        # Expire pump/BNC pulse latches. This loop runs at 100 Hz, five times the
+        # CSV sampling rate, so the recorded pulse edges are accurate to ~10 ms.
+        tracker.sweep()
         timestamp, active_pin = ser_machine.read_serial()
         active = active_pin[0] + active_pin[1]
         for i in range(16):

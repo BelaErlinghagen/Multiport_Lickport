@@ -14,7 +14,7 @@ Section order (top → bottom):
 
 When a recording stops the session is written up — protocol details, the reward
 ports that were actually chosen, and the comments — and that write-up is always
-saved as JSON next to the recordings, in Data/<mouse>/<session>/<entry>_rspace.json.
+saved as JSON next to the recordings, in Data/<mouse>_<entry>_rspace.json.
 It is additionally uploaded as a new entry in the selected RSpace notebook unless
 uploading is switched off in Settings (rspace.load_upload_enabled) or the
 upload fails; either way the record stays "pending" and can be sent later from
@@ -25,6 +25,7 @@ the mouse is identified by its "id_<mouse>" tag rather than by the name.
 
 import json
 import os
+import time
 from datetime import datetime
 from html import escape
 from multiprocessing import Process, Value
@@ -35,6 +36,7 @@ import console_log
 import rspace
 import shared_states
 from data_saving import saving_process
+from shared_states import recording_basename
 
 
 # ── Pure helpers (no Qt, no network — unit-testable) ──────────────────────────
@@ -245,10 +247,14 @@ def build_entry_html(protocol, meta, reward_ports, comments):
 
 # ── Session write-up records (local JSON) ─────────────────────────────────────
 # Every finished session is written up as a JSON record next to its recordings, in
-# Data/<mouse>/<session>/<entry_name>_rspace.json — whether or not it is uploaded.
-# The record holds everything the RSpace entry needs (name, tags, HTML body) plus
-# the structured session data, so an entry can be created later (via the pending
-# uploads dialog, or by hand) without re-deriving anything.
+# Data/<mouse>_<entry_name>_rspace.json — whether or not it is uploaded. The record
+# holds everything the RSpace entry needs (name, tags, HTML body) plus the structured
+# session data, so an entry can be created later (via the pending uploads dialog, or
+# by hand) without re-deriving anything.
+#
+# Note the two namings pull opposite ways, deliberately: the *file* is mouse-prefixed
+# like every other file of a recording, because a filename carries no tags; the
+# *entry* inside it is not, because the uploaded document is tagged id_<mouse>.
 
 RECORD_SUFFIX = "_rspace.json"
 
@@ -272,12 +278,44 @@ def build_entry_record(name, tags, content, meta, protocol, reward_ports, commen
 
 
 def entry_record_path(data_path, mouse, session, name):
-    """Path of the write-up file for one session entry."""
-    return os.path.join(data_path, mouse, session, f"{name}{RECORD_SUFFIX}")
+    """Path of the write-up file for one session entry, flat in the Data folder.
+
+    Prefixed with the mouse, like every other file of a recording: this is a file on
+    disk, and a filename carries no tags, so the mouse has to be in the name for the
+    record to be identifiable. The RSpace *entry* it holds is the opposite case — its
+    title stays mouse-free because the uploaded document is tagged id_<mouse>
+    (see build_entry_name).
+    """
+    return os.path.join(data_path, f"{mouse}_{name}{RECORD_SUFFIX}")
+
+
+def record_entry_name(record, path):
+    """The RSpace title for a stored record — never the filename verbatim.
+
+    Records written by build_entry_record always carry "name". The fallback matters
+    anyway: the file on disk *is* mouse-prefixed, so using its basename as the title
+    would push the mouse id into RSpace, where the subject belongs in the id_<mouse>
+    tag instead. So a nameless record is rebuilt from its meta, and only as a last
+    resort does the filename get used — with the record suffix and the mouse prefix
+    stripped back off.
+    """
+    name = record.get("name")
+    if name:
+        return name
+
+    meta = record.get("meta") or {}
+    session = meta.get("session_id", "")
+    mouse   = meta.get("mouse_id", "")
+    stem = os.path.basename(path)
+    if stem.endswith(RECORD_SUFFIX):
+        stem = stem[:-len(RECORD_SUFFIX)]
+    if mouse and stem.startswith(f"{mouse}_"):
+        stem = stem[len(mouse) + 1:]
+    return stem or session or "session"
 
 
 def write_entry_record(path, record):
-    """Write a record to `path`, creating the session folder if needed."""
+    """Write a record to `path`, creating the Data folder if needed."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as fh:
         json.dump(record, fh, indent=2)
@@ -293,28 +331,48 @@ def read_entry_record(path):
 def find_pending_records(data_path):
     """Return [{"path", "record"}] for every write-up that has not been uploaded.
 
-    Scans Data/<mouse>/<session>/ for *_rspace.json; newest (by saved_at) first.
+    Scans the Data folder for *_rspace.json; newest (by saved_at) first.
     Unreadable files are skipped rather than breaking the listing.
+
+    Records written before the layout changed sit two levels down, in
+    Data/<mouse>/<session>/, so those are scanned too — otherwise a session that was
+    never uploaded would silently drop out of the retry dialog and could not be
+    pushed to RSpace at all. mark_record_uploaded writes back to a record's own path,
+    so a legacy record still stamps correctly where it lies. The nesting is walked
+    explicitly rather than with os.walk, which would descend into the (huge) frame
+    folders of old recordings.
     """
-    pending = []
-    for mouse in sorted(os.listdir(data_path)) if os.path.isdir(data_path) else []:
-        session_root = os.path.join(data_path, mouse)
-        if not os.path.isdir(session_root):
-            continue
-        for session in sorted(os.listdir(session_root)):
-            folder = os.path.join(session_root, session)
-            if not os.path.isdir(folder):
+    def _scan(folder):
+        try:
+            return sorted(f for f in os.listdir(folder)
+                          if f.endswith(RECORD_SUFFIX))
+        except OSError:
+            return []
+
+    if not os.path.isdir(data_path):
+        return []
+
+    paths = [os.path.join(data_path, f) for f in _scan(data_path)]
+    try:
+        for mouse in sorted(os.listdir(data_path)):
+            mouse_dir = os.path.join(data_path, mouse)
+            if not os.path.isdir(mouse_dir):
                 continue
-            for fname in sorted(os.listdir(folder)):
-                if not fname.endswith(RECORD_SUFFIX):
-                    continue
-                path = os.path.join(folder, fname)
-                try:
-                    record = read_entry_record(path)
-                except Exception:
-                    continue
-                if not record.get("uploaded_at"):
-                    pending.append({"path": path, "record": record})
+            for session in sorted(os.listdir(mouse_dir)):
+                session_dir = os.path.join(mouse_dir, session)
+                if os.path.isdir(session_dir):
+                    paths += [os.path.join(session_dir, f) for f in _scan(session_dir)]
+    except OSError:
+        pass
+
+    pending = []
+    for path in paths:
+        try:
+            record = read_entry_record(path)
+        except Exception:
+            continue
+        if not record.get("uploaded_at"):
+            pending.append({"path": path, "record": record})
     pending.sort(key=lambda p: p["record"].get("saved_at", ""), reverse=True)
     return pending
 
@@ -820,7 +878,7 @@ class PendingUploadsDialog(QtWidgets.QDialog):
             for path in paths:
                 try:
                     record = read_entry_record(path)
-                    name = record.get("name", os.path.basename(path))
+                    name = record_entry_name(record, path)
                     # An entry goes to the notebook it was written for; if it had
                     # none, the currently configured notebook.
                     nb_id = record.get("notebook_id") or default_nb
@@ -903,12 +961,12 @@ class ExperimentPage(QtWidgets.QWidget):
         # SemLock._rebuild).
         self._saving_proc    = None
         self._saving_running = None
-        self._cam_flag       = None
         self._sensor_flag    = None
         self._dlc_flag       = None
-        # Built by _start_recording, which owns the path so the console log can be
-        # opened before the saving child is even spawned.
-        self._recording_folder = None
+        # Built by _start_recording, which owns the naming so the console log can be
+        # opened before the saving child is even spawned. A path *prefix*, not a
+        # folder: recordings are stored flat (shared_states.recording_basename).
+        self._file_prefix = None
 
         # RSpace state
         self._tasks           = []    # live _Task threads (kept from the GC)
@@ -1084,6 +1142,24 @@ class ExperimentPage(QtWidgets.QWidget):
         btn_row.addWidget(self._stop_btn)
         root.addLayout(btn_row)
 
+        # Session progress. Hidden while idle so the panel doesn't carry a dead bar
+        # between sessions; shown by _start_recording.
+        self._progress_bar = QtWidgets.QProgressBar()
+        self._progress_bar.setRange(0, 1000)     # per-mille, so the bar moves smoothly
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setFixedHeight(14)
+        self._progress_bar.setStyleSheet(
+            "QProgressBar { background:#222; border:1px solid #444; border-radius:3px; }"
+            "QProgressBar::chunk { background:#1a6b1a; border-radius:2px; }")
+        self._progress_bar.setVisible(False)
+        root.addWidget(self._progress_bar)
+
+        self._progress_lbl = QtWidgets.QLabel("")
+        self._progress_lbl.setStyleSheet("color:#ccc; font-size:10px;")
+        self._progress_lbl.setVisible(False)
+        root.addWidget(self._progress_lbl)
+
         self._rec_status = QtWidgets.QLabel("Idle")
         self._rec_status.setStyleSheet("color:#aaa; font-size:10px;")
         self._rec_status.setWordWrap(True)
@@ -1158,28 +1234,54 @@ class ExperimentPage(QtWidgets.QWidget):
 
     # ── Local scanning ────────────────────────────────────────────
 
-    @staticmethod
-    def _list_subdirs(path: str) -> list:
-        """Return sorted list of immediate sub-directory names under path."""
-        try:
-            return sorted(d for d in os.listdir(path)
-                          if os.path.isdir(os.path.join(path, d)))
-        except OSError:
-            return []
-
     def _data_path(self) -> str:
         return data_root()
 
     def _local_mice(self) -> list:
-        return self._list_subdirs(self._data_path())
+        """Mice known locally, from the Data folder's <mouse>.json files.
+
+        Recordings are stored flat, so there are no per-mouse folders to list, and
+        the ids cannot be recovered from the recording filenames either — a mouse or
+        session id may itself contain underscores. The per-mouse log is the only
+        unambiguous record of which mice exist.
+
+        Recordings made before the layout changed kept their log one level down, in
+        Data/<mouse>/<mouse>.json. Those are still listed so a mouse does not vanish
+        from the picker; nothing is moved or rewritten.
+        """
+        path = self._data_path()
+        try:
+            names = os.listdir(path)
+        except OSError:
+            return []
+        mice = {f[:-5] for f in names
+                if f.endswith(".json") and not f.endswith(RECORD_SUFFIX)
+                and os.path.isfile(os.path.join(path, f))}
+        mice |= {d for d in names
+                 if os.path.isfile(os.path.join(path, d, f"{d}.json"))}
+        return sorted(mice)
 
     def _local_sessions(self, mouse: str) -> list:
+        """Session ids this mouse has recorded, read out of its log(s).
+
+        Merges the current log with a pre-flat-layout one if both exist, so a mouse
+        recorded under the old layout keeps its full session history in the picker.
+        """
         if not mouse:
             return []
-        return self._list_subdirs(os.path.join(self._data_path(), mouse))
+        seen = set()
+        for path in (self._mouse_log_path(mouse),
+                     os.path.join(self._data_path(), mouse, f"{mouse}.json")):
+            try:
+                with open(path, "r") as fh:
+                    log = json.load(fh)
+            except Exception:
+                continue
+            seen |= {e.get("session_id", "") for e in log.get("sessions", [])}
+        return sorted(s for s in seen if s)
 
     def _mouse_log_path(self, mouse: str) -> str:
-        return os.path.join(self._data_path(), mouse, f"{mouse}.json")
+        return os.path.join(self._data_path(), f"{mouse}.json")
 
     # ── Combo population ──────────────────────────────────────────
 
@@ -1451,19 +1553,22 @@ class ExperimentPage(QtWidgets.QWidget):
             self._rec_status.setText("Load a protocol first.")
             return
 
-        # The recording folder used to be built inside the saving child, ~1 s after
-        # Start and with a timestamp the parent never saw. It is created here now so
-        # the console log can be opened at t=0 and the child is handed a path rather
-        # than inventing one.
-        recording_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session}"
-        recording_folder = os.path.join(self._data_path(), mouse, session, recording_id)
+        # The recording's name used to be built inside the saving child, ~1 s after
+        # Start and with a timestamp the parent never saw. It is built here now so the
+        # console log can be opened at t=0 and every child is handed the same prefix
+        # rather than inventing one — a second timestamp would not have matched.
+        data_path = self._data_path()
+        base = recording_basename(mouse, session)
         try:
-            os.makedirs(os.path.join(recording_folder, "Image_Arrays"), exist_ok=True)
+            os.makedirs(data_path, exist_ok=True)
         except OSError as exc:
-            self._rec_status.setText(f"Could not create the recording folder: {exc}")
+            self._rec_status.setText(f"Could not create the Data folder: {exc}")
             return
-        self._recording_folder = recording_folder
-        console_log.start_log(recording_folder)
+        # Recordings are stored flat, so this is a path *prefix*, not a folder: every
+        # file of this session is "{file_prefix}_<what>".
+        file_prefix = os.path.join(data_path, base)
+        self._file_prefix = file_prefix
+        console_log.start_log(data_path, f"{base}_console.log")
 
         # Comments and the lick counts belong to one session.
         self._comments = []
@@ -1489,21 +1594,33 @@ class ExperimentPage(QtWidgets.QWidget):
 
         ds = self._data_sources
         self._saving_running = Value('b', True)
-        self._cam_flag    = Value('b', self._cam_chk.isChecked())
         self._sensor_flag = Value('b', self._sensor_chk.isChecked())
         self._dlc_flag    = Value('b', self._dlc_chk.isChecked())
+
+        # Camera saving is no longer the saving process's job: the camera process
+        # encodes straight to MP4, which keeps the 4 MB frames out of the queues and
+        # stops the saver from stealing them from DeepLabCut. The Camera checkbox now
+        # drives that flag. The prefix must be published *before* the flag, or the
+        # camera could see "recording" with no path to write to.
+        video_running = ds.get("video_running")
+        video_path    = ds.get("video_path")
+        if video_running is not None:
+            if video_path is not None:
+                encoded = file_prefix.encode("utf-8")[:len(video_path) - 1]
+                video_path.value = encoded
+            video_running.value = self._cam_chk.isChecked()
 
         self._saving_proc = Process(
             target=saving_process,
             args=(
-                ds.get("dlc_queue"),      # full-res frames for camera saving
                 ds.get("sensor_array"),
                 ds.get("pose_queue"),     # DLC pose estimates for CSV
                 ds.get("timestamp_value"),
                 mouse, session,
-                self._cam_flag, self._sensor_flag, self._dlc_flag,
+                self._sensor_flag, self._dlc_flag,
                 self._saving_running,
-                recording_folder,
+                file_prefix,
+                ds.get("hw"),             # live actuator state for the CSV
             ),
             daemon=True,
         )
@@ -1512,6 +1629,13 @@ class ExperimentPage(QtWidgets.QWidget):
         if self._sm_active is not None:
             self._sm_active.value = True
 
+        # Clear any progress left over from the previous session before showing the
+        # bar, so it doesn't flash the old session's position for one timer tick.
+        for v in (ds.get("sm_session_start"), ds.get("sm_trial")):
+            if v is not None:
+                v.value = 0
+        self._show_progress(True)
+        self._update_progress()
         self._sm_done_timer.start()
 
         self._set_id_widgets_enabled(False)
@@ -1526,6 +1650,12 @@ class ExperimentPage(QtWidgets.QWidget):
             self._sm_stop.value = True
         if self._saving_running is not None:
             self._saving_running.value = False
+        # Tell the camera process to close the encoder and join the chunks. Done here
+        # rather than in _finalize_stop so the concat starts while the state machine
+        # is still winding down.
+        video_running = self._data_sources.get("video_running")
+        if video_running is not None:
+            video_running.value = False
 
         self._stop_btn.setEnabled(False)
         self._rec_status.setText("Stopping — waiting for the state machine…")
@@ -1551,7 +1681,6 @@ class ExperimentPage(QtWidgets.QWidget):
             self._saving_proc.join(timeout=3)
         self._saving_proc    = None
         self._saving_running = None
-        self._cam_flag       = None
         self._sensor_flag    = None
         self._dlc_flag       = None
 
@@ -1563,17 +1692,86 @@ class ExperimentPage(QtWidgets.QWidget):
         self._set_id_widgets_enabled(True)
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        self._show_progress(False)
         self._refresh_session_combo()
 
         self._push_rspace_entry(mouse, session, entry)
 
         # Last: the RSpace upload runs on a worker thread and may print after this
         # point, and that output belongs to the console, not to the session log.
-        self._recording_folder = None
+        self._file_prefix = None
         console_log.stop_log()
 
+    # ── Session progress ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        """Seconds as m:ss, or h:mm:ss once the session runs past an hour."""
+        seconds = max(0, int(round(seconds)))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    def _update_progress(self):
+        """Advance the progress bar from the state machine's published progress.
+
+        Time-based sessions are interpolated from the wall-clock start the SM posted
+        once, so the bar moves smoothly between the SM's own (per-trial) updates.
+        Trial-based sessions step with the trial counter, which is all the resolution
+        a trial count has.
+        """
+        protocol = self._loaded_protocol or {}
+        session  = protocol.get("session") or {}
+        length   = session.get("length")
+        stype    = session.get("type")
+        start_v  = self._data_sources.get("sm_session_start")
+        trial_v  = self._data_sources.get("sm_trial")
+
+        if not length or stype not in ("time", "trials") or start_v is None:
+            self._progress_bar.setVisible(False)
+            self._progress_lbl.setVisible(False)
+            return
+
+        started = start_v.value > 0.0
+        if not started:
+            # The SM is still assigning reward locations / writing the mouse log.
+            self._progress_bar.setValue(0)
+            self._progress_lbl.setText("Waiting for the state machine to start…")
+            return
+
+        if stype == "time":
+            total     = float(length)
+            elapsed   = min(max(time.time() - start_v.value, 0.0), total)
+            remaining = total - elapsed
+            frac      = elapsed / total if total > 0 else 0.0
+            self._progress_lbl.setText(
+                f"{self._fmt_duration(elapsed)} elapsed  ·  "
+                f"{self._fmt_duration(remaining)} remaining      "
+                f"(session length {self._fmt_duration(total)})")
+        else:
+            total     = int(length)
+            trial     = int(trial_v.value) if trial_v is not None else 0
+            trial     = min(max(trial, 0), total)
+            remaining = max(total - trial, 0)
+            frac      = trial / total if total > 0 else 0.0
+            self._progress_lbl.setText(
+                f"Trial {trial} of {total}  ·  "
+                f"{remaining} trial{'' if remaining == 1 else 's'} remaining")
+
+        self._progress_bar.setValue(int(round(frac * 1000)))
+
+    def _show_progress(self, visible: bool):
+        """Show/hide the progress widgets, resetting them when they go away."""
+        self._progress_bar.setVisible(visible)
+        self._progress_lbl.setVisible(visible)
+        if not visible:
+            self._progress_bar.setValue(0)
+            self._progress_lbl.setText("")
+
     def _check_session_done(self):
-        """Called every 500 ms while recording; auto-stop on natural session end."""
+        """Called every 500 ms while recording; drives the progress bar and
+        auto-stops on natural session end."""
+        self._update_progress()
         if self._session_done is not None and self._session_done.value:
             self._sm_done_timer.stop()
             self._rec_status.setText("Session complete — stopping recording…")

@@ -66,8 +66,9 @@ class _BncScheduler:
     # Wake at least this often, so a phase change or a stop is honoured promptly.
     _TICK_CAP = 0.05
 
-    def __init__(self, send):
+    def __init__(self, send, hw=None):
         self._send   = send            # StateMachine._send
+        self._hw     = hw              # hardware_state.HardwareState, for the CSV
         self._trains = []
         self._phase  = None            # None | "trial" | "iti"
         self._lock   = threading.Lock()
@@ -147,12 +148,29 @@ class _BncScheduler:
                 # Fire at once: the first pulse of a during-trial train marks the
                 # trial onset, it does not wait a period for it.
                 t["on"], t["next_at"], t["count"] = True, now, 0
+                self._publish(t["bnc"], 1)
                 print(f"[StateMachine] BNC {t['bnc']} train started "
                       f"({t['trigger']}, {t['hz']:g} Hz, {t['pulse_ms']} ms).")
             elif not want and t["on"]:
                 t["on"] = False
+                self._publish(t["bnc"], 0)
                 print(f"[StateMachine] BNC {t['bnc']} train stopped "
                       f"({t['trigger']}) — {t['count']} pulse(s).")
+
+    def _publish(self, bnc_id, value):
+        """Record the train's on/off *span* for the session CSV.
+
+        The individual pulses are far shorter than the CSV's 50 ms sampling period,
+        so logging them would alias into a meaningless flicker. What the log wants is
+        simply whether this line was running, which is exactly what this method knows
+        — and it is the only writer of bnc_train, so it never races sensor_process's
+        single-pulse latch in bnc_pulse.
+        """
+        if self._hw is None:
+            return
+        idx = int(bnc_id) - 1
+        if 0 <= idx < len(self._hw.bnc_train):
+            self._hw.bnc_train[idx] = value
 
     def _loop(self):
         while not self._stop.is_set():
@@ -187,12 +205,19 @@ class StateMachine:
     """
 
     def __init__(self, command_queue, sensor_array, pose_queue=None, beamer_queue=None,
-                 screen_queue=None):
+                 screen_queue=None, hw=None, progress=None):
         self.command_queue = command_queue
         self.sensor_array  = sensor_array   # multiprocessing.Array('i', 16)
         self.pose_queue    = pose_queue     # optional Queue for DLC-based ITI
         self.beamer_queue  = beamer_queue   # optional Queue for beamer projection
         self.screen_queue  = screen_queue   # optional Queue for touch-screen patterns
+        # Live actuator state for the session CSV. The beamer, screens and speaker
+        # never touch command_queue, so serial_controls cannot see them — they are
+        # mirrored from this class's own chokepoints instead (hardware_state.py).
+        self.hw            = hw
+        # (session_start Value('d'), trial Value('i')) for the GUI progress bar,
+        # or None when nothing is watching. See _publish_progress.
+        self.progress      = progress
         self._calib        = None           # BeamerCalibration, loaded at run()
         self._shadow       = False          # derived from the active ITI region
         self._field_color  = [255, 255, 255]  # stable shadow-field colour for this session
@@ -215,7 +240,7 @@ class StateMachine:
 
         # BNC outputs
         self._bnc_cfg: dict = {}
-        self._bnc = _BncScheduler(self._send)
+        self._bnc = _BncScheduler(self._send, hw)
         self._dropped_cmds = 0
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -262,6 +287,11 @@ class StateMachine:
                 self._speaker.stop()
             except Exception:
                 pass
+        # The log must match what the hardware is now doing. The beamer and screens
+        # were already cleared through their own chokepoints above, so only the
+        # speaker (silenced out-of-band, behind its timer's back) is left.
+        if self.hw is not None:
+            self.hw.speaker.value = 0
 
     # ── Beamer ────────────────────────────────────────────────────────────────
 
@@ -275,7 +305,23 @@ class StateMachine:
             self._calib = None
 
     def _beamer(self, cmd: dict):
-        """Put a command on the beamer queue; drop silently if full/absent."""
+        """Put a command on the beamer queue; drop silently if full/absent.
+
+        The sole funnel for both _beamer_baseline and _beamer_sphere, so mirroring
+        the projection into the shared state here covers everything the session
+        projects. Note a diameter-0 shadow sphere is the "fully lit field" baseline,
+        which is correctly recorded as the beamer being *on*.
+        """
+        if self.hw is not None:
+            from hardware_state import write_beamer
+            if cmd.get("cmd") == "sphere":
+                write_beamer(self.hw, True,
+                             shadow=bool(cmd.get("shadow", False)),
+                             x_cm=cmd.get("x_cm", 0.0),
+                             y_cm=cmd.get("y_cm", 0.0),
+                             diameter_cm=cmd.get("diameter_cm", 0.0))
+            elif cmd.get("cmd") == "clear":
+                write_beamer(self.hw, False)
         if self.beamer_queue is None:
             return
         try:
@@ -368,6 +414,39 @@ class StateMachine:
         except Exception as exc:
             # A dead speaker must never abort a running experiment.
             print(f"[StateMachine] sound '{key}' failed: {exc}")
+            return
+        # Mark the speaker active for exactly the tone's length. produce_sound is
+        # non-blocking (it feeds an aplay child from its own thread), so a timer is
+        # what tracks the end — polling it from the trial loop would not.
+        if self.hw is not None:
+            self.hw.speaker.value = 1
+            timer = threading.Timer(length, self._speaker_done)
+            timer.daemon = True
+            timer.start()
+
+    def _speaker_done(self):
+        """Timer callback: the tone has finished playing."""
+        if self.hw is not None:
+            self.hw.speaker.value = 0
+
+    # ── Session progress ──────────────────────────────────────────────────────
+
+    def _publish_progress(self, session_start=None, trial_num=None):
+        """Publish session progress for the GUI's progress bar.
+
+        *session_start* is a wall-clock time.time() (0.0 = no session running), so
+        the GUI can interpolate elapsed time on its own timer instead of this loop
+        having to keep a counter fresh while it is blocked inside a trial.
+
+        Either argument may be None to leave that value alone.
+        """
+        if self.progress is None:
+            return
+        start_v, trial_v = self.progress
+        if session_start is not None:
+            start_v.value = float(session_start)
+        if trial_num is not None:
+            trial_v.value = int(trial_num)
 
     # ── BNC outputs ───────────────────────────────────────────────────────────
 
@@ -390,7 +469,20 @@ class StateMachine:
     # ── Touch screens ─────────────────────────────────────────────────────────
 
     def _screen(self, screen_id: int, pattern: str):
-        """Show *pattern* on one screen; drop silently if the queue is full/absent."""
+        """Show *pattern* on one screen; drop silently if the queue is full/absent.
+
+        Sole funnel for the screens (_screens_apply, _all_off and the session-start
+        blank all come through here), so the shared state is mirrored here too. The
+        pattern is normalised with screen_controls' own table so the code stored
+        always matches what the screen actually shows.
+        """
+        if self.hw is not None:
+            from screen_controls import normalize_pattern
+            from hardware_state import SCREEN_PATTERNS
+            codes = {name: code for code, name in SCREEN_PATTERNS.items()}
+            idx = int(screen_id) - 1
+            if 0 <= idx < len(self.hw.screens):
+                self.hw.screens[idx] = codes.get(normalize_pattern(pattern), 0)
         if self.screen_queue is None:
             return
         try:
@@ -437,17 +529,21 @@ class StateMachine:
 
     @staticmethod
     def _mouse_json_path(protocol: dict) -> str | None:
-        """Return path to {mouse_id}.json inside the mouse folder, or None."""
+        """Return path to Data/{mouse_id}.json, or None.
+
+        Directly in the Data folder: recordings are stored flat, and this file is
+        also what the GUI enumerates mice and sessions from, since the ids cannot be
+        parsed back out of the flat filenames.
+        """
         meta = protocol.get("_meta", {})
         mouse = meta.get("mouse_id", "")
         if not mouse:
             return None
         try:
-            from shared_states import get_data_path
-            data_path = get_data_path()
+            from shared_states import mouse_log_path
+            return mouse_log_path(mouse)
         except Exception:
             return None
-        return os.path.join(data_path, mouse, f"{mouse}.json")
 
     @staticmethod
     def _load_mouse_log(path: str) -> dict:
@@ -833,6 +929,12 @@ class StateMachine:
         Writes a session entry to {mouse_id}.json at start; updates it with the
         end time on completion.
         """
+        # Clear the logged actuator state first, so nothing from a previous session
+        # (or from the Cleaning tab) leaks into the first rows of this one's CSV.
+        if self.hw is not None:
+            from hardware_state import reset as _reset_hw
+            _reset_hw(self.hw)
+
         # Beamer session setup. Light/shadow belongs to the ITI target region, so a
         # fixed-time ITI (no region) simply runs the beamer dark all session.
         region = self._active_iti_region(protocol)
@@ -840,8 +942,12 @@ class StateMachine:
         self._field_color = self._region_color(region) if region else [255, 255, 255]
         self._load_calib()
 
-        # Touch-screen patterns for this session.
+        # Touch-screen patterns for this session. The CSV logs the screens only when
+        # they are actually in use — in "none" mode the column stays empty rather
+        # than reporting a black screen nobody is looking at.
         self._screens = protocol["screens"]
+        if self.hw is not None:
+            self.hw.screens_used.value = 1 if self._screens["mode"] != "none" else 0
         if self._screens["mode"] == "none":
             # Blank once up front, so a pattern left over from the Cleaning/Testing
             # tab doesn't sit on the screens for the whole session.
@@ -922,6 +1028,13 @@ class StateMachine:
         trial_num   = 0
         stopped     = False
 
+        # Publish the session clock for the GUI's progress bar. A wall-clock start is
+        # posted once rather than an elapsed value on every tick: the GUI can then
+        # interpolate smoothly on its own timer, and this loop — which spends most of
+        # its life blocked inside a trial — never has to keep a counter fresh.
+        # time.time(), not monotonic(): the two processes share a wall clock only.
+        self._publish_progress(time.time(), 0)
+
         # Anchored here rather than where it was sampled, so writing the mouse log
         # above doesn't silently shorten the delay.
         self._delay_deadline = (sess_start + delay_s
@@ -950,6 +1063,7 @@ class StateMachine:
                     break
 
                 trial_num += 1
+                self._publish_progress(trial_num=trial_num)
                 if not self._run_trial(trial_num, protocol, sm_stop, sm_active,
                                        sess_deadline):
                     stopped = True
@@ -972,6 +1086,10 @@ class StateMachine:
             self._bnc.stop()
 
         self._all_off()
+        # Session clock back to 0 — the GUI reads that as "no session running" and
+        # stops advancing the progress bar. The trial count is left standing so the
+        # final "x / y trials" stays readable after the session ends.
+        self._publish_progress(session_start=0.0)
 
         if self._dropped_cmds:
             print(f"[StateMachine] WARNING: {self._dropped_cmds} hardware "
@@ -1001,7 +1119,7 @@ class StateMachine:
 def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
                            sensor_array, protocol_queue, session_done,
                            pose_sm_queue=None, beamer_queue=None,
-                           screen_queue=None):
+                           screen_queue=None, hw=None, progress=None):
     """Long-running process that hosts the StateMachine.
 
     Lifecycle:
@@ -1024,7 +1142,8 @@ def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
     signal.signal(signal.SIGTERM, _handle_term)
 
     machine = StateMachine(command_queue, sensor_array, pose_queue=pose_sm_queue,
-                           beamer_queue=beamer_queue, screen_queue=screen_queue)
+                           beamer_queue=beamer_queue, screen_queue=screen_queue,
+                           hw=hw, progress=progress)
     print("[StateMachine] Process ready — waiting for activation.")
 
     while sm_running.value:

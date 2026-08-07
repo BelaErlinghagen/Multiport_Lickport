@@ -11,7 +11,8 @@ state, so you can create as many clients as you like and test them easily:
     ok, msg = client.check_connection()
     for doc in client.list_documents(folder_id=12345):
         print(doc["name"])
-    client.create_document(folder_id=12345, name="OPI111_20260601_1200_test",
+    # Entry names carry no mouse id — the subject is the id_<mouse> tag's job.
+    client.create_document(folder_id=12345, name="20260601_1200_test",
                            tags=["id_OPI111", "m_mea"], content="hello")
     client.project_overview(folder_id=12345, output_dir="~/Desktop")
 

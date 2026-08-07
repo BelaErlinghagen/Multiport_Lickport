@@ -27,9 +27,9 @@ More information about these two components can be found below.
 
 The computer (a Lenovo Thinkstation) used on this build had the following specifications:
 
-| CPU | Intel(R) Core(TM) i7-14700K |
-| GPU | Nvidia GeForce RTX 4060 |
-| OS | Ubuntu 24.04 |
+| CPU: Intel(R) Core(TM) i7-14700K |
+| GPU: Nvidia GeForce RTX 4060 |
+| OS: Ubuntu 24.04 |
 
 In order to run live inference with DeepLabCut, CUDA was installed alongside the necessary Nvidia GPU drivers. Pixi was used to manage the python environment of the software, the .lock and .toml files can be found in the repo.
 
@@ -140,14 +140,12 @@ The Lick-O-Tron is supposed to be connected via an 8 band ribbon cable to the PO
 </p>
 <center>
   <i>Figure 5: The PORTMASTER rack, lid opened.</i>
-</center>
-
-In order to control up to 16 Lick-O-Tron lickports, the PORTMASTER was designed: two Arduino Mega Microcontroller which are connected within the Multiport-Setup to the Computer via serial connection. The 
+</center> 
 
 ### Design
 
 The PORTMASTER is designed to: 
-- enable users to power up to 5 6V pumps comfortably
+- enable users to power up to 5 6V pumps comfortably (more are possible)
 - provide an easily accessible interface between the Arduinos and the computer/BNCs/power supply
 
 ### Assembly

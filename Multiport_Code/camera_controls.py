@@ -1,11 +1,13 @@
 import signal
+import threading
 import time
 from pypylon import pylon
 from shared_states import camera_serial, camera_exposure_us, camera_gain, DLC_CROP
 import numpy as np
 
 class TrackingCamera:
-    def __init__(self, frame_queue, dlc_queue, plotting_shape):
+    def __init__(self, frame_queue, dlc_queue, plotting_shape,
+                 video_running=None, video_path=None):
         print("Initializing Camera.")
         # Two Basler cameras are connected — select the tracking camera by serial
         # so we never grab the wrong one (CreateFirstDevice depends on enumeration
@@ -27,8 +29,100 @@ class TrackingCamera:
         self.shared_image_queue = frame_queue
         self.dlc_input = dlc_queue
         self.shape = plotting_shape
+        # Recording is driven from the GUI: video_running is the Camera checkbox,
+        # video_path carries the recording folder the parent already created. Video
+        # is encoded here rather than in the saving process because the frames are
+        # already in this process — the saver used to pull them out of dlc_queue,
+        # which stole them from DeepLabCut.
+        self.video_running = video_running
+        self.video_path    = video_path
+        self._writer       = None
+        # Set once a start attempt has failed, so a broken encoder is reported once
+        # instead of re-spawning ffmpeg on every frame. Cleared when recording stops.
+        self._video_failed = False
         time.sleep(2)
         print("Camera is ready.")
+
+    # ── Video recording ───────────────────────────────────────────────────────
+
+    def _recording_prefix(self):
+        """Decode the recording path prefix the GUI wrote into the shared buffer.
+
+        A full path stem like /…/Data/BECU371_20260807_113631_Test2, not a folder —
+        recordings are stored flat (shared_states.recording_basename).
+        """
+        if self.video_path is None:
+            return None
+        raw = bytes(self.video_path[:]).split(b'\x00', 1)[0]
+        return raw.decode('utf-8', 'ignore') or None
+
+    def _video_start(self, frame):
+        """Open a ChunkedVideoWriter sized to the frame we are actually saving."""
+        prefix = self._recording_prefix()
+        if not prefix:
+            print("[Camera] video requested but no recording path was set.")
+            self._video_failed = True
+            return
+        import shared_states
+        from video_writer import ChunkedVideoWriter
+        h, w = frame.shape[:2]
+        self._writer = ChunkedVideoWriter(
+            prefix, w, h,
+            fps=getattr(shared_states, "video_fps", 20),
+            chunk_seconds=getattr(shared_states, "video_chunk_seconds", 60),
+            crf=getattr(shared_states, "video_crf", 23),
+            max_size=getattr(shared_states, "video_max_size", 0),
+        )
+
+    def _video_stop(self):
+        """Close the encoder, then join the chunks on a background thread.
+
+        The concat runs off-thread so frame grabbing — and therefore DLC and the live
+        preview — keeps running while ffmpeg stitches the session together.
+        """
+        writer, self._writer = self._writer, None
+        # A new recording gets a fresh attempt even if the last one could not start.
+        self._video_failed = False
+        if writer is None:
+            return
+        prefix = writer.prefix
+        writer.close()
+
+        import shared_states
+        if not getattr(shared_states, "video_concat_on_stop", True):
+            return
+
+        def _join():
+            from video_writer import concat_chunks
+            try:
+                concat_chunks(prefix)
+            except Exception as exc:
+                print(f"[Camera] video concat failed: {exc}")
+
+        threading.Thread(target=_join, daemon=True, name="video-concat").start()
+
+    def _video_tick(self, frame):
+        """Start/feed/stop the writer to follow the video_running flag.
+
+        Everything is guarded: a video failure must never break the grab loop, which
+        also feeds DeepLabCut and the GUI preview.
+        """
+        if self.video_running is None:
+            return
+        try:
+            want = bool(self.video_running.value)
+            if want and self._writer is None and not self._video_failed:
+                self._video_start(frame)
+            elif not want and (self._writer is not None or self._video_failed):
+                self._video_stop()
+            if self._writer is not None:
+                self._writer.write(frame, time.time())
+        except Exception as exc:
+            # Latch the failure: without it this retries — and re-spawns ffmpeg —
+            # on every single frame, burying the console at 20 Hz.
+            print(f"[Camera] video error, recording disabled for this session: {exc}")
+            self._writer = None
+            self._video_failed = True
 
     def run(self, running_flag):
         self.cam.Open()
@@ -61,6 +155,10 @@ class TrackingCamera:
                     # Arena focus crop (shared with DLC/beamer normalisation).
                     y0, y1, x0, x1 = DLC_CROP
                     cropped_img = img[y0:y1, x0:x1]
+                    # Record the same cropped arena view DLC sees, so pose
+                    # coordinates map onto the video 1:1. Non-blocking — a slow
+                    # encoder drops frames rather than stalling this loop.
+                    self._video_tick(cropped_img)
                     # send full quality cropped image to dlc
                     if self.dlc_input.full():
                         try:
@@ -84,11 +182,18 @@ class TrackingCamera:
                 grabResult.Release()
                 time.sleep(0.01)
         finally:
+            # Finalize any in-flight recording before the device goes away, so the
+            # last chunk is closed properly and the concat still runs.
+            try:
+                self._video_stop()
+            except Exception as exc:
+                print(f"[Camera] could not close the video writer: {exc}")
             # Always release the device so subsequent runs don't hit "exclusively opened"
             self.cam.StopGrabbing()
             self.cam.Close()
 
-def camera_process(shared_image, dlc_queue, cam_shape, running_flag):
+def camera_process(shared_image, dlc_queue, cam_shape, running_flag,
+                   video_running=None, video_path=None):
     from console_log import tag_process
     tag_process("Camera")
 
@@ -101,7 +206,8 @@ def camera_process(shared_image, dlc_queue, cam_shape, running_flag):
         running_flag.value = False
     signal.signal(signal.SIGTERM, _handle_term)
 
-    camera = TrackingCamera(shared_image, dlc_queue, cam_shape)
+    camera = TrackingCamera(shared_image, dlc_queue, cam_shape,
+                            video_running, video_path)
     camera.run(running_flag)
 
 if __name__ == "__main__":
@@ -109,7 +215,12 @@ if __name__ == "__main__":
     cam_shape = (200, 200)
     cam_size = int(np.prod(cam_shape))
     dlc_queue = Queue(maxsize=2)
-    camera_running = Value('b', True)  
+    camera_running = Value('b', True)
     frame_queue = Queue(maxsize=2)
-    sensor_array = Array('i', 16)    
-    camera_process(frame_queue, dlc_queue, cam_shape, camera_running)
+    sensor_array = Array('i', 16)
+    # Record straight away into /tmp so the video path can be exercised standalone.
+    video_running = Value('b', True)
+    video_path    = Array('c', 512)
+    video_path.value = b"/tmp/camera_demo/DemoMouse_20250101_000000_DemoSession"
+    camera_process(frame_queue, dlc_queue, cam_shape, camera_running,
+                   video_running, video_path)

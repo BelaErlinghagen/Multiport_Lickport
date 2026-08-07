@@ -1,4 +1,32 @@
-import numpy as np
+"""data_saving.py — the session CSV.
+
+One row every 50 ms holding both what the sensors saw and what the setup was doing:
+the lick sensors, the DLC pose, and the live state of every actuator (pumps, LEDs,
+speaker, beamer, touch screens, BNC lines) read out of the shared hardware_state.
+
+Camera frames are *not* saved here any more. They used to be written one .npy per
+sample — 4 MB each, pulled out of dlc_queue and therefore stolen from DeepLabCut.
+The camera process now encodes them straight to chunked MP4 instead
+(camera_controls.TrackingCamera._video_tick → video_writer.ChunkedVideoWriter).
+
+Reading a session back — the bit-string columns must be read as strings, or pandas
+parses "0010000000000000" as the integer 10000000000000 and the leading zeros (i.e.
+the first channels) are lost:
+
+    df = pd.read_csv(path, dtype={"Sensors": str, "Pumps": str,
+                                  "LEDs": str, "BNCs": str})
+    pumps_on = [i + 1 for i, c in enumerate(df.Pumps[0]) if c == "1"]
+    beamer   = json.loads(df.Beamer[0]) if pd.notna(df.Beamer[0]) else None
+
+Video frames align by index: row N of {prefix}_frames.csv gives the wall-clock
+timestamp of frame N of the MP4, on the same clock as the Timestamp column here.
+
+Files are written flat into the Data folder as <prefix>_Data.csv, where the prefix
+is shared_states.recording_basename(mouse, session) — there are no per-mouse or
+per-session sub-folders.
+"""
+
+import json
 import pandas as pd
 import os
 import signal
@@ -6,19 +34,49 @@ from time import monotonic, sleep
 from datetime import datetime
 from threading import Thread
 
+import hardware_state
+
 # How long rows may sit in RAM before being appended to the CSV. Overridden by
 # shared_states.save_chunk_seconds; the fallback keeps this module usable standalone.
 DEFAULT_CHUNK_SECONDS = 30
 
 
 class data_saver:
-    def __init__(self, camera_data, sensor_data, dlc_data, timestamp_queue):
-        self.camera_data = camera_data
+    def __init__(self, sensor_data, dlc_data, timestamp_queue, hw=None):
         self.sensor_data = sensor_data
         self.dlc_data = dlc_data
         self.timestamp = timestamp_queue
+        self.hw = hw          # hardware_state.HardwareState, or None
         self.running = True
         print("Data saver launched.")
+
+    def _actuator_row(self):
+        """Snapshot every actuator for one CSV row.
+
+        The 16-item states are packed bit-strings ("0010000000000000") — fixed width,
+        no whitespace to guess at, and `[int(c) for c in s]` reads them back. The
+        beamer is the one structured field, so it goes in as compact JSON, and is
+        None whenever nothing is being projected.
+        """
+        hw = self.hw
+        if hw is None:
+            return {'Pumps': None, 'LEDs': None, 'Speakers': None,
+                    'Beamer': None, 'Screens': None, 'BNCs': None}
+
+        beamer = hardware_state.read_beamer(hw)
+        if beamer is not None:
+            _on, shadow, x_cm, y_cm, diameter_cm = beamer
+            beamer = json.dumps({"shadow": shadow, "x_cm": round(x_cm, 3),
+                                 "y_cm": round(y_cm, 3),
+                                 "diameter_cm": round(diameter_cm, 3)})
+        return {
+            'Pumps':    hardware_state.bits(hw.pumps),
+            'LEDs':     hardware_state.bits(hw.leds),
+            'Speakers': 1 if hw.speaker.value else 0,
+            'Beamer':   beamer,
+            'Screens':  hardware_state.screen_names(hw),
+            'BNCs':     hardware_state.bnc_bits(hw),
+        }
 
     @staticmethod
     def _flush(rows, csv_path):
@@ -36,23 +94,22 @@ class data_saver:
         print(f"[Saving] flushed {len(rows)} row(s) to {os.path.basename(csv_path)}")
         rows.clear()
 
-    def start_saving(self, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag,
-                     recording_folder=None):
-        if recording_folder is None:
-            # Standalone use (the __main__ demo below). The GUI always passes a
-            # folder it created itself, so it owns the path from the moment Start is
-            # pressed and can open the session console log there immediately.
-            from shared_states import get_data_path
-            recording_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session_id}"
-            recording_folder = os.path.join(get_data_path(), mouse_id, session_id,
-                                            recording_id)
-        recording_id = os.path.basename(recording_folder)
-        # exist_ok: the folder normally already exists because the GUI made it.
-        # Without it, a pre-existing folder raised FileExistsError inside this daemon
-        # thread, which then died silently while the GUI still showed "Recording".
-        os.makedirs(os.path.join(recording_folder, "Image_Arrays"), exist_ok=True)
+    def start_saving(self, mouse_id, session_id, sensor_flag, dlc_flag,
+                     file_prefix=None):
+        if file_prefix is None:
+            # Standalone use (the __main__ demo below). The GUI always builds the
+            # prefix itself, so it owns the path from the moment Start is pressed and
+            # can open the session console log alongside the CSV immediately.
+            from shared_states import get_data_path, recording_basename
+            file_prefix = os.path.join(get_data_path(),
+                                       recording_basename(mouse_id, session_id))
+        # exist_ok: the Data folder normally already exists. Without it, a
+        # pre-existing folder raised FileExistsError inside this daemon thread, which
+        # then died silently while the GUI still showed "Recording".
+        os.makedirs(os.path.dirname(file_prefix) or ".", exist_ok=True)
 
-        print(f"[Saving] {mouse_id} / {session_id} → {recording_folder}")
+        print(f"[Saving] {mouse_id} / {session_id} → "
+              f"{os.path.basename(file_prefix)}_Data.csv")
 
         # Rows are buffered here and appended to the CSV every chunk_seconds, so a
         # crash mid-session only loses the rows since the last flush.
@@ -62,7 +119,7 @@ class data_saver:
                                           DEFAULT_CHUNK_SECONDS))
         except Exception:
             chunk_seconds = DEFAULT_CHUNK_SECONDS
-        csv_path = f"{recording_folder}/{recording_id}_Data.csv"
+        csv_path = f"{file_prefix}_Data.csv"
         rows = []
         last_flush = monotonic()
 
@@ -78,22 +135,22 @@ class data_saver:
                 current_timestamp = None
             sensor_data_copy = None
             dlc_data_copy    = None
-            # Each flag is checked independently so all enabled streams are captured
-            if camera_flag.value and current_timestamp is not None:
-                np.save(f"{recording_folder}/Image_Arrays/{current_timestamp}.npy",
-                        np.array(self.camera_data.get()).copy())
+            # Each flag is checked independently so all enabled streams are captured.
+            # Camera frames are absent here on purpose — the camera process encodes
+            # them to MP4 itself, gated by the same Camera checkbox.
             if sensor_flag.value:
-                sensor_data_copy = np.array(self.sensor_data).copy()
+                sensor_data_copy = hardware_state.bits(self.sensor_data)
             if dlc_flag.value and self.dlc_data is not None:
                 try:
                     dlc_data_copy = self.dlc_data.get_nowait()
                 except Exception:
                     dlc_data_copy = None
-            rows.append({
-                'Timestamp': current_timestamp,
-                'Sensors':   sensor_data_copy,
-                'DLCStuff':  dlc_data_copy,
-            })
+            # Actuator state is always recorded: it is what the setup was *doing*,
+            # and it is cheap, so there is no checkbox to forget to tick.
+            row = {'Timestamp': current_timestamp, 'Sensors': sensor_data_copy}
+            row.update(self._actuator_row())
+            row['DLCStuff'] = dlc_data_copy
+            rows.append(row)
             now = monotonic()
             if now - last_flush >= chunk_seconds:
                 self._flush(rows, csv_path)
@@ -103,11 +160,12 @@ class data_saver:
 
 
     
-def saving_process(camera_data, sensor_data, dlc_data, timestamp_queue, mouse_id, session_id, camera_flag, sensor_flag, dlc_flag, running_flag, recording_folder=None):
+def saving_process(sensor_data, dlc_data, timestamp_queue, mouse_id, session_id,
+                   sensor_flag, dlc_flag, running_flag, file_prefix=None, hw=None):
     from console_log import tag_process
     tag_process("Saving")
 
-    saver = data_saver(camera_data, sensor_data, dlc_data, timestamp_queue)
+    saver = data_saver(sensor_data, dlc_data, timestamp_queue, hw)
     saving_thread = None
 
     # A SIGTERM (the GUI ending the recording) must not cut the saving thread off
@@ -129,8 +187,8 @@ def saving_process(camera_data, sensor_data, dlc_data, timestamp_queue, mouse_id
             # To DO: move mouse id and so on in here so that it can be flexibly deployed
             saving_thread = Thread(
                 target=saver.start_saving,
-                args=(mouse_id, session_id, camera_flag, sensor_flag, dlc_flag,
-                      recording_folder),
+                args=(mouse_id, session_id, sensor_flag, dlc_flag,
+                      file_prefix),
                 daemon=True
             )
             saving_thread.start()
@@ -153,24 +211,30 @@ if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     from serial_controls import sensor_process
     from camera_controls import camera_process
+    from hardware_state import HardwareState
     timestamp_queue = Queue(maxsize=2)
-    sensor_array = Array('i', 16)  
-    sensor_proc = Process(target=sensor_process, args=(sensor_array, timestamp_queue,))
+    sensor_array = Array('i', 16)
+    command_queue = Queue(maxsize=1000)
+    hw = HardwareState()
+    sensor_proc = Process(target=sensor_process,
+                          args=(sensor_array, timestamp_queue, command_queue, hw))
     sensor_proc.start()
     cam_shape = (300, 300)
-    timestamp_value = Queue(maxsize=2)
-    dlc_queue = Queue(maxsize=2)            # shared camera image original cropped
-    frame_queue = Queue(maxsize=2)        # shared camera image downsampled              # shared sensors
+    dlc_queue = Queue(maxsize=2)          # shared camera image original cropped
+    frame_queue = Queue(maxsize=2)        # shared camera image downsampled
     camera_running = Value('b', True)
-    cam_proc = Process(target=camera_process, args = (frame_queue, dlc_queue, cam_shape,camera_running,))
+    video_running  = Value('b', False)
+    video_path     = Array('c', 512)
+    cam_proc = Process(target=camera_process,
+                       args=(frame_queue, dlc_queue, cam_shape, camera_running,
+                             video_running, video_path))
     cam_proc.start()
-    saving_camera_data = Value('b', False) 
     saving_sensor_data = Value('b', False)
     saving_dlc_data = Value('b', False)
     running_flag = Value('b', False)
     saving_proc = Process(target=saving_process, args=(
-        frame_queue, sensor_array, None, timestamp_queue, "Test_Mouse", "Test_Session",
-        saving_camera_data, saving_sensor_data, saving_dlc_data,  running_flag,)
+        sensor_array, None, timestamp_queue, "Test_Mouse", "Test_Session",
+        saving_sensor_data, saving_dlc_data, running_flag, None, hw)
         )
     saving_proc.start()
     while True:
@@ -181,15 +245,22 @@ if __name__ == "__main__":
         elif command == "Sensor Off":
             saving_sensor_data.value = False
         elif command == "Camera On":
-            saving_camera_data.value = True
+            # The camera process owns the video now; it needs a path prefix.
+            video_path.value = b"/tmp/data_saving_demo/Test_Mouse_20250101_000000_Test_Session"
+            video_running.value = True
         elif command == "Camera Off":
-            saving_camera_data.value = False
+            video_running.value = False
         elif command == "Saving On":
             running_flag.value = True
         elif command == "Saving Off":
             running_flag.value = False
+        elif command.startswith(("LED:", "MOS:", "BNC:")):
+            # Exercise the actuator tracking: the command reaches the Arduino and
+            # shows up in the Pumps/LEDs/BNCs columns of the CSV.
+            command_queue.put(command)
         elif command == "End":
             saving_proc.terminate()
             cam_proc.terminate()
+            sensor_proc.terminate()
             print("processes terminated")
             break

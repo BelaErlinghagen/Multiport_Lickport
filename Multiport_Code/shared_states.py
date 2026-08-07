@@ -76,22 +76,90 @@ DEFAULT_PROTOCOLS_PATH = str(Path(__file__).resolve().parent / "Protocols")
 
 
 def get_data_path():
-    """Folder holding the recordings, as Data/<mouse>/<session>/<timestamp>_<session>/."""
+    """Folder holding the recordings. Every file lives directly in here — see
+    recording_basename() for the naming scheme that replaces the folder tree."""
     # Imported here rather than at module scope: shared_states is pulled in by every
     # process at startup, and rspace drags in `requests`.
     import rspace
     return rspace.load_setting("data_path", DEFAULT_DATA_PATH)
 
 
+def recording_basename(mouse_id, session_id, when=None):
+    """The prefix every file of one recording shares: <mouse>_<date>_<time>_<session>.
+
+    Recordings are stored flat: the Data folder holds no per-mouse or per-session
+    sub-folders, so the filename alone has to say which mouse, when, and which
+    session a file belongs to. One recording produces, for example:
+
+        BECU371_20260807_113631_Test2_Data.csv
+        BECU371_20260807_113631_Test2_console.log
+        BECU371_20260807_113631_Test2_Video.mp4
+        BECU371_20260807_113631_Test2_frames.csv
+
+    Note the ids are *not* recoverable by splitting on "_" — a mouse or session id
+    may itself contain underscores. Anything that needs to enumerate mice or
+    sessions must read <mouse>.json instead (see mouse_log_path), never parse these
+    names.
+    """
+    from datetime import datetime
+    when = when or datetime.now()
+    return f"{mouse_id}_{when.strftime('%Y%m%d_%H%M%S')}_{session_id}"
+
+
+def mouse_log_path(mouse_id):
+    """Path of a mouse's session log, Data/<mouse>.json.
+
+    Per-mouse rather than per-recording, so it carries no timestamp — and it is the
+    authoritative list of which mice and sessions exist, now that the folder tree is
+    gone.
+    """
+    import os
+    return os.path.join(get_data_path(), f"{mouse_id}.json")
+
+
 def get_protocols_path():
     """Folder holding the protocol JSON files."""
     import rspace
     return rspace.load_setting("protocols_path", DEFAULT_PROTOCOLS_PATH)
-# Sensor/DLC rows are buffered in RAM and appended to the session CSV this often.
-# A crash therefore costs at most this many seconds of table data — lower it for
-# more safety, raise it for fewer disk writes. Camera frames are unaffected: they
-# are written to Image_Arrays/ as they arrive.
+# Sensor/DLC/actuator rows are buffered in RAM and appended to the session CSV this
+# often. A crash therefore costs at most this many seconds of table data — lower it
+# for more safety, raise it for fewer disk writes. Video is unaffected: it has its
+# own chunking, see video_chunk_seconds below.
 save_chunk_seconds = 30
+
+### Video
+# The camera stream is encoded to H.264 by the camera process itself (ffmpeg, from
+# the pixi env) and written to <recording>/Video/ as video_%04d.mp4 chunks. Each
+# chunk is finalized as the next one begins, so a crash costs at most one chunk.
+#
+# video_fps is only the *nominal* rate stamped into the MP4 — frames are pushed at
+# whatever rate the camera delivers them. The true per-frame times are written to
+# Video/video_frames.csv, which is what aligns the video with the session CSV, so a
+# wrong value here makes playback speed off but never loses information. Keep it in
+# step with camera_exposure_us (50000 µs caps the sensor at 20 fps).
+video_fps            = 20
+# libx264's quality dial (Constant Rate Factor). It is NOT a bitrate: the encoder
+# spends whatever bits each frame needs to hit this quality, so a still scene costs
+# little and a noisy one costs a lot. Lower = better and bigger, in steps of about
+# ±6 = ×2 file size. 18 ≈ visually lossless, 23 default, 28 visibly soft.
+video_crf            = 23
+# Longest side of the saved video, in pixels (0 = save at the camera's own size).
+# This is by far the biggest lever on file size, and it is nearly free: the frames
+# are cropped to 2000x2000, and at gain 20 most of those pixels are sensor grain,
+# which is expensive to encode. Halving to 1000 averages four noisy pixels into one
+# clean one, so the file shrinks ~13x (≈20.7 → ≈1.6 GB/hour, measured on a real
+# recording) rather than the ~4x the pixel count alone would suggest.
+# DeepLabCut is unaffected — it runs live on the full-resolution frames and never
+# reads the video. This only changes what you see when re-watching a session.
+video_max_size       = 1000
+video_chunk_seconds  = 60
+# Normally left empty: video_writer finds ffmpeg next to the running interpreter
+# (i.e. inside the pixi env) and then on PATH. Set an absolute path here only if the
+# encoder lives somewhere else.
+ffmpeg_path          = ""
+# Join the chunks into one <recording_id>_Video.mp4 when the session stops. The
+# chunks are deleted only once the (lossless, stream-copy) join has succeeded.
+video_concat_on_stop = True
 
 ### Deeplabcut
 model_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/DLCModel"
