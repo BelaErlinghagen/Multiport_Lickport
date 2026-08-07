@@ -43,7 +43,7 @@ A Basler daA3840-45uc camera with an Evetar Lens (E3417A F2.4 f2.5mm 1/1.8") wer
 
 ### Screens
 
-In the Y-Maze configuration, two adafruit (5" 800x480 HDMI Backpack) screens were used to display patterns for the mice. The screens were directly connected to the computer via HDMI.
+In the Y-Maze configuration, two adafruit (5" 800x480 HDMI Backpack) screens were used to display patterns for the mice. The screens were mounted on ![custom holders](https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/ArenaFiles/YMaze_ScreenHolder.stp) to fit into the Y-Maze configuration and directly connected to the computer via HDMI.
 
 
 ### Credit
