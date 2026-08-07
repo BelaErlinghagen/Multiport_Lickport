@@ -11,7 +11,7 @@
 
 ### Arena
 
-The arena of the Multiport Setup is constructed from 16 red acrylic wall panels, which are held together by 16 connector pieces. This circular assembly is standing on a sheet of acrylic that has been roughened on one side, so that it is more comfortable to walk on for the mice and so that light that is projected onto the floor of the arena does not get reflected.
+The arena of the Multiport Setup is constructed from 16 ![red acrylic wall panels](https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/ArenaFiles/ArenaWall.stp), which are held together by 16 ![connector pieces](https://github.com/BelaErlinghagen/Multiport_Lickport/blob/main/ArenaFiles/AnglePiece.stp). This circular assembly is standing on a sheet of acrylic that has been roughened on one side, so that it is more comfortable to walk on for the mice and so that light that is projected onto the floor of the arena does not get reflected.
 
 In addition to the circular Multiport arena, two inlets were created to create a Y-Maze.
 
