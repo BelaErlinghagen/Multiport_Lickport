@@ -1,6 +1,6 @@
-"""gui/experiment_page.py — Experiment control tab.
+"""Experiment control tab.
 
-Section order (top → bottom):
+Section order (top -> bottom):
   0. Status bar       — RSpace connection status (left) + Settings button (right,
                         opens SettingsDialog: Data/Protocols folders + RSpace)
   1. Experiment Info  — Mouse / Session editable comboboxes, merged from the local
@@ -12,15 +12,15 @@ Section order (top → bottom):
   5. Comments         — timestamped notes typed during the session (fixed at the
                         bottom so they stay reachable while a session runs)
 
-When a recording stops the session is written up — protocol details, the reward
-ports that were actually chosen, and the comments — and that write-up is always
-saved as JSON next to the recordings, in Data/<mouse>_<entry>_rspace.json.
-It is additionally uploaded as a new entry in the selected RSpace notebook unless
-uploading is switched off in Settings (rspace.load_upload_enabled) or the
-upload fails; either way the record stays "pending" and can be sent later from
-Settings → Pending entries…. Naming/tag conventions come from rspace.py:
-the entry is named "YYYYMMDD_HHMM_<session>" (matching rspace.ENTRY_NAME_RE) and
-the mouse is identified by its "id_<mouse>" tag rather than by the name.
+When a recording stops, the session is written up (protocol details, the
+reward ports actually chosen, and the comments) and always saved as JSON
+next to the recordings, at Data/<mouse>_<entry>_rspace.json. It's also
+uploaded as a new entry in the selected RSpace notebook unless uploading is
+off (Settings, rspace.load_upload_enabled) or the upload fails — either way
+the record stays "pending" and can be sent later from Settings -> Pending
+entries…. Naming/tags follow rspace.py's conventions: the entry is named
+"YYYYMMDD_HHMM_<session>" (rspace.ENTRY_NAME_RE) and identifies its mouse via
+an "id_<mouse>" tag rather than the name.
 """
 
 import json
@@ -35,6 +35,7 @@ from PyQt5 import QtWidgets, QtGui, QtCore
 import console_log
 import rspace
 import shared_states
+from beamer_controls import normalise_protocol_beamer
 from data_saving import saving_process
 from pump_calibration import PumpCalibration
 from shared_states import recording_basename
@@ -98,9 +99,24 @@ def _iti_detail(iti):
         bits.append(f"dwell {region['duration_s']} s")
     else:
         bits.append(f"dwell random 0–{region['duration_max_s']} s")
-    # Light/shadow is a property of the region, not of the session.
-    bits.append("shadow" if region["shadow"] else "light")
     return ", ".join(str(b) for b in bits)
+
+
+def _beamer_detail(beamer):
+    """One-line description of the session's projection mode.
+
+    Kept separate from the intertrial line since the mode governs the whole
+    session, even when the ITI has no target region at all.
+    """
+    mode = beamer["mode"]
+    if mode == "light":
+        return "light (arena dark, bright ITI target)"
+    field = beamer["background_color"]
+    lit = (f"arena lit rgb({field[0]}, {field[1]}, {field[2]}) at "
+           f"{beamer['background_brightness']} % for the whole session")
+    if mode == "shadow":
+        return f"shadow ({lit}; dark ITI target)"
+    return f"lit background ({lit}; brighter ITI target on top)"
 
 
 def _delay_detail(delay):
@@ -146,6 +162,10 @@ def build_entry_html(protocol, meta, reward_ports, comments):
         out.append(f"<li><b>Protocol file:</b> "
                    f"{e(os.path.basename(str(meta['protocol_path'])))}</li>")
     out.append("</ul>")
+
+    # An un-uploaded record from before the beamer block existed still has to render;
+    # the shim derives it from the region flag it replaced.
+    normalise_protocol_beamer(protocol)
 
     sess    = protocol["session"]
     trial   = protocol["trial"]
@@ -211,6 +231,7 @@ def build_entry_html(protocol, meta, reward_ports, comments):
 
     out.append(f"<li><b>Intertrial:</b> {e(str(iti['type']))} — "
                f"{e(_iti_detail(iti))}</li>")
+    out.append(f"<li><b>Beamer:</b> {e(_beamer_detail(protocol['beamer']))}</li>")
     out.append("</ul>")
 
     configs = rew["configs"]
@@ -247,15 +268,14 @@ def build_entry_html(protocol, meta, reward_ports, comments):
 
 
 # ── Session write-up records (local JSON) ─────────────────────────────────────
-# Every finished session is written up as a JSON record next to its recordings, in
-# Data/<mouse>_<entry_name>_rspace.json — whether or not it is uploaded. The record
-# holds everything the RSpace entry needs (name, tags, HTML body) plus the structured
-# session data, so an entry can be created later (via the pending uploads dialog, or
-# by hand) without re-deriving anything.
+# Every finished session is written up as a JSON record next to its recordings,
+# at Data/<mouse>_<entry_name>_rspace.json, whether or not it's uploaded. Holds
+# everything an RSpace entry needs (name, tags, HTML body) plus the structured
+# session data, so an entry can be created later without re-deriving anything.
 #
-# Note the two namings pull opposite ways, deliberately: the *file* is mouse-prefixed
-# like every other file of a recording, because a filename carries no tags; the
-# *entry* inside it is not, because the uploaded document is tagged id_<mouse>.
+# The two namings pull opposite ways on purpose: the file is mouse-prefixed
+# like every other recording file, since a filename carries no tags, while
+# the entry inside it isn't, since the uploaded document is tagged id_<mouse>.
 
 RECORD_SUFFIX = "_rspace.json"
 
@@ -281,11 +301,10 @@ def build_entry_record(name, tags, content, meta, protocol, reward_ports, commen
 def entry_record_path(data_path, mouse, session, name):
     """Path of the write-up file for one session entry, flat in the Data folder.
 
-    Prefixed with the mouse, like every other file of a recording: this is a file on
-    disk, and a filename carries no tags, so the mouse has to be in the name for the
-    record to be identifiable. The RSpace *entry* it holds is the opposite case — its
-    title stays mouse-free because the uploaded document is tagged id_<mouse>
-    (see build_entry_name).
+    Prefixed with the mouse like every other recording file, since a
+    filename carries no tags. The RSpace entry it holds is the opposite case
+    — its title stays mouse-free, since the uploaded document is tagged
+    id_<mouse> instead (see build_entry_name).
     """
     return os.path.join(data_path, f"{mouse}_{name}{RECORD_SUFFIX}")
 
@@ -293,12 +312,11 @@ def entry_record_path(data_path, mouse, session, name):
 def record_entry_name(record, path):
     """The RSpace title for a stored record — never the filename verbatim.
 
-    Records written by build_entry_record always carry "name". The fallback matters
-    anyway: the file on disk *is* mouse-prefixed, so using its basename as the title
-    would push the mouse id into RSpace, where the subject belongs in the id_<mouse>
-    tag instead. So a nameless record is rebuilt from its meta, and only as a last
-    resort does the filename get used — with the record suffix and the mouse prefix
-    stripped back off.
+    Records from build_entry_record always carry "name". The fallback still
+    matters: the file on disk is mouse-prefixed, and using its basename as
+    the title would push the mouse id into RSpace, where it belongs in the
+    id_<mouse> tag instead. A nameless record is rebuilt from its meta, and
+    only as a last resort from the filename with the suffix/prefix stripped.
     """
     name = record.get("name")
     if name:
@@ -332,16 +350,14 @@ def read_entry_record(path):
 def find_pending_records(data_path):
     """Return [{"path", "record"}] for every write-up that has not been uploaded.
 
-    Scans the Data folder for *_rspace.json; newest (by saved_at) first.
-    Unreadable files are skipped rather than breaking the listing.
+    Scans the Data folder for *_rspace.json (newest first by saved_at);
+    unreadable files are skipped rather than breaking the listing.
 
-    Records written before the layout changed sit two levels down, in
-    Data/<mouse>/<session>/, so those are scanned too — otherwise a session that was
-    never uploaded would silently drop out of the retry dialog and could not be
-    pushed to RSpace at all. mark_record_uploaded writes back to a record's own path,
-    so a legacy record still stamps correctly where it lies. The nesting is walked
-    explicitly rather than with os.walk, which would descend into the (huge) frame
-    folders of old recordings.
+    Also scans the older Data/<mouse>/<session>/ layout, so a session
+    recorded before the flat layout doesn't silently drop out of the retry
+    dialog — mark_record_uploaded writes back to a record's own path, so a
+    legacy record still stamps correctly in place. Walked explicitly rather
+    than with os.walk, which would descend into old recordings' large frame folders.
     """
     def _scan(folder):
         try:
@@ -1241,14 +1257,14 @@ class ExperimentPage(QtWidgets.QWidget):
     def _local_mice(self) -> list:
         """Mice known locally, from the Data folder's <mouse>.json files.
 
-        Recordings are stored flat, so there are no per-mouse folders to list, and
-        the ids cannot be recovered from the recording filenames either — a mouse or
-        session id may itself contain underscores. The per-mouse log is the only
-        unambiguous record of which mice exist.
+        Recordings are stored flat with no per-mouse folders, and ids can't
+        be recovered from filenames (they may themselves contain
+        underscores), so the per-mouse log is the only unambiguous record of
+        which mice exist.
 
-        Recordings made before the layout changed kept their log one level down, in
-        Data/<mouse>/<mouse>.json. Those are still listed so a mouse does not vanish
-        from the picker; nothing is moved or rewritten.
+        Also lists mice whose log still sits in the older
+        Data/<mouse>/<mouse>.json layout, so they don't vanish from the
+        picker; nothing is moved or rewritten.
         """
         path = self._data_path()
         try:
@@ -1482,6 +1498,9 @@ class ExperimentPage(QtWidgets.QWidget):
         try:
             with open(path, "r") as fh:
                 self._loaded_protocol = json.load(fh)
+            # Upgrade the beamer block here rather than in the editor alone: a
+            # protocol can be started from this tab without ever being opened there.
+            normalise_protocol_beamer(self._loaded_protocol)
             self._loaded_protocol_path = path
             self._proto_path_lbl.setText(path)
             self._show_protocol_summary()
@@ -1569,13 +1588,13 @@ class ExperimentPage(QtWidgets.QWidget):
     def _snapshot_camera_calibration(self, file_prefix):
         """Copy the lens calibration in force into the recording.
 
-        Every frame of this session — video, DLC input, pose coordinates — was
-        rectified with those exact coefficients, and config/camera_calibration.json is
-        overwritten by the next wizard run. Without a copy there is no way to tell
-        afterwards which geometry a session was shot in, which matters most for the
-        recordings a DLC model is trained on. Never fatal: a missing calibration is
-        already reported by the camera process, and a failed copy must not stop a
-        session that is otherwise ready to run.
+        Every frame of this session (video, DLC input, pose coordinates) was
+        rectified with these exact coefficients, and
+        config/camera_calibration.json gets overwritten by the next wizard
+        run — without a copy, there's no way to tell afterward which
+        geometry a session was shot in. Never fatal: a missing calibration
+        is already reported by the camera process, and a failed copy must
+        not stop an otherwise-ready session.
         """
         src = shared_states.camera_calibration_path
         try:
@@ -1613,10 +1632,9 @@ class ExperimentPage(QtWidgets.QWidget):
             self._rec_status.setText(f"Pump(s) {ports} not calibrated.")
             return
 
-        # The recording's name used to be built inside the saving child, ~1 s after
-        # Start and with a timestamp the parent never saw. It is built here now so the
-        # console log can be opened at t=0 and every child is handed the same prefix
-        # rather than inventing one — a second timestamp would not have matched.
+        # Built here (not inside a child process) so the console log can open
+        # at t=0 and every child process is handed the exact same prefix,
+        # rather than each one inventing its own timestamp.
         data_path = self._data_path()
         base = recording_basename(mouse, session)
         try:
@@ -1658,11 +1676,10 @@ class ExperimentPage(QtWidgets.QWidget):
         self._sensor_flag = Value('b', self._sensor_chk.isChecked())
         self._dlc_flag    = Value('b', self._dlc_chk.isChecked())
 
-        # Camera saving is no longer the saving process's job: the camera process
-        # encodes straight to MP4, which keeps the 4 MB frames out of the queues and
-        # stops the saver from stealing them from DeepLabCut. The Camera checkbox now
-        # drives that flag. The prefix must be published *before* the flag, or the
-        # camera could see "recording" with no path to write to.
+        # The camera process encodes its own video straight to MP4 (keeping
+        # multi-MB frames out of the queues DeepLabCut also reads from); the
+        # Camera checkbox just drives its on/off flag. Publish the prefix
+        # before the flag, or the camera could see "recording" with no path yet.
         video_running = ds.get("video_running")
         video_path    = ds.get("video_path")
         if video_running is not None:
@@ -1724,6 +1741,49 @@ class ExperimentPage(QtWidgets.QWidget):
         # ports + end time) to mouse.json; only then is it safe to read it back.
         self._wait_ticks = 0
         self._sm_wait_timer.start()
+
+    def shutdown(self):
+        """Stop an in-flight recording synchronously, for use when the GUI closes.
+
+        _stop_recording finishes asynchronously — it waits on timers for the state
+        machine — which cannot complete once the event loop is ending. The part
+        that matters here is clearing video_running: the camera process finalises
+        the encoder when that drops, so doing it before the processes are torn
+        down lets ffmpeg flush the session's video while the rig is still alive,
+        instead of being killed part-way through writing it.
+        """
+        for timer in (self._sm_done_timer, self._sm_wait_timer):
+            timer.stop()
+        if self._file_prefix is None:
+            return                                   # nothing is recording
+
+        print("[Experiment] the window was closed while recording — stopping the "
+              "session and finalising its video.")
+        if self._sm_stop is not None:
+            self._sm_stop.value = True
+        if self._saving_running is not None:
+            self._saving_running.value = False
+        video_running = self._data_sources.get("video_running")
+        if video_running is not None:
+            video_running.value = False
+
+        # The saving process flushes its buffered rows on SIGTERM, so terminate
+        # rather than kill, and give it room to write them.
+        if self._saving_proc and self._saving_proc.is_alive():
+            self._saving_proc.terminate()
+            self._saving_proc.join(timeout=3)
+        self._saving_proc    = None
+        self._saving_running = None
+
+        # Best effort from here: none of it may block the window from closing.
+        try:
+            session = self._session_cb.currentText().strip()
+            self._update_mouse_log(self._mouse_cb.currentText().strip(), session)
+            self._mark_comments_session_end(session)
+        except Exception as exc:
+            print(f"[Experiment] could not update the mouse log on close: {exc}")
+        self._file_prefix = None
+        console_log.stop_log()
 
     def _wait_for_sm(self):
         idle = self._sm_active is None or not self._sm_active.value

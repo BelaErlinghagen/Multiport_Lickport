@@ -1,30 +1,25 @@
-"""video_writer.py — Chunked H.264 recording of the camera stream.
-
-Replaces the old one-.npy-per-frame scheme in data_saving.py: a 2000x2000 Mono8
-frame is 4 MB, so a session wrote tens of MB per second and the saving process had
-to steal frames from DeepLabCut's queue to get them. Encoding happens instead inside
-the *camera* process, where the frames already exist — no extra IPC, and DLC keeps
-every frame.
+"""Chunked H.264 recording of the camera stream, encoded inside the camera
+process (where the frames already exist) rather than the saving process.
 
 Two pieces:
 
   ChunkedVideoWriter  one long-lived ffmpeg fed raw frames on stdin, writing
-                      {prefix}_Video_%04d.mp4 chunks through ffmpeg's segment muxer.
-                      Each chunk is finalized as the next one begins, so a crash
-                      costs at most one chunk; the fragmented-mp4 flags make even a
-                      chunk truncated by SIGKILL playable.
+                      {prefix}_Video_%04d.mp4 chunks through ffmpeg's segment
+                      muxer. Each chunk is finalized as the next one begins,
+                      so a crash costs at most one chunk; fragmented-mp4
+                      flags keep even a SIGKILLed chunk playable.
 
-  concat_chunks()     lossless (-c copy) join of the chunks into {prefix}_Video.mp4,
-                      run once the recording stops.
+  concat_chunks()     lossless (-c copy) join of the chunks into
+                      {prefix}_Video.mp4, run once the recording stops.
 
-Both take a *path prefix* rather than a folder — recordings all share one flat Data
-folder (shared_states.recording_basename), so the prefix is the only thing keeping
-one session's files apart from another's.
+Both take a path *prefix* rather than a folder, since recordings all share
+one flat Data folder (shared_states.recording_basename) and the prefix is
+what keeps one session's files apart from another's.
 
-The MP4's own timeline is *nominal* — frames are pushed at whatever rate the camera
-delivers them but stamped at a constant `fps`. The real per-frame times live in
-{prefix}_frames.csv, which is what maps a video frame back onto a row of the session
-CSV (it replaces the information the old "{timestamp}.npy" filenames held).
+The MP4's own timeline is nominal: frames are pushed at whatever rate the
+camera delivers them but stamped at a constant `fps`. The real per-frame
+times live in {prefix}_frames.csv, which is what maps a video frame back
+onto a row of the session CSV.
 """
 
 import os
@@ -39,16 +34,13 @@ _ffmpeg_bin = None          # resolved once by _resolve_ffmpeg()
 
 
 def _resolve_ffmpeg():
-    """Locate the ffmpeg binary, preferring the one in this interpreter's env.
+    """Locate the ffmpeg binary, preferring the one next to this interpreter.
 
-    PATH alone is not enough. ffmpeg is a pixi dependency living in
-    .pixi/envs/default/bin, which is only on PATH when the app is started through
-    `pixi run`. Launched with that env's python directly — from a desktop shortcut
-    or an IDE, which is normal here — PATH has no ffmpeg and every recording died
-    with "No such file or directory: 'ffmpeg'" at the first frame.
-
-    sys.executable is inside the very same bin directory whichever way the app was
-    started, so checking there first makes the lookup independent of PATH.
+    ffmpeg is a pixi dependency, which only lands on PATH when the app is
+    launched via `pixi run` — starting the app with that env's python
+    directly (the normal case here) leaves PATH without it. sys.executable
+    sits in the same bin directory either way, so checking there first makes
+    the lookup independent of PATH.
     """
     global _ffmpeg_bin
     if _ffmpeg_bin is not None:
@@ -79,24 +71,23 @@ _STOP = object()
 
 
 class ChunkedVideoWriter:
-    """Encode raw grayscale frames to a sequence of H.264 MP4 chunks.
+    """Encodes raw grayscale frames to a sequence of H.264 MP4 chunks.
 
-    write() never blocks: if ffmpeg cannot keep up, the oldest queued frame is
-    dropped and counted. That is the whole point of the bounded queue — this runs in
-    the camera process, so a stalled encoder must never stall the grab loop and
-    starve DeepLabCut and the live preview of frames.
+    write() never blocks: if ffmpeg falls behind, the oldest queued frame is
+    dropped instead. This runs inside the camera process, so a stalled
+    encoder must never stall the grab loop and starve DeepLabCut and the
+    live preview of frames.
     """
 
-    # Frames waiting to be handed to ffmpeg. Small on purpose: 8 x 4 MB is already
-    # 32 MB of backlog, and anything beyond that is better dropped than buffered.
+    # Frames waiting to be handed to ffmpeg. Kept small on purpose — beyond
+    # this much backlog, a frame is better dropped than buffered.
     _QUEUE_DEPTH = 8
 
     def __init__(self, prefix, width, height, fps=20, chunk_seconds=60, crf=23,
                  max_size=0):
-        # *prefix* is a full path stem, e.g.
-        # /…/Data/BECU371_20260807_113631_Test2 — every file this writer produces
-        # starts with it. Recordings share one flat directory, so the prefix is the
-        # only thing separating this session's chunks from another's.
+        # *prefix* is a full path stem, e.g. /…/Data/BECU371_20260807_113631_Test2.
+        # Every file this writer produces starts with it — the only thing
+        # separating this session's chunks from another's in the flat Data folder.
         self.prefix        = prefix
         self.width         = int(width)
         self.height        = int(height)
@@ -126,8 +117,8 @@ class ChunkedVideoWriter:
                 "set shared_states.ffmpeg_path to the binary's absolute path."
             ) from None
 
-        # Per-frame timestamps. Opened line-buffered off a background flush so a kill
-        # mid-session still leaves an index for every chunk already on disk.
+        # Per-frame timestamps, line-buffered so a kill mid-session still
+        # leaves an index for every chunk already written.
         self._index_path = f"{prefix}_frames.csv"
         self._index = open(self._index_path, "w", buffering=1)
         self._index.write("frame_index,timestamp\n")
@@ -148,8 +139,8 @@ class ChunkedVideoWriter:
     def _scaled_size(width, height, max_size):
         """Output size with the longest side capped at *max_size* (0 = unchanged).
 
-        Never upscales. Dimensions are rounded to even numbers because yuv420p
-        subsamples chroma by two and libx264 rejects odd ones.
+        Never upscales. Rounds to even numbers, since yuv420p subsamples
+        chroma by two and libx264 rejects odd dimensions.
         """
         max_size = int(max_size or 0)
         longest = max(width, height)
@@ -162,18 +153,16 @@ class ChunkedVideoWriter:
     def _ffmpeg_cmd(self):
         """The encoder command line.
 
-        -force_key_frames is what makes the chunking actually work: the segment muxer
-        can only cut on a keyframe, so without a forced one every chunk_seconds the
-        chunks drift to whatever the GOP length happens to be.
+        -force_key_frames makes the chunking land on schedule: the segment
+        muxer can only cut on a keyframe, so without forcing one every
+        chunk_seconds, chunk boundaries drift to whatever the GOP length is.
 
-        The +frag_keyframe/+empty_moov flags write each chunk as a fragmented MP4, so
-        a chunk interrupted by a hard kill is still playable instead of being a file
-        with no moov atom.
+        +frag_keyframe/+empty_moov write each chunk as a fragmented MP4, so a
+        chunk cut short by a hard kill is still playable.
 
-        Downscaling is ffmpeg's job, not numpy's: full-resolution frames go down the
-        pipe either way, so scaling here costs the camera process nothing and gets a
-        properly filtered (grain-averaging) resample instead of the aliased result
-        that slicing the array would give.
+        Downscaling happens here, not in numpy: full-resolution frames go
+        down the pipe either way, so this costs the camera process nothing
+        and gets a properly filtered resample instead of an aliased one.
         """
         scale = (["-vf", f"scale={self.out_size[0]}:{self.out_size[1]}"]
                  if self.out_size else [])
@@ -207,8 +196,8 @@ class ChunkedVideoWriter:
         try:
             self._queue.put_nowait(item)
         except queue.Full:
-            # Encoder is behind. Make room by discarding the oldest frame rather than
-            # blocking the camera loop; report the total once at close().
+            # Encoder is behind: drop the oldest frame rather than block the
+            # camera loop. The total dropped is reported once at close().
             try:
                 self._queue.get_nowait()
                 self._dropped += 1
@@ -284,21 +273,17 @@ class ChunkedVideoWriter:
 def concat_chunks(prefix, remove_chunks=True):
     """Join {prefix}_Video_NNNN.mp4 into {prefix}_Video.mp4 without re-encoding.
 
-    Stream copy, so this is I/O bound and takes seconds even for a long session. The
-    chunks are deleted only once the concat has actually succeeded — a failed join
-    must never be able to destroy the recording.
-
-    The glob is deliberately anchored to *this* recording's prefix. Every recording
-    now shares one flat Data folder, so a looser pattern would let one session's
-    concat swallow (and then delete) another session's chunks — including those of a
-    recording still in progress.
+    Chunks are deleted only once the join has actually succeeded, so a failed
+    join can never destroy the recording. The glob is anchored to this
+    recording's own prefix — every recording shares one flat Data folder, so
+    a looser pattern could swallow (and delete) another session's chunks.
 
     Returns True on success.
     """
     folder = os.path.dirname(prefix) or "."
     stem   = os.path.basename(prefix)
-    # "_Video_" then digits then ".mp4" — never matches the joined _Video.mp4 itself,
-    # so re-running this is harmless.
+    # "_Video_" then digits then ".mp4" never matches the joined _Video.mp4
+    # itself, so re-running this is harmless.
     chunks = sorted(
         f for f in os.listdir(folder)
         if f.startswith(f"{stem}_Video_") and f.endswith(".mp4")

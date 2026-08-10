@@ -1,19 +1,16 @@
-"""speaker_controls.py — Tone generation for the headphone-jack speakers.
+"""Tone generation for the headphone-jack speakers. Mirrors
+serial_controls.py: a single control class (SpeakerControls) whose one public
+method, produce_sound(), renders and plays a tone.
 
-Mirrors serial_controls.py: a single control class (SpeakerControls) whose one
-public method, produce_sound(), renders and plays a tone.
+The speakers are quiet, so `volume` is an overdrive factor rather than a
+plain 0-1 gain: values above 1.0 push the sine past full scale where it
+hard-clips, raising perceived loudness (toward a square wave) at the cost of
+a harsher timbre.
 
-The setup's speakers are quiet, so the *volume* argument is an **overdrive**
-factor rather than a plain 0–1 gain: values above 1.0 push the unit-amplitude
-sine past full scale where it hard-clips, which raises the perceived loudness (the
-waveform approaches a square wave) so the weak speakers can be driven hard — at the
-cost of a harsher timbre.
-
-Audio is sent out through ALSA's `aplay` (no extra Python dependency): the rendered
-16-bit PCM is piped to `aplay` on the configured device. The device defaults to
-shared_states.speaker_device ("default", i.e. the system's current output). Set it
-to "plughw:0,0" to force the analog/headphone jack directly — useful when the
-default output is the HDMI beamer rather than the speakers.
+Playback goes through ALSA's `aplay` (no extra Python dependency needed) on
+shared_states.speaker_device ("default" = the system's current output; set
+e.g. "plughw:0,0" to force the headphone jack if the default output is the
+HDMI beamer instead).
 """
 
 import subprocess
@@ -31,6 +28,8 @@ SAMPLE_RATE = 44100
 
 
 class SpeakerControls:
+    """Owns the tone rendering and playback for one speaker device."""
+
     def __init__(self, sample_rate=SAMPLE_RATE, device=None):
         print("Initializing Speaker Controls.")
         self.sample_rate = int(sample_rate)

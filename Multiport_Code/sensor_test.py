@@ -1,35 +1,29 @@
-"""sensor_test.py — standalone two-camera + sensor-15 test recorder.
+"""Standalone two-camera + sensor-15 test recorder, used to validate the
+Multiport setup before a real run. The GUI has two tabs:
+  - "Record"  : live downsampled feeds from both Basler cameras plus a live
+                0/1 trace of lick-sensor 15, recording all three streams
+                synchronized (one 4K frame <-> one 1440 frame <-> one sensor sample).
+  - "Analyze" : load a saved recording, scrub frames + sensor with a slider,
+                pick a square ROI per camera (mouse-wheel zoom), and generate
+                a plot of the ~10 timepoints around the selected frame.
 
-A self-contained utility used to validate the Multiport setup before the first
-real run. The GUI has two tabs:
-  - "Record"  : live (downsampled) feeds from both Basler cameras + a live 0/1
-                time trace of lick-sensor 15; records all three streams
-                *synchronized* (one 4K frame ↔ one 1440 frame ↔ one sensor sample).
-  - "Analyze" : load a saved recording, scrub through frames + sensor with a
-                slider, pick a square ROI per camera (mouse-wheel zoom), and
-                generate a comprehensive plot of the ~10 timepoints around the
-                selected frame.
+Cameras run at ~30 fps (auto-exposure capped to one frame period, USB
+bandwidth cap lifted). To keep recordings small, the 4K stream is cropped to
+its arena ROI, both streams are downsampled, and each frame is written live
+as a compressed JPEG plus a CSV row. On Stop, both videos are encoded from
+the saved JPEGs via ffmpeg/H.264 at the exact average fps measured from the
+frame timestamps, so playback is real-time. Encode settings are in the
+"Recording size controls" block below.
 
-Cameras are configured for ~30 fps (auto-exposure is capped to one frame period
-and the USB bandwidth cap lifted). To keep recordings small (raw full-res .npy ran
-to ~100 GB/10 min), the 4K stream is cropped to its arena focus ROI, both streams
-are downsampled, and each frame is written live as a compressed JPEG + the CSV.
-On Stop the two videos are encoded from the saved JPEGs with ffmpeg/H.264 (bitrate
-capped) at the exact average fps measured from the frame timestamps (so playback is
-real speed). The encode knobs live in the "Recording size controls" block below and
-keep each frames folder and each video under ~500 MB per 10 min.
-
-Reuses existing code WITHOUT modifying it:
-  - serial_controls.sensor_process  → maintains the shared 16-int sensor_array.
-  - gui.CameraWidget                → live downsampled camera preview (one per cam).
-
-Everything that did not fit the existing modules (two-camera acquisition,
-per-frame JPEG saving + video, the 0/1 time-trace widget) is new and lives here.
+Reuses existing code as-is: serial_controls.sensor_process fills the shared
+sensor_array, and gui.CameraWidget provides the live downsampled preview.
+Everything else (two-camera acquisition, per-frame JPEG + video saving, the
+0/1 time-trace widget) is new and lives here.
 
 Process layout (spawn):
-  main process       → Qt GUI (two CameraWidgets + sensor trace + record panel)
-  sensor_process     → fills sensor_array from the Arduinos (existing function)
-  acquisition_process→ grabs both cameras, feeds the GUI, and (when recording)
+  main process        Qt GUI (two CameraWidgets + sensor trace + record panel)
+  sensor_process       fills sensor_array from the Arduinos (existing function)
+  acquisition_process  grabs both cameras, feeds the GUI, and (when recording)
                        hands cropped frames to an in-process writer thread.
 
 Output files (in the chosen folder), base = {YYYYmmdd_HHMMSS}_testing_{label}:
@@ -69,10 +63,10 @@ WRITE_Q_MAX = 64         # writer-thread backpressure cap (preserves sync, caps 
 SENSOR_INDEX = 14        # sensor 15 → sensor_array[14]
 
 # ── Recording size controls ────────────────────────────────────────────────────
-# Raw full-res .npy per frame is what blows recordings up to ~100 GB/10 min. We
-# crop the 4K to its arena focus ROI (same as camera_controls.py), downsample both
-# streams, save each frame as JPEG, and encode H.264 videos with ffmpeg. Every knob
-# below trades quality for size; defaults keep each artifact < 500 MB per 10 min.
+# Saving raw full-resolution frames would make recordings enormous. Instead
+# the 4K stream is cropped to its arena ROI (same as camera_controls.py), both
+# streams are downsampled, each frame is saved as JPEG, and video is encoded
+# with H.264. Every knob below trades quality for file size.
 CROP_4K        = (100, 2100, 1000, 3000)  # (y0, y1, x0, x1) — matches camera_controls.py arena ROI → 2000×2000
 SAVE_4K_SIZE   = (1000, 1000)             # (w, h) saved size of the 4K crop
 SAVE_1440_SIZE = (960, 720)               # (w, h) saved size of the 1440 (keeps 4:3)
@@ -86,8 +80,8 @@ FFMPEG_BIN     = "ffmpeg"                 # encoder binary (provided by the pixi
 def open_camera(serial):
     """Open the Basler camera with the given serial as Mono8.
 
-    Selecting by serial (not CreateFirstDevice) is essential here because two
-    cameras are connected. Raises with a helpful list if the serial is absent.
+    Selects by serial rather than CreateFirstDevice, since two cameras are
+    connected. Raises with a list of available cameras if the serial isn't found.
     """
     tl = pylon.TlFactory.GetInstance()
     dev = next((d for d in tl.EnumerateDevices()
@@ -113,12 +107,12 @@ def open_camera(serial):
 def _configure_framerate(cam, target_fps):
     """Configure a Basler camera to sustain target_fps.
 
-    By default ExposureAuto drives the exposure up to 100 ms in dim scenes, which
-    caps the frame rate at ~10 fps, and DeviceLinkThroughputLimit (~160 MB/s)
-    further throttles the 4K stream. We lift the bandwidth cap and bound the
-    auto-exposure to one frame period; auto-gain then compensates the brightness
-    lost to the shorter exposure. Each node is set defensively (names/availability
-    vary across models/firmware).
+    By default, auto-exposure can drive exposure time up in dim scenes and
+    cap the frame rate well below target, and the USB bandwidth limit further
+    throttles the 4K stream. This lifts the bandwidth cap and bounds
+    auto-exposure to one frame period, letting auto-gain compensate for the
+    shorter exposure. Each node is set defensively, since names and
+    availability vary across camera models/firmware.
     """
     def _set(name, val):
         try:
@@ -189,9 +183,8 @@ def _drop_put(q, item):
 def _encode_one_ffmpeg(folder, out_path, fps):
     """Encode a folder of NNNNNN.jpg into an H.264 mp4 via ffmpeg.
 
-    H.264 with a bitrate cap keeps each video well under budget. Returns True on
-    success, or False if ffmpeg is unavailable/fails (the caller then falls back
-    to the cv2 encoder so a video is still produced).
+    Returns True on success, False if ffmpeg is unavailable or fails — the
+    caller then falls back to the cv2 encoder so a video is still produced.
     """
     cmd = [
         FFMPEG_BIN, "-y", "-framerate", f"{fps:.4f}",
@@ -232,11 +225,11 @@ def _writer_loop(write_q):
       ("close",)                                        → finalize current recording
       None                                              → exit the thread
 
-    Realtime path writes only the per-frame JPEG + the CSV, so video encoding never
-    throttles capture and the cameras run at their full frame rate. On "close" the
-    two videos are encoded *from the saved JPEGs* (ffmpeg/H.264) at the exact average
-    fps measured from the frame timestamps — so the .mp4 plays back at real speed.
-    Only timestamps + file paths are buffered, so RAM use stays negligible.
+    Only the per-frame JPEG and CSV are written in realtime, so video encoding
+    never throttles capture. On "close", both videos are encoded from the
+    saved JPEGs at the exact average fps measured from the frame timestamps,
+    so playback is real-time. Only timestamps and file paths are buffered, so
+    memory use stays negligible.
     """
     folder4k = folder1440 = None
     csvfile = csvw = None
@@ -244,9 +237,8 @@ def _writer_loop(write_q):
     recorded = []   # [(timestamp, path_4k, path_1440)] for this recording
 
     def _encode_videos():
-        # Encode both videos from the saved .jpg sequence at the measured average
-        # fps (so playback is real speed). ffmpeg/H.264 with a bitrate cap keeps
-        # each video under budget; cv2 mp4v is the fallback when ffmpeg is absent.
+        # ffmpeg/H.264 is tried first; cv2 mp4v is the fallback if ffmpeg is
+        # unavailable.
         if not recorded or video_cfg is None:
             return
         out_dir, base, fdir4k, fdir1440 = video_cfg
@@ -289,9 +281,8 @@ def _writer_loop(write_q):
 
         elif tag == "frame":
             _, idx, t, f4k, f1440, s15 = item
-            # Downsample then JPEG-encode each frame: a per-frame .jpg is ~100×
-            # smaller than the raw .npy this used to write, keeping the frames
-            # folder under budget while staying frame-accurate for the Analyze tab.
+            # Downsample then JPEG-encode each frame to keep the frames folder
+            # small while staying frame-accurate for the Analyze tab.
             f4 = cv2.resize(f4k,   SAVE_4K_SIZE,   interpolation=cv2.INTER_AREA)
             f1 = cv2.resize(f1440, SAVE_1440_SIZE, interpolation=cv2.INTER_AREA)
             p4k   = os.path.join(folder4k,   f"{idx:06d}.jpg")
@@ -315,11 +306,11 @@ def acquisition_process(disp_q_4k, disp_q_1440, sensor_array, ctrl_queue,
                         running_flag, disp_shape_4k, disp_shape_1440):
     """Grab both cameras in lockstep, feed the GUI, and record on request.
 
-    The 4K camera (slower max fps) is retrieved first and sets the loop rate; the
-    1440 camera is then retrieved (latest image) so each iteration yields one
-    synchronized (4K, 1440, sensor) triplet. Full-res frames are copied only when
-    recording and handed to the writer thread; the GUI only ever sees small
-    downsampled frames.
+    The 4K camera (slower max fps) is retrieved first and sets the loop rate;
+    the 1440 camera is retrieved right after, so each iteration yields one
+    synchronized (4K, 1440, sensor) triplet. Full-res frames are copied only
+    while recording and handed to the writer thread — the GUI only ever sees
+    small downsampled frames.
     """
     disp_q_4k.cancel_join_thread()
     disp_q_1440.cancel_join_thread()
@@ -367,9 +358,9 @@ def acquisition_process(disp_q_4k, disp_q_1440, sensor_array, ctrl_queue,
                 continue
             arr4k = res4k.Array
             disp4k = _downsample(arr4k, disp_shape_4k[0], disp_shape_4k[1])
-            # Record only the arena focus ROI (same crop as camera_controls.py): a
-            # 2000×2000 slice instead of the full 8.3 MB frame, so far less data
-            # crosses to the writer and the saved frames are smaller.
+            # Record only the arena focus ROI (same crop as camera_controls.py),
+            # not the full frame, so less data crosses to the writer and the
+            # saved frames are smaller.
             if recording:
                 y0, y1, x0, x1 = CROP_4K
                 rec4k = arr4k[y0:y1, x0:x1].copy()   # copy before Release

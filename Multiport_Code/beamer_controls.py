@@ -1,23 +1,27 @@
-"""beamer_controls.py — Driver for the HDMI-connected beamer (projector).
+"""Driver for the HDMI-connected beamer (projector), structured like
+camera_controls.py / serial_controls.py: BeamerProjector owns the
+QApplication, the fullscreen projection window, and all rendering logic (and
+can be run standalone); beamer_process() is the multiprocessing entry point
+launched by main.py. Commands arrive as dicts on beamer_queue:
 
-Architecture mirrors camera_controls.py / serial_controls.py:
-  - BeamerProjector class    : owns the QApplication + fullscreen projection
-                               window and all rendering logic; can be exercised
-                               standalone.
-  - beamer_process()         : multiprocessing target launched by main.py.
-
-The projector runs in its own process with its own QApplication and a fullscreen
-QWidget placed on the beamer's extended-display screen. Commands arrive as dicts
-on *beamer_queue* (the beamer analogue of serial_controls' command_queue):
-
-  {"cmd": "sphere", "x_cm", "y_cm", "diameter_cm", "shadow": bool, "duration": s}
+  {"cmd": "sphere", "x_cm", "y_cm", "diameter_cm", "mode", "color", "field_color",
+                    "duration": s}
         Project a filled circle. Coordinates are centimetres from the arena
-        centre; converted to pixels via the calibration. shadow=True draws a
-        black sphere on a white field (else white on black). duration>0 auto-
-        clears after that many seconds.
-  {"cmd": "sphere_px", "cx", "cy", "diameter_px", "shadow", "duration"}
-        Same, but geometry is given directly in pixels (used by the calibration
-        wizard, which works before any cm scale exists).
+        centre, converted to pixels via BeamerCalibration. duration > 0
+        auto-clears the sphere after that many seconds. "mode" picks a
+        background/target combination:
+
+            "light"           black background, sphere drawn in "color"
+            "shadow"          background lit in "field_color", sphere black
+                              (a hole punched in the lit field)
+            "lit_background"  background lit in "field_color", sphere drawn in
+                              "color" on top of it
+
+        A diameter of 0 in the two lit modes projects just the lit field, no target.
+  {"cmd": "sphere_px", "cx", "cy", "diameter_px", "mode", "color", "field_color",
+                       "duration"}
+        Same as "sphere" but in raw pixels — used by the calibration wizard,
+        which runs before any cm scale exists.
   {"cmd": "fill", "color": "black"|"white"}   solid field.
   {"cmd": "clear"}                            blank to black.
   {"cmd": "reload_calibration"}               re-read the calibration JSON.
@@ -30,22 +34,79 @@ import time
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 import shared_states
+from hardware_state import BEAMER_LIT_MODES, BEAMER_MODES
+
+
+# ── Protocol schema ────────────────────────────────────────────────────────────
+
+# Menu text for the projection modes, shared by the protocol editor and the
+# Cleaning tab's test sphere so label text and stored key never drift apart.
+BEAMER_MODE_LABELS = {
+    "light":          "Light (dark arena, bright target)",
+    "shadow":         "Shadow (lit arena, dark target)",
+    "lit_background": "Lit background (lit arena, brighter target)",
+}
+BEAMER_MODE_KEYS = {v: k for k, v in BEAMER_MODE_LABELS.items()}
+
+# Default shape of the top-level "beamer" protocol block (see
+# ProtocolPage.DEFAULT_PROTOCOL). The background is dimmer than the sphere by
+# default: the projector is additive, so a sphere in lit_background mode is
+# only visible if it out-shines its field.
+_DEFAULT_BEAMER = {"mode": "light",
+                   "background_color": [255, 255, 255],
+                   "background_brightness": 30}
+
+
+def normalise_protocol_beamer(protocol: dict) -> dict:
+    """Upgrade an older protocol (with no top-level "beamer" block), in place.
+
+    The projection mode used to be a per-region boolean ("shadow") rather
+    than a session-wide setting; this reconstructs the new "beamer" block
+    from the old field so protocol files saved before that change still
+    load. Deliberately the only tolerant protocol read in the codebase —
+    everywhere else a missing key raises. Idempotent, so it's safe to call
+    at every load site (protocol editor, experiment tab, state machine).
+    """
+    if not isinstance(protocol, dict) or "beamer" in protocol:
+        return protocol
+
+    # Read whichever ITI region was actually active; its colour/brightness
+    # become the new background, reproducing the old rendering exactly.
+    iti = protocol.get("intertrial") or {}
+    region = None
+    if iti.get("type") == "fixed_region":
+        region = iti.get("region")
+    elif iti.get("type") == "random_region":
+        region = iti.get("random_region")
+
+    beamer = dict(_DEFAULT_BEAMER)
+    beamer["background_color"] = list(beamer["background_color"])
+    if isinstance(region, dict):
+        beamer["mode"] = "shadow" if region.get("shadow") else "light"
+        beamer["background_color"] = list(region.get("color", [255, 255, 255]))
+        beamer["background_brightness"] = int(region.get("brightness", 100))
+    protocol["beamer"] = beamer
+
+    # The per-region flags are dead weight now; drop them so a re-saved file is clean.
+    for key in ("region", "random_region"):
+        stale = iti.get(key)
+        if isinstance(stale, dict):
+            stale.pop("shadow", None)
+    return protocol
 
 
 # ── Calibration ────────────────────────────────────────────────────────────────
 
 class BeamerCalibration:
-    """Loads beamer calibration and converts arena centimetres to screen pixels.
-
-    Reads beamer_calibration_path (written by the GUI calibration wizard). When
-    the file is missing or incomplete it falls back to an uncalibrated default so
-    the projector still runs — cm inputs are then only a rough guess derived from
-    the live screen size.
+    """Converts arena centimetres to screen pixels, using the calibration
+    written by the GUI's calibration wizard (shared_states.beamer_calibration_path).
+    Falls back to a rough guess based on screen size if the file is missing
+    or incomplete, so the projector still runs uncalibrated rather than failing.
     """
 
     def __init__(self, screen_size=None):
-        # screen_size = (w, h) of the actual projection window; used to place the
-        # default origin at screen centre and to guess a scale pre-calibration.
+        # screen_size = (w, h) of the projection window, used for the default
+        # origin (screen centre) and to guess a scale before calibration.
         self.screen_w, self.screen_h = screen_size or (1920, 1080)
         self.px_per_cm = None
         self.origin_px = (self.screen_w / 2.0, self.screen_h / 2.0)
@@ -63,8 +124,8 @@ class BeamerCalibration:
         except Exception:
             data = {}
 
-        # Last-resort scale so an uncalibrated projector still shows *something*
-        # sane (roughly a 20 cm-tall field maps to full screen height).
+        # Fallback scale so an uncalibrated projector still shows something
+        # reasonable (roughly a 20 cm-tall field mapped to full screen height).
         self.px_per_cm = float(data.get("px_per_cm") or (self.screen_h / 20.0))
         origin = data.get("origin_px")
         if origin and len(origin) == 2:
@@ -85,9 +146,8 @@ class BeamerCalibration:
         return cx, cy, radius
 
     def dlc_to_px(self, u, v):
-        """Map a normalised DLC coordinate to beamer pixels via the camera↔beamer
-        affine. (u, v) are fractions (0–1) of the tracking frame — the same frame
-        DLC runs on. Returns (cx_px, cy_px), or None if uncalibrated."""
+        """Map a normalised DLC coordinate (u, v in 0-1, fractions of the DLC
+        tracking frame) to beamer pixels. Returns None if uncalibrated."""
         m = self.cam_to_beamer
         if not m:
             return None
@@ -95,10 +155,8 @@ class BeamerCalibration:
         return (a * u + b * v + c, d * u + e * v + f)
 
     def px_to_dlc(self, bx, by):
-        """Inverse of dlc_to_px: beamer pixels → normalised DLC (u, v).
-
-        Inverts the 2×2 linear part of camera_to_beamer. Returns None if
-        uncalibrated or the mapping is singular (collinear calibration points)."""
+        """Inverse of dlc_to_px: beamer pixels -> normalised DLC (u, v).
+        Returns None if uncalibrated or the mapping is singular."""
         m = self.cam_to_beamer
         if not m:
             return None
@@ -112,11 +170,9 @@ class BeamerCalibration:
         return (u, v)
 
     def cm_to_dlc(self, x_cm, y_cm, diameter_cm):
-        """Map an arena-centred cm request to a normalised DLC circle (u, v, r).
-
-        cm → beamer px → normalised DLC, for both the centre and a point on the
-        rim, so r is the radius in DLC-normalised units. Returns None if the
-        camera↔beamer mapping is unavailable. Used to draw the camera contour."""
+        """Map an arena-centred cm request to a normalised DLC circle (u, v, r),
+        by converting both the centre and a rim point through cm -> px -> DLC.
+        Returns None if uncalibrated. Used to draw the camera-view contour."""
         cx, cy, radius = self.cm_to_px(x_cm, y_cm, diameter_cm)
         centre = self.px_to_dlc(cx, cy)
         edge   = self.px_to_dlc(cx + radius, cy)
@@ -129,12 +185,9 @@ class BeamerCalibration:
 # ── Projection window ───────────────────────────────────────────────────────────
 
 class _ProjectionWindow(QtWidgets.QWidget):
-    """Fullscreen renderer for the beamer.
-
-    Holds a single render state — a solid background plus an optional filled
-    circle — and paints it edge to edge. WA_OpaquePaintEvent stops Qt from
-    pre-filling the background (the flicker-free idiom used across this GUI).
-    """
+    """Fullscreen widget that renders one background colour plus an optional
+    filled circle on top. WA_OpaquePaintEvent avoids the Qt/X11 background
+    flicker worked around the same way elsewhere in this GUI."""
 
     _BLACK = QtGui.QColor(0, 0, 0)
     _WHITE = QtGui.QColor(255, 255, 255)
@@ -149,14 +202,18 @@ class _ProjectionWindow(QtWidgets.QWidget):
         self._field = None    # (cx, cy, radius, QColor) lit disc drawn under the sphere
         self._circle = None   # (cx, cy, radius, QColor) or None
 
-    def show_sphere(self, cx, cy, radius, shadow, light_color=None, field=None):
-        # The "lit" region uses light_color (default white); the rest is black.
-        #   Normal      : black background + lit sphere.
-        #   Shadow      : black sphere over a lit region. If *field* (fx, fy, fr)
-        #                 is given, the lit region is that disc (the calibrated
-        #                 projection area); otherwise the whole screen is lit.
-        lit = light_color if light_color is not None else self._WHITE
-        if shadow:
+    def show_sphere(self, cx, cy, radius, mode,
+                    sphere_color=None, field=None, field_color=None):
+        # One rendered frame: a background plus a sphere on top of it.
+        #   light          black background + sphere in sphere_color
+        #   shadow         lit background   + black sphere (a hole in the field)
+        #   lit_background lit background   + sphere in sphere_color on top
+        # The two lit modes share this branch; only the sphere colour differs.
+        # If *field* (fx, fy, fr) is given, only that disc is lit (the
+        # calibrated projection area); otherwise the whole screen is lit.
+        sphere = sphere_color if sphere_color is not None else self._WHITE
+        if mode in BEAMER_LIT_MODES:
+            lit = field_color if field_color is not None else self._WHITE
             if field is not None:
                 fx, fy, fr = field
                 self._bg = self._BLACK
@@ -164,11 +221,11 @@ class _ProjectionWindow(QtWidgets.QWidget):
             else:
                 self._bg = lit
                 self._field = None
-            self._circle = (cx, cy, max(0.0, radius), self._BLACK)
         else:
             self._bg = self._BLACK
             self._field = None
-            self._circle = (cx, cy, max(0.0, radius), lit)
+        self._circle = (cx, cy, max(0.0, radius),
+                        self._BLACK if mode == "shadow" else sphere)
         self.update()
 
     def show_fill(self, color):
@@ -198,11 +255,9 @@ class _ProjectionWindow(QtWidgets.QWidget):
 # ── Projector ───────────────────────────────────────────────────────────────────
 
 class BeamerProjector:
-    """Owns the QApplication + fullscreen window and services beamer_queue.
-
-    Mirrors TrackingCamera / SerialControls: all rendering logic lives here so it
-    can be run standalone, while beamer_process() is the multiprocessing entry.
-    """
+    """Owns the QApplication, fullscreen projection window, and calibration;
+    services beamer_queue. Can run standalone (see __main__ below) or inside
+    beamer_process(), the multiprocessing entry point."""
 
     def __init__(self, beamer_queue, running_flag):
         print("Initializing Beamer.")
@@ -227,15 +282,15 @@ class BeamerProjector:
         print("Beamer is ready.")
 
     def _place_on_beamer_screen(self):
-        """Move the window onto the configured extended-display screen, fullscreen.
+        """Move the window fullscreen onto the configured beamer display.
 
-        If that screen doesn't exist (the beamer isn't plugged in, or the display
-        indices shifted after a cabling change) the window stays hidden instead of
-        falling back to the primary display — a fullscreen projection window there
-        just blacks out the control monitor. Commands are still accepted and simply
-        not projected, matching how screen_controls handles a missing touch screen.
+        If that screen index doesn't exist (beamer unplugged, or display
+        indices shifted after a cabling change), the window stays hidden
+        rather than falling back to the primary display and blacking out the
+        control monitor — commands are still accepted, just not shown, the
+        same way screen_controls.py handles a missing touch screen.
 
-        Returns the geometry the calibration should assume for its default size.
+        Returns the geometry the calibration should use as its default size.
         """
         screens = self.app.screens()
         idx = int(getattr(shared_states, "beamer_screen_index", 1))
@@ -272,15 +327,25 @@ class BeamerProjector:
         except Exception:
             return None
 
-    def _show_sphere(self, cx, cy, radius, shadow, duration, light_color=None):
+    @staticmethod
+    def _mode_of(cmd):
+        """Return a sphere command's projection mode, falling back to the
+        older boolean "shadow" flag so a stale command still renders."""
+        mode = cmd.get("mode")
+        if mode in BEAMER_MODES:
+            return mode
+        return "shadow" if cmd.get("shadow") else "light"
+
+    def _show_sphere(self, cx, cy, radius, mode, duration,
+                     sphere_color=None, field_color=None):
         self._duration_timer.stop()
-        # In shadow mode, bound the lit region to the calibrated projection area
-        # (the arena disc) instead of lighting the whole screen.
+        # In the lit modes, restrict the lit area to the calibrated projection
+        # disc instead of lighting the whole screen.
         field = None
-        if shadow and self.calib.projection_radius_px:
+        if mode in BEAMER_LIT_MODES and self.calib.projection_radius_px:
             ox, oy = self.calib.origin_px
             field = (ox, oy, self.calib.projection_radius_px)
-        self.window.show_sphere(cx, cy, radius, shadow, light_color, field)
+        self.window.show_sphere(cx, cy, radius, mode, sphere_color, field, field_color)
         if duration and duration > 0:
             self._duration_timer.start(int(duration * 1000))
 
@@ -295,17 +360,19 @@ class BeamerProjector:
                 float(cmd.get("diameter_cm", 0.0)),
             )
             self._show_sphere(cx, cy, radius,
-                              bool(cmd.get("shadow", False)),
+                              self._mode_of(cmd),
                               float(cmd.get("duration", 0.0) or 0.0),
-                              self._parse_color(cmd.get("color")))
+                              self._parse_color(cmd.get("color")),
+                              self._parse_color(cmd.get("field_color")))
         elif action == "sphere_px":
             self._show_sphere(
                 float(cmd.get("cx", self.calib.origin_px[0])),
                 float(cmd.get("cy", self.calib.origin_px[1])),
                 float(cmd.get("diameter_px", 0.0)) / 2.0,
-                bool(cmd.get("shadow", False)),
+                self._mode_of(cmd),
                 float(cmd.get("duration", 0.0) or 0.0),
                 self._parse_color(cmd.get("color")),
+                self._parse_color(cmd.get("field_color")),
             )
         elif action == "fill":
             self._duration_timer.stop()
@@ -340,10 +407,11 @@ class BeamerProjector:
 
 
 def beamer_process(beamer_queue, running_flag):
+    """Process entry point: runs a BeamerProjector until running_flag clears."""
     from console_log import tag_process
     tag_process("Beamer")
 
-    # Prevent Queue feeder threads from blocking this process's atexit.
+    # Prevent Queue feeder threads from blocking this process's exit.
     beamer_queue.cancel_join_thread()
 
     # Convert SIGTERM (from beamer_proc.terminate()) into a clean loop exit.
@@ -365,16 +433,29 @@ if __name__ == "__main__":
     proc = mp.Process(target=beamer_process, args=(q, running))
     proc.start()
 
-    # Push a few test frames a couple seconds apart, then shut down. Watch the
-    # beamer: a centred 10 cm light sphere, an off-centre one, a shadow sphere,
-    # then blank.
+    # Manual test: push a few frames a couple seconds apart and watch the
+    # beamer — a centred light sphere, an off-centre one, a shadow sphere, the
+    # lit_background baseline (field only), a lit_background sphere, then
+    # blank. The field should not flicker or change intensity between the
+    # last two; only the brighter sphere should appear on top of it.
+    dim  = [70, 70, 70]
+    full = [255, 255, 255]
     try:
         time.sleep(2)
-        q.put({"cmd": "sphere", "x_cm": 0, "y_cm": 0, "diameter_cm": 10, "shadow": False})
+        q.put({"cmd": "sphere", "x_cm": 0, "y_cm": 0, "diameter_cm": 10,
+               "mode": "light", "color": full})
         time.sleep(2)
-        q.put({"cmd": "sphere", "x_cm": 5, "y_cm": 5, "diameter_cm": 6, "shadow": False})
+        q.put({"cmd": "sphere", "x_cm": 5, "y_cm": 5, "diameter_cm": 6,
+               "mode": "light", "color": full})
         time.sleep(2)
-        q.put({"cmd": "sphere", "x_cm": 0, "y_cm": 0, "diameter_cm": 12, "shadow": True})
+        q.put({"cmd": "sphere", "x_cm": 0, "y_cm": 0, "diameter_cm": 12,
+               "mode": "shadow", "field_color": full})
+        time.sleep(2)
+        q.put({"cmd": "sphere", "x_cm": 0, "y_cm": 0, "diameter_cm": 0,
+               "mode": "lit_background", "color": full, "field_color": dim})
+        time.sleep(2)
+        q.put({"cmd": "sphere", "x_cm": 0, "y_cm": 0, "diameter_cm": 12,
+               "mode": "lit_background", "color": full, "field_color": dim})
         time.sleep(2)
         q.put({"cmd": "clear"})
         time.sleep(1)

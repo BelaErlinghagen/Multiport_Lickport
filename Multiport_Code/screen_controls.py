@@ -1,23 +1,14 @@
-"""screen_controls.py — Pattern display for the two HDMI touch screens.
+"""Pattern display for the two HDMI touch screens, structured like
+beamer_controls.py: ScreenControls owns a QApplication with one fullscreen
+window per screen (indices from shared_states.screen_indices) and paints
+patterns locally. Its display_pattern(screen_id, pattern_id) call — or a
+{"screen_id", "pattern_id"} dict on a multiprocessing queue, see
+screen_process() — overwrites whatever that screen is currently showing.
 
-Architecture mirrors serial_controls.py: a single control class (ScreenControls)
-whose public method, display_pattern(screen_id, pattern_id), tells one screen which
-pattern to show. Sending a new pattern to a screen overwrites whatever it is
-currently displaying.
-
-The two Raspberry Pi touch screens are wired to the setup PC as extra HDMI displays,
-so — like beamer_controls.py — this owns a QApplication with one fullscreen window
-per screen and paints the pattern locally. Which QApplication.screens() index each
-window opens on comes from shared_states.screen_indices.
-
-Three patterns (accepted as the canonical name, an alias, or an int 0/1/2):
+Three patterns, accepted as a canonical name, an alias, or an int 0/1/2:
     "black"   / 0 — a plain black screen
     "circles" / 1 — a scatter of white circles on a black background
     "zigzag"  / 2 — black zigzag lines on a white background
-
-Commands can also arrive from another process over a multiprocessing queue of
-{"screen_id": int, "pattern_id": ...} dicts (see screen_process), the same way the
-beamer is driven from the GUI.
 """
 
 import queue
@@ -58,10 +49,8 @@ def normalize_pattern(pattern_id):
 
 class _PatternWindow(QtWidgets.QWidget):
     """Fullscreen window for one screen; paints the currently-set pattern.
-
-    WA_OpaquePaintEvent stops Qt pre-filling the background (the flicker-free idiom
-    used across this GUI); paintEvent fills every pixel itself.
-    """
+    WA_OpaquePaintEvent avoids the Qt background-flicker issue worked around
+    the same way elsewhere in this GUI."""
 
     _BLACK = QtGui.QColor(0, 0, 0)
     _WHITE = QtGui.QColor(255, 255, 255)
@@ -159,10 +148,10 @@ class ScreenControls:
     def _place(self, win, idx):
         """Move `win` fullscreen onto QApplication screen index `idx`.
 
-        If that index doesn't exist (the touch screens aren't plugged in yet) the
-        window stays hidden rather than falling back to the primary display —
-        otherwise a fullscreen black window would cover the control monitor.
-        Commands for a missing screen are then accepted and simply not visible.
+        If that index doesn't exist (touch screen not plugged in), the window
+        stays hidden rather than falling back to the primary display and
+        covering the control monitor — commands for it are silently accepted
+        but not shown.
         """
         screens = self.app.screens()
         if idx < 0 or idx >= len(screens):
@@ -233,10 +222,11 @@ class ScreenControls:
 
 
 def screen_process(screen_queue, running_flag):
+    """Process entry point: runs a ScreenControls until running_flag clears."""
     from console_log import tag_process
     tag_process("Screens")
 
-    # Prevent Queue feeder threads from blocking this process's atexit.
+    # Prevent Queue feeder threads from blocking this process's exit.
     screen_queue.cancel_join_thread()
 
     # Convert SIGTERM (from screen_proc.terminate()) into a clean loop exit.

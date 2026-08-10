@@ -1,27 +1,22 @@
-"""pump_calibration.py — how much liquid each lickport pump ejects per pulse.
+"""How much liquid each lickport pump ejects per pulse.
 
-Rewards are configured as a *volume* in µL, not as a pump-on duration. A duration is
-not a volume: sixteen pumps with different tubing and back-pressure deliver different
-amounts for the same milliseconds, and nothing downstream knew how much. Worse, a
-pump energised for more than about 10 ms shoots the liquid across the arena instead
-of forming a droplet at the cannula, so a single long pulse is the wrong primitive
-altogether.
-
-So a reward is a *train* of shared_states.pump_pulse_ms pulses, one per lick, and the
-number of pulses comes from the µL/pulse measured here:
+Rewards are configured as a volume in µL, not a pump-on duration: pumps
+differ in tubing and back-pressure, so the same duration delivers different
+amounts on different ports. A pump held on for more than ~10 ms also shoots
+liquid across the arena instead of forming a droplet, so a reward is
+delivered as a train of shared_states.pump_pulse_ms pulses (one per lick),
+sized from the µL/pulse measured here:
 
     n_pulses = round(volume_ul / ul_per_pulse)
 
-The numbers are measured by the wizard on the Cleaning/Testing tab (one port at a
-time: fire N pulses into a tube, weigh it, enter the net mass in mg) and stored in
-shared_states.pump_calibration_path. The raw measurements are kept alongside the
-derived value, the same way config/beamer_calibration.json keeps its own — a stored
-mean with no way to see the spread it came from cannot be sanity-checked later.
+Measured by the wizard on the Cleaning/Testing tab (fire N pulses into a
+tube, weigh it, enter the net mass in mg) and stored in
+shared_states.pump_calibration_path, alongside the raw measurements the mean
+was computed from — so a stored value can be sanity-checked later.
 
-This class never raises and never blocks startup: a missing or partial file simply
-leaves ports uncalibrated (ul_per_pulse returns None) so the rig, the Cleaning tab
-and the wizard itself all still run. Refusing to run is a *session's* decision, made
-in ExperimentPage._start_recording and StateMachine.run(), not this module's.
+Never raises and never blocks startup: a missing/partial file just leaves a
+port uncalibrated (ul_per_pulse returns None). Refusing to run a session
+over that is ExperimentPage/StateMachine's decision, not this module's.
 """
 
 import json
@@ -30,8 +25,8 @@ from datetime import datetime
 
 import shared_states
 
-# Ports are keyed by their string form in the JSON — json.dump turns int keys into
-# strings anyway, so using them consistently avoids a load/save asymmetry.
+# Ports are keyed by their string form in the JSON, since json.dump turns int
+# keys into strings anyway — using strings consistently avoids a load/save mismatch.
 PORT_COUNT = 16
 
 
@@ -50,12 +45,11 @@ class PumpCalibration:
     # ── Loading ───────────────────────────────────────────────────────────────
 
     def reload(self, force=False):
-        """Re-read the calibration JSON. Keeps the rig running on any failure.
+        """Re-read the calibration JSON; keeps the rig running on any failure.
 
-        Cheap enough to call from a GUI timer: unless *force*, it returns
-        immediately when the file's mtime has not moved, so the Protocol tab can
-        refresh its pulse-count hints after a wizard run without re-parsing on
-        every repaint.
+        Cheap enough to call from a GUI timer: skips re-parsing unless
+        *force* or the file's mtime changed, so e.g. the Protocol tab can
+        refresh its pulse-count hints on every repaint.
         """
         try:
             mtime = os.path.getmtime(self.path)
@@ -84,11 +78,10 @@ class PumpCalibration:
                 ports[port] = dict(entry)
         self.ports = ports
 
-        # A calibration measured at a different pulse width or refill interval does
-        # not transfer: 10 ms of a peristaltic pump is mostly startup transient, so
-        # the volume per pulse is neither proportional to the width nor independent
-        # of how long the line had to refill. Someone editing the shared_states
-        # constants would otherwise silently keep using stale numbers.
+        # A calibration measured at a different pulse width or refill interval
+        # doesn't transfer — pump output isn't proportional to pulse width or
+        # independent of refill time. Warn loudly rather than silently using
+        # stale numbers after shared_states is edited.
         file_pulse = data.get("pulse_ms")
         file_refr = data.get("refractory_ms")
         if ports and file_pulse is not None and int(file_pulse) != self.pulse_ms:
@@ -125,16 +118,13 @@ class PumpCalibration:
         return dict(entry) if entry else None
 
     def pulses_for(self, port, volume_ul):
-        """(n_pulses, actual_ul) needed to deliver *volume_ul* at *port*.
+        """Return (n_pulses, actual_ul) needed to deliver volume_ul at port,
+        or None if the port is uncalibrated.
 
-        Returns None for an uncalibrated port — callers must check rather than let
-        a None reach a division.
-
-        int(x + 0.5) rather than round(): Python 3's round() is banker's rounding,
-        so round(0.5) == 0 and a volume of exactly half a pulse would ask for no
-        pulses at all. The result is clamped to at least one pulse (a request below
-        half a droplet still delivers a droplet — the alternative is a reward the
-        hardware cannot express) and at most pump_max_pulses.
+        Uses int(x + 0.5) instead of round(), since Python's round() is
+        banker's rounding and would round exactly half a pulse down to zero.
+        Clamped to at least 1 pulse (there's no way to deliver less than one
+        droplet) and at most pump_max_pulses.
         """
         ul = self.ul_per_pulse(port)
         if ul is None or ul <= 0:
@@ -157,10 +147,8 @@ class PumpCalibration:
 
         *measurements* is a list of {"n_pulses": int, "measured_mg": float}.
 
-        Read-modify-write: calibrating one pump must never clear the other fifteen,
-        so the file is re-read here rather than dumped from self.ports alone (the
-        wizard may have been open across an edit, and a port the user did not touch
-        this session still has to survive).
+        Read-modify-write: re-reads the file rather than dumping self.ports,
+        so calibrating one pump can never clear the other fifteen.
         """
         density = float(density_mg_per_ul if density_mg_per_ul is not None
                         else self.density_mg_per_ul)

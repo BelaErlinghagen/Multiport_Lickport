@@ -1,26 +1,25 @@
-"""gui/pump_calibration_dialog.py — measure how much each pump ejects per pulse.
+"""Wizard to measure how much each pump ejects per pulse.
 
-Rewards are configured in µL, but a pump only understands "on for 10 ms". This
-wizard is what connects the two: it fires a known number of pulses into a tube, the
-user weighs it, and the net mass divided by the pulse count gives that pump's
-µL/pulse. Repeating it 3-5× gives a spread to judge the number by.
+Rewards are configured in µL, but a pump only understands "on for 10 ms".
+This connects the two: fire a known number of pulses into a tube, weigh it,
+and net mass divided by pulse count gives that pump's µL/pulse. Repeated
+3-5x for a spread worth trusting.
 
-One port at a time, deliberately. All sixteen at once would need sixteen tubes in
-place and sixteen weigh-ins before a single number could be entered, and the common
-case is one pump that has drifted, not a fresh rig.
+One port at a time, deliberately — the common case is one drifted pump, not
+calibrating a fresh rig, so there's no need for sixteen tubes at once.
 
-Two things about the procedure that are easy to get wrong and matter a lot:
+Two things easy to get wrong:
+  - The wizard fires at exactly the pulse width/interval a session uses
+    (shared_states.pump_pulse_ms / pump_refractory_ms) — a calibration
+    measured at a different cadence doesn't transfer, since a 10 ms
+    energisation is mostly the pump's startup transient.
+  - The mass entered must be net (liquid only), which is why empty/full
+    weights are entered separately rather than trusting the difference to be
+    remembered.
 
-  • The wizard fires at exactly the pulse width and interval a session uses
-    (shared_states.pump_pulse_ms / pump_refractory_ms). A 10 ms energisation is
-    mostly the pump's startup transient and the line needs time to refill, so a
-    calibration measured at a different cadence does not transfer.
-  • The mass entered must be *net* — the liquid only. The dialog asks for the empty
-    and full weights separately rather than trusting that to be remembered.
-
-Modelled on BeamerCalibrationDialog in cleaning_page.py: same dark styling, same
-"write JSON then tell the live process" ending. Unlike that one it needs no camera,
-so it is a plain form rather than a step-by-step wizard.
+Modelled on BeamerCalibrationDialog in cleaning_page.py (same dark styling,
+same "write JSON then tell the live process" ending), but needs no camera,
+so it's a plain form rather than a step-by-step wizard.
 """
 
 import time
@@ -59,8 +58,8 @@ class PumpCalibrationDialog(QtWidgets.QDialog):
         # Measurements for the port currently selected, cleared when it changes.
         self._measurements: list = []      # [{"n_pulses", "measured_mg"}]
 
-        # Run state. Its own timer — the Cleaning page's cleaning-cycle timer is
-        # stopped and cleared by _stop_cleaning, which would silently kill a run.
+        # Run state, with its own timer — the Cleaning page's cleaning-cycle
+        # timer is stopped/cleared by _stop_cleaning, which would silently kill a run.
         self._run_timer = QtCore.QTimer(self)
         self._run_timer.timeout.connect(self._run_tick)
         self._run_remaining = 0
@@ -245,8 +244,8 @@ class PumpCalibrationDialog(QtWidgets.QDialog):
     def _send(self, cmd: str):
         """Queue one command; a full queue means a lost pulse, so say so loudly.
 
-        A silently dropped pulse would make the run deliver fewer droplets than the
-        count the volume is divided by, i.e. an under-estimate of µL/pulse that
+        A silently dropped pulse would deliver fewer droplets than the count
+        the volume gets divided by — an under-estimate of µL/pulse that
         nothing downstream could detect.
         """
         try:

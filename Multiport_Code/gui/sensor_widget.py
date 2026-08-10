@@ -1,3 +1,5 @@
+"""SensorWidget: 4x4 heat-map of lick-sensor activity, showing cumulative
+counts per port with the currently-active sensors highlighted."""
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 
@@ -6,6 +8,8 @@ class SensorWidget(QtWidgets.QWidget):
 
     Active sensors (currently licking) are highlighted with a blue accent border.
     """
+
+    _BG = QtGui.QColor("#2b2b2b")   # matches the tab pages and _OpaqueWidget
 
     def __init__(self, sensor_array, num_sensors=16):
         super().__init__()
@@ -28,9 +32,9 @@ class SensorWidget(QtWidgets.QWidget):
             if int(self.sensor_array[i]) == 1:
                 new_active.add(i)
 
-        # Only schedule a repaint when something actually changed — either the set
-        # of active sensors is different, or counts are still accumulating (active
-        # sensors exist). Avoids 80 ms unconditional repaints when the setup is idle.
+        # Repaint only when something changed — the active set differs, or
+        # counts are still accumulating — avoiding unconditional repaints
+        # when the setup is idle.
         if new_active or new_active != self.active:
             for i in new_active:
                 self.counts[i] += 1
@@ -52,6 +56,12 @@ class SensorWidget(QtWidgets.QWidget):
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
+        # WA_OpaquePaintEvent means this method must paint every pixel itself.
+        # That matters even though the tiles below are inset/spaced: CameraWidget
+        # (a QOpenGLWidget) puts the whole window into OpenGL compositing, where
+        # every widget shares one framebuffer — anything left unpainted here would
+        # show whatever another widget last rendered into that region.
+        painter.fillRect(event.rect(), self._BG)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
         cols, rows = 4, 4

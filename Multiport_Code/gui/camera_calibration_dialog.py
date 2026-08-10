@@ -1,19 +1,18 @@
-"""camera_calibration_dialog.py — measure the tracking camera's fisheye distortion.
+"""Wizard that measures the tracking camera's fisheye distortion.
 
-No printed target: the beamer projects the calibration pattern. It lights one 2 cm
-dot at a time inside the arena, the wizard finds that dot in the live camera feed, and
-the resulting correspondences (known point on the floor ↔ where the lens put it) are
-what the distortion fit is solved from. That works here because the projection disc is
-*larger* than the camera's view of it, so dots can be placed right into the corners of
-the frame — the region where fisheye distortion is largest and a calibration that only
-covered the middle would be extrapolating.
+Uses no printed target: the beamer projects one 2 cm dot at a time inside
+the arena, the wizard finds it in the live camera feed, and the resulting
+correspondences (known floor point <-> where the lens put it) are what the
+distortion fit is solved from. This works because the projection disc is
+larger than the camera's view of it, so dots can reach the frame corners —
+where fisheye distortion is largest and a calibration covering only the
+middle would be extrapolating.
 
-What it inherits from that choice: the projector's own (much smaller) lens distortion
-and any unevenness of the arena floor are folded into the estimate. The measured point
-pairs are saved with the result, so a fit can be audited or redone later without
-putting the rig back into this state.
+The trade-off: the projector's own (much smaller) lens distortion and any
+floor unevenness fold into the estimate. The measured point pairs are saved
+alongside the result, so a fit can be audited or redone later.
 
-The wizard needs *raw* frames to measure, so it lowers the camera process's
+Needs raw frames to measure, so it lowers the camera process's
 undistort_enabled flag for the duration and raises undistort_reload when it saves.
 """
 
@@ -29,11 +28,10 @@ from beamer_controls import BeamerCalibration
 def _detect_dot(diff, min_peak=25):
     """Sub-pixel centre of the brightest blob in *diff*, or None if none stands out.
 
-    *diff* is the lit frame minus the dark reference, so the projected dot is the only
-    thing left except sensor noise and anything in the arena that changed. The centre
-    is an intensity-weighted centroid over the blob rather than the peak pixel: the
-    peak is quantised to whole pixels, the centroid is good to a fraction of one, and
-    that fraction is the accuracy the whole calibration inherits.
+    *diff* is the lit frame minus the dark reference, so the projected dot is
+    the only thing left besides sensor noise. Uses an intensity-weighted
+    centroid rather than the peak pixel, since the centroid is accurate to a
+    fraction of a pixel and that fraction is what the whole calibration inherits.
     """
     blur = cv2.GaussianBlur(diff, (5, 5), 0)
     _mn, mx, _mnloc, mxloc = cv2.minMaxLoc(blur)
@@ -125,9 +123,9 @@ class CameraCalibrationDialog(QtWidgets.QDialog):
       3. Result — model, RMS, before/after preview, suggested zoom → Finish saves.
     """
 
-    # A projected dot has to travel beamer → arena → sensor → frame_queue → the GUI's
-    # 50 ms preview timer before we may look at it. 350 ms clears all of that with
-    # room for the 50 ms exposure and the ~10 fps the camera actually runs at.
+    # A projected dot has to travel beamer -> arena -> sensor -> frame_queue
+    # -> the GUI's preview timer before it can be measured; 350 ms clears
+    # that pipeline with room to spare.
     _SETTLE_MS = 350
     _SAMPLE_MS = 120
     _SAMPLES = 3          # frames averaged per dot, to beat sensor noise
@@ -310,9 +308,9 @@ class CameraCalibrationDialog(QtWidgets.QDialog):
         if self.frame_provider is None:
             problems.append("there is no camera feed")
         if not self._beamer.cam_to_beamer:
-            # Without it we cannot tell which beamer pixels the camera can see, so
-            # the grid would be placed blind — usable, but likely to miss the corners
-            # that matter most.
+            # Without it, the grid is placed blind (usable, but likely to
+            # miss the corners that matter most), since there's no way to
+            # tell which beamer pixels the camera can see.
             notes.append("no camera↔beamer mapping yet: the grid will be placed over "
                          "the projection area instead of the camera's view. Run the "
                          "beamer calibration first for a better spread.")
@@ -332,16 +330,16 @@ class CameraCalibrationDialog(QtWidgets.QDialog):
     def _grid_points(self):
         """Beamer-pixel dot positions that land inside the camera's field of view.
 
-        Placed on a grid in *camera* coordinates and mapped back to the beamer, not
-        the other way round: the point of this pattern is to constrain distortion
-        everywhere in the frame, and only the camera knows where its own edges are.
+        Placed on a grid in camera coordinates and mapped back to the
+        beamer, not the other way round, since only the camera knows where
+        its own edges are and the goal is to constrain distortion everywhere
+        in the frame.
 
-        The frame's corners sit outside the projector's round usable area, so those
-        dots are pulled back to its rim rather than dropped. A dot near the rim still
-        constrains the periphery — where fisheye distortion is largest and a fit made
-        only of central points would be extrapolating — and its arena position is
-        known just as exactly. Duplicates from several corners landing on the same bit
-        of rim are collapsed.
+        Corners that fall outside the projector's round usable area are
+        pulled back to its rim rather than dropped — a dot near the rim
+        still constrains the periphery, where fisheye distortion is largest,
+        and its arena position is known just as exactly. Duplicates from
+        several corners landing on the same bit of rim are collapsed.
         """
         n = int(self._grid_spin.value())
         m = self._MARGIN
@@ -467,7 +465,7 @@ class CameraCalibrationDialog(QtWidgets.QDialog):
         bx, by = self._targets[self._idx]
         diam = max(6.0, self._DOT_CM * (self._beamer.px_per_cm or 12.0))
         self._send({"cmd": "sphere_px", "cx": bx, "cy": by,
-                    "diameter_px": diam, "shadow": False})
+                    "diameter_px": diam, "mode": "light"})
         self._progress.setValue(self._idx)
         self._cap_label.setText(
             f"Dot {self._idx + 1} / {len(self._targets)} — found {len(self._pairs)}")
@@ -496,9 +494,9 @@ class CameraCalibrationDialog(QtWidgets.QDialog):
                 "and check the feed for reflections being measured instead of dots.")
             return
 
-        # Straightness, stated the way it matters: how far the measured dots sit from
-        # the best flat-plane fit, before and after. That is exactly the error the
-        # beamer's affine mapping and the ITI dwell test absorb today.
+        # Straightness: how far the measured dots sit from the best
+        # flat-plane fit, before and after — the same error the beamer's
+        # affine mapping and the ITI dwell test have to absorb.
         before = _plane_residual(img_px, obj_cm)
         after = _plane_residual(self._fit_undistort(img_px), obj_cm)
         zoom = self._preview_calib().fit_zoom(self._crop)
@@ -602,9 +600,9 @@ class CameraCalibrationDialog(QtWidgets.QDialog):
 
 
 def _plane_residual(pts, obj_cm):
-    """RMS distance from the best plane→image homography, in pixels.
+    """RMS distance from the best plane->image homography, in pixels.
 
-    Zero for a pinhole camera looking at a flat floor, whatever the angle. What is
+    Zero for a pinhole camera looking at a flat floor, at any angle — what's
     left is lens distortion, so this is the one number that says whether the
     correction worked, independent of the fit's own error estimate.
     """

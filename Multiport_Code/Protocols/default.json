@@ -73,7 +73,6 @@
         255,
         255
       ],
-      "shadow": false,
       "duration_type": "fixed",
       "duration_s": 2.0,
       "duration_max_s": 3.0
@@ -86,7 +85,6 @@
         255,
         255
       ],
-      "shadow": false,
       "margin_x_cm": 0.0,
       "margin_y_cm": 0.0,
       "margin_radius_cm": 10.0,
@@ -94,6 +92,15 @@
       "duration_s": 2.0,
       "duration_max_s": 3.0
     }
+  },
+  "beamer": {
+    "mode": "light",
+    "background_color": [
+      255,
+      255,
+      255
+    ],
+    "background_brightness": 30
   },
   "screens": {
     "mode": "none",

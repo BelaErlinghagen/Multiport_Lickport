@@ -1,7 +1,7 @@
-"""gui/protocol_page.py — Protocol editor tab.
+"""Protocol editor tab.
 
-Lets the user create, load, edit, and save behavioural protocols as .json files.
-Protocols are stored in the folder chosen in the Settings dialog
+Lets the user create, load, edit, and save behavioural protocols as .json
+files, stored in the folder chosen in the Settings dialog
 (shared_states.get_protocols_path()).
 
 Section layout (inside a QScrollArea):
@@ -17,22 +17,29 @@ Section layout (inside a QScrollArea):
   ── Trial ───────────────────────────────────────────────────────
   ── Sounds ──────────────────────────────────────────────────────
       • a tone at trial start and/or trial end
+  ── Beamer ──────────────────────────────────────────────────────
+      • projection mode (light / shadow / lit background) + the lit field
+      • session-wide: it governs the whole session, not just the ITI
   ── Intertrial Interval ──────────────────────────────────────────
       • Fixed time  OR  Fixed region  OR  Random region
-      • each region carries its own beamer light/shadow mode
+      • each region defines the target sphere the beamer projects
       • Region settings shown as live overlay on the camera preview
 
-Protocols are read strictly — every key in DEFAULT_PROTOCOL must be present, so a
-malformed file raises KeyError at load rather than silently running with defaults.
-That is what rejects protocols written before rewards became volumes: they carry
-`duration_ms` where `volume_ul` is now required, and there is no honest way to
-convert one into the other (a pump's output is not proportional to how long it is
-energised), so they have to be rebuilt rather than guessed at.
+Protocols are read strictly: every key in DEFAULT_PROTOCOL must be present,
+so a malformed file raises KeyError at load instead of silently running with
+defaults. That's also why a protocol with pump-on durations (`duration_ms`)
+instead of volumes (`volume_ul`) is rejected outright rather than converted
+— a pump's output isn't proportional to how long it runs, so there's no
+honest way to translate one into the other; those files must be rebuilt.
+
+The beamer block is the one exception: older files predate it entirely, and
+it *can* be translated honestly from the per-region `shadow` flag it
+replaced — see beamer_controls.normalise_protocol_beamer, run here before
+any widget is touched.
 
 Rewards are set in µL. How many pulses that costs depends on the per-pump
-calibration (pump_calibration.py), which is why each volume carries a live hint —
-the editor is the only place the user can notice that a requested volume rounds
-badly or would take longer to drink than the trial lasts.
+calibration (pump_calibration.py), so each volume carries a live hint — the
+one place a badly-rounding volume can be caught before an animal is in the arena.
 """
 
 import json
@@ -42,6 +49,9 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import pyqtSignal
 
 import shared_states
+from beamer_controls import (BEAMER_MODE_KEYS, BEAMER_MODE_LABELS,
+                             normalise_protocol_beamer)
+from hardware_state import BEAMER_LIT_MODES
 from pump_calibration import PumpCalibration
 
 
@@ -94,10 +104,11 @@ class ProtocolPage(QtWidgets.QWidget):
         "intertrial": {
             "type": "time",
             "duration_s": 5.0,
+            # brightness/color describe the *target sphere*; the field behind it is
+            # the session-wide beamer block below.
             "region": {
                 "x_cm": 0.0, "y_cm": 0.0, "diameter_cm": 6.0,
                 "brightness": 100, "color": [255, 255, 255],
-                "shadow": False,
                 "duration_type": "fixed",
                 "duration_s": 2.0,
                 "duration_max_s": 3.0,
@@ -105,12 +116,21 @@ class ProtocolPage(QtWidgets.QWidget):
             "random_region": {
                 "diameter_cm": 6.0,
                 "brightness": 100, "color": [255, 255, 255],
-                "shadow": False,
                 "margin_x_cm": 0.0, "margin_y_cm": 0.0, "margin_radius_cm": 10.0,
                 "duration_type": "fixed",
                 "duration_s": 2.0,
                 "duration_max_s": 3.0,
             },
+        },
+        "beamer": {
+            # Session-wide, not an ITI setting: in the two lit modes the field is on
+            # for the whole session and only the target comes and goes on top of it.
+            "mode": "light",              # "light" | "shadow" | "lit_background"
+            # The constant lit field. Left dimmer than the sphere by default —
+            # a projector is additive, so a lit_background sphere is only visible
+            # if it out-shines the field it sits on.
+            "background_color": [255, 255, 255],
+            "background_brightness": 30,
         },
         "screens": {
             "mode":      "none",              # "none" | "static" | "dynamic"
@@ -165,6 +185,15 @@ class ProtocolPage(QtWidgets.QWidget):
         "dynamic": "Dynamic (pattern follows the reward)",
     }
     _SCREEN_MODE_KEYS = {v: k for k, v in _SCREEN_MODE_LABELS.items()}
+
+    # Beamer projection modes. Shared with the Cleaning tab's test sphere, so the
+    # two menus can never offer different labels for the same stored key.
+    _BEAMER_MODE_LABELS = BEAMER_MODE_LABELS
+    _BEAMER_MODE_KEYS   = BEAMER_MODE_KEYS
+
+    # The two modes that keep the arena lit; both show the background controls and
+    # hold their field between targets.
+    _BEAMER_LIT_MODES = BEAMER_LIT_MODES
 
     _DELAY_MODE_LABELS = {
         "release":  "Release (rewards inert until the delay passes)",
@@ -234,10 +263,10 @@ class ProtocolPage(QtWidgets.QWidget):
         # Beamer sphere appearance for the two region menus (persist across rebuilds)
         self._reg_color = QtGui.QColor(255, 255, 255)
         self._rnd_color = QtGui.QColor(255, 255, 255)
-        # Per-region light/shadow mode. Persisted here (like the colours above) so the
-        # setting survives the widget teardown when the user switches ITI type.
-        self._reg_shadow = False
-        self._rnd_shadow = False
+        # Constant lit field, for the two lit projection modes. Lives in the Beamer
+        # section, which is built once, but is kept here beside the sphere colours it
+        # is compared against.
+        self._bg_color = QtGui.QColor(255, 255, 255)
 
         # Per-pump µL/pulse, used only for the live hints beside each volume. The
         # editor must stay usable on an uncalibrated rig — PumpCalibration never
@@ -293,7 +322,7 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_reg_x_spin = self._iti_reg_y_spin = self._iti_reg_diam_spin = None
         self._iti_reg_bright = self._iti_reg_color_btn = None
         self._iti_reg_beamer_chk = self._iti_reg_contour_chk = None
-        self._iti_reg_shadow_chk = None
+        self._iti_reg_sphere_note = None
         self._iti_reg_dur_type = self._iti_reg_dur_spin = self._iti_reg_dur_max_spin = None
         self._iti_reg_dur_fixed_w = self._iti_reg_dur_max_w = None
         # Random region (same sphere fields + margin + toggles + dwell)
@@ -301,7 +330,7 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_rnd_margin_x_spin = self._iti_rnd_margin_y_spin = None
         self._iti_rnd_margin_radius_spin = None
         self._iti_rnd_beamer_chk = self._iti_rnd_contour_chk = self._iti_rnd_margin_chk = None
-        self._iti_rnd_shadow_chk = None
+        self._iti_rnd_sphere_note = None
         self._iti_rnd_dur_type = self._iti_rnd_dur_spin = self._iti_rnd_dur_max_spin = None
         self._iti_rnd_dur_fixed_w = self._iti_rnd_dur_max_w = None
 
@@ -649,6 +678,57 @@ class ProtocolPage(QtWidgets.QWidget):
         sl.addWidget(self._section_label("Sounds"))
         for key in self._SOUND_KEYS:
             sl.addWidget(self._build_sound_block(key))
+
+        sl.addWidget(self._make_separator())
+
+        # ── Beamer ────────────────────────────────────────────────
+        # Above the ITI section on purpose: the mode governs the whole session, so it
+        # must be reachable for every ITI type — including Fixed time, which projects
+        # no target but can still run the arena lit throughout.
+        sl.addWidget(self._section_label("Beamer"))
+
+        beamer_mode_row = QtWidgets.QHBoxLayout()
+        beamer_mode_row.addWidget(QtWidgets.QLabel("Mode:"))
+        self._beamer_mode_combo = QtWidgets.QComboBox()
+        self._beamer_mode_combo.addItems(list(self._BEAMER_MODE_LABELS.values()))
+        self._beamer_mode_combo.setMinimumWidth(280)
+        beamer_mode_row.addWidget(self._beamer_mode_combo)
+        beamer_mode_row.addStretch()
+        sl.addLayout(beamer_mode_row)
+
+        beamer_note = QtWidgets.QLabel(
+            "Light: arena dark, the ITI target is a bright sphere.\n"
+            "Shadow: arena lit all session, the ITI target is a dark sphere.\n"
+            "Lit background: arena lit all session, the ITI target is a brighter "
+            "sphere on top of it.\n"
+            "In both lit modes the field stays on during trials — only the target "
+            "comes and goes.")
+        beamer_note.setWordWrap(True)
+        beamer_note.setStyleSheet("color:#777; font-size:9px;")
+        sl.addWidget(beamer_note)
+
+        # Background controls — only meaningful when the arena is lit.
+        self._beamer_bg_w = QtWidgets.QWidget()
+        bg_layout = QtWidgets.QVBoxLayout(self._beamer_bg_w)
+        bg_layout.setContentsMargins(8, 2, 0, 0)
+        bg_layout.setSpacing(4)
+        self._beamer_bg_bright = self._make_bright_slider()
+        self._beamer_bg_bright.setValue(30)
+        bg_layout.addWidget(self._labeled_row("Background brightness:",
+                                              self._beamer_bg_bright))
+        self._beamer_bg_color_btn = QtWidgets.QPushButton()
+        self._beamer_bg_color_btn.setFixedWidth(44)
+        self._update_swatch(self._beamer_bg_color_btn, self._bg_color)
+        self._beamer_bg_color_btn.clicked.connect(self._pick_bg_color)
+        bg_layout.addWidget(self._labeled_row("Background colour:",
+                                              self._beamer_bg_color_btn))
+        self._beamer_contrast_lbl = QtWidgets.QLabel()
+        self._beamer_contrast_lbl.setWordWrap(True)
+        bg_layout.addWidget(self._beamer_contrast_lbl)
+        sl.addWidget(self._beamer_bg_w)
+
+        self._beamer_mode_combo.currentTextChanged.connect(self._beamer_mode_changed)
+        self._beamer_bg_bright.valueChanged.connect(self._beamer_bg_changed)
 
         sl.addWidget(self._make_separator())
 
@@ -1427,14 +1507,14 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_reg_x_spin = self._iti_reg_y_spin = self._iti_reg_diam_spin = None
         self._iti_reg_bright = self._iti_reg_color_btn = None
         self._iti_reg_beamer_chk = self._iti_reg_contour_chk = None
-        self._iti_reg_shadow_chk = None
+        self._iti_reg_sphere_note = None
         self._iti_reg_dur_type = self._iti_reg_dur_spin = self._iti_reg_dur_max_spin = None
         self._iti_reg_dur_fixed_w = self._iti_reg_dur_max_w = None
         self._iti_rnd_diam_spin = self._iti_rnd_bright = self._iti_rnd_color_btn = None
         self._iti_rnd_margin_x_spin = self._iti_rnd_margin_y_spin = None
         self._iti_rnd_margin_radius_spin = None
         self._iti_rnd_beamer_chk = self._iti_rnd_contour_chk = self._iti_rnd_margin_chk = None
-        self._iti_rnd_shadow_chk = None
+        self._iti_rnd_sphere_note = None
         self._iti_rnd_dur_type = self._iti_rnd_dur_spin = self._iti_rnd_dur_max_spin = None
         self._iti_rnd_dur_fixed_w = self._iti_rnd_dur_max_w = None
 
@@ -1444,9 +1524,10 @@ class ProtocolPage(QtWidgets.QWidget):
             self._iti_time_spin = self._make_dur_spin(5.0)
             layout.addWidget(self._labeled_row("Duration:", self._iti_time_spin))
             note = QtWidgets.QLabel(
-                "Light and shadow are a property of the ITI target region, so there "
-                "is no beamer mode to set here — the beamer stays dark for the whole "
-                "session. Pick Fixed region or Random region to use Shadow.")
+                "A fixed-time ITI has no target region, so the beamer projects no "
+                "sphere at any point in the session. The projection mode set in the "
+                "Beamer section above still applies: in either lit mode the arena "
+                "stays lit for the whole session, with nothing on it.")
             note.setWordWrap(True)
             note.setStyleSheet("color:#777; font-size:9px;")
             layout.addWidget(note)
@@ -1460,30 +1541,19 @@ class ProtocolPage(QtWidgets.QWidget):
             layout.addWidget(self._labeled_row("Diameter (cm):",   self._iti_reg_diam_spin))
 
             self._iti_reg_bright = self._make_bright_slider()
-            layout.addWidget(self._labeled_row("Brightness:", self._iti_reg_bright))
+            layout.addWidget(self._labeled_row("Sphere brightness:", self._iti_reg_bright))
             self._iti_reg_color_btn = QtWidgets.QPushButton()
             self._iti_reg_color_btn.setFixedWidth(44)
             self._update_swatch(self._iti_reg_color_btn, self._reg_color)
             self._iti_reg_color_btn.clicked.connect(self._pick_reg_color)
-            layout.addWidget(self._labeled_row("Colour:", self._iti_reg_color_btn))
+            layout.addWidget(self._labeled_row("Sphere colour:", self._iti_reg_color_btn))
+            self._iti_reg_sphere_note = self._sphere_appearance_note()
+            layout.addWidget(self._iti_reg_sphere_note)
 
             self._iti_reg_beamer_chk  = QtWidgets.QCheckBox("Beamer on")
             self._iti_reg_contour_chk = QtWidgets.QCheckBox("Contour on")
             layout.addWidget(self._toggle_row(self._iti_reg_beamer_chk, self._iti_reg_contour_chk))
             layout.addWidget(self._calib_hint())
-
-            layout.addWidget(self._sublabel("Beamer mode"))
-            self._iti_reg_shadow_chk = QtWidgets.QCheckBox(
-                "Shadow (dark sphere on a lit field)")
-            self._iti_reg_shadow_chk.setChecked(self._reg_shadow)
-            layout.addWidget(self._iti_reg_shadow_chk)
-            shadow_note = QtWidgets.QLabel(
-                "Light: dark during trials, bright sphere marks the ITI target.\n"
-                "Shadow: whole area lit during trials, dark sphere marks the ITI target.")
-            shadow_note.setWordWrap(True)
-            shadow_note.setStyleSheet("color:#777; font-size:9px;")
-            layout.addWidget(shadow_note)
-            self._iti_reg_shadow_chk.toggled.connect(self._reg_shadow_toggled)
 
             layout.addWidget(self._sublabel("Dwell time"))
             self._iti_reg_dur_type = QtWidgets.QComboBox()
@@ -1509,12 +1579,14 @@ class ProtocolPage(QtWidgets.QWidget):
             self._iti_rnd_diam_spin = self._make_cm_spin(6.0, 0.1, 200.0)
             layout.addWidget(self._labeled_row("Diameter (cm):", self._iti_rnd_diam_spin))
             self._iti_rnd_bright = self._make_bright_slider()
-            layout.addWidget(self._labeled_row("Brightness:", self._iti_rnd_bright))
+            layout.addWidget(self._labeled_row("Sphere brightness:", self._iti_rnd_bright))
             self._iti_rnd_color_btn = QtWidgets.QPushButton()
             self._iti_rnd_color_btn.setFixedWidth(44)
             self._update_swatch(self._iti_rnd_color_btn, self._rnd_color)
             self._iti_rnd_color_btn.clicked.connect(self._pick_rnd_color)
-            layout.addWidget(self._labeled_row("Colour:", self._iti_rnd_color_btn))
+            layout.addWidget(self._labeled_row("Sphere colour:", self._iti_rnd_color_btn))
+            self._iti_rnd_sphere_note = self._sphere_appearance_note()
+            layout.addWidget(self._iti_rnd_sphere_note)
 
             layout.addWidget(self._sublabel("Outer margin (projection area for random targets)"))
             self._iti_rnd_margin_x_spin      = self._make_cm_spin(0.0)
@@ -1537,19 +1609,6 @@ class ProtocolPage(QtWidgets.QWidget):
             note.setStyleSheet("color:#777; font-size:9px;")
             layout.addWidget(note)
             layout.addWidget(self._calib_hint())
-
-            layout.addWidget(self._sublabel("Beamer mode"))
-            self._iti_rnd_shadow_chk = QtWidgets.QCheckBox(
-                "Shadow (dark sphere on a lit field)")
-            self._iti_rnd_shadow_chk.setChecked(self._rnd_shadow)
-            layout.addWidget(self._iti_rnd_shadow_chk)
-            rnd_shadow_note = QtWidgets.QLabel(
-                "Light: dark during trials, bright sphere marks the ITI target.\n"
-                "Shadow: whole area lit during trials, dark sphere marks the ITI target.")
-            rnd_shadow_note.setWordWrap(True)
-            rnd_shadow_note.setStyleSheet("color:#777; font-size:9px;")
-            layout.addWidget(rnd_shadow_note)
-            self._iti_rnd_shadow_chk.toggled.connect(self._rnd_shadow_toggled)
 
             layout.addWidget(self._sublabel("Dwell time"))
             self._iti_rnd_dur_type = QtWidgets.QComboBox()
@@ -1577,8 +1636,10 @@ class ProtocolPage(QtWidgets.QWidget):
             self._iti_rnd_beamer_chk.toggled.connect(self._refresh_rnd_beamer)
             self._update_iti_dur_visibility()
 
-        # Switching type clears any live beamer preview from the previous menu.
-        self._send_beamer({"cmd": "clear"})
+        # Switching type drops any live target preview from the previous menu, back
+        # to whatever the current mode shows between targets.
+        self._send_beamer(self._beamer_baseline_cmd())
+        self._update_beamer_mode_visibility()
         self._emit_overlay()
 
     @staticmethod
@@ -1618,23 +1679,127 @@ class ProtocolPage(QtWidgets.QWidget):
         except Exception:
             pass
 
-    # Shadow is a per-region setting, so each preview reads its own checkbox. The
-    # persisted flag is the fallback for when the panel isn't currently built.
-    def _reg_shadow_on(self) -> bool:
-        return bool(self._iti_reg_shadow_chk.isChecked()
-                    if self._iti_reg_shadow_chk is not None else self._reg_shadow)
+    # ── Beamer mode ───────────────────────────────────────────────────────────
 
-    def _rnd_shadow_on(self) -> bool:
-        return bool(self._iti_rnd_shadow_chk.isChecked()
-                    if self._iti_rnd_shadow_chk is not None else self._rnd_shadow)
+    def _beamer_mode(self) -> str:
+        """The selected projection mode. Session-wide, so both region previews and
+        the fixed-time menu read this one control."""
+        return self._BEAMER_MODE_KEYS[self._beamer_mode_combo.currentText()]
 
-    def _reg_shadow_toggled(self, on: bool):
-        self._reg_shadow = bool(on)
-        self._reg_live()      # re-project immediately if the beamer preview is on
+    def _bg_eff_color(self) -> list:
+        """The constant lit field's colour, scaled by its brightness."""
+        return self._eff_color(self._bg_color, self._beamer_bg_bright)
 
-    def _rnd_shadow_toggled(self, on: bool):
-        self._rnd_shadow = bool(on)
-        self._refresh_rnd_beamer()
+    def _beamer_baseline_cmd(self) -> dict:
+        """What the beamer shows between targets, mirroring the state machine's
+        _beamer_baseline: blank in light mode, the lit field in the two lit modes
+        (a diameter-0 sphere, so the field itself never switches)."""
+        mode = self._beamer_mode()
+        if mode not in self._BEAMER_LIT_MODES:
+            return {"cmd": "clear"}
+        field = self._bg_eff_color()
+        return {"cmd": "sphere", "x_cm": 0.0, "y_cm": 0.0, "diameter_cm": 0.0,
+                "mode": mode, "color": field, "field_color": field}
+
+    def _beamer_mode_changed(self, *_):
+        self._update_beamer_mode_visibility()
+        self._refresh_beamer_preview()
+
+    def _beamer_bg_changed(self, *_):
+        self._update_contrast_warning()
+        self._refresh_beamer_preview()
+
+    def _pick_bg_color(self):
+        color = QtWidgets.QColorDialog.getColor(self._bg_color, self, "Background colour")
+        if color.isValid():
+            self._bg_color = color
+            self._update_swatch(self._beamer_bg_color_btn, color)
+            self._beamer_bg_changed()
+
+    def _refresh_beamer_preview(self):
+        """Re-send whatever the live preview should currently be showing.
+
+        Routed through the two region refreshers so that the "Beamer on" checkbox
+        keeps deciding between the target and the bare baseline.
+        """
+        if self._iti_reg_beamer_chk is not None:
+            self._reg_beamer_toggled(self._iti_reg_beamer_chk.isChecked())
+        elif self._iti_rnd_beamer_chk is not None:
+            self._refresh_rnd_beamer()
+        else:
+            self._send_beamer(self._beamer_baseline_cmd())
+
+    def _update_beamer_mode_visibility(self):
+        """Show the background controls only when the arena is actually lit, and note
+        on the region panels when the sphere's own colour has no effect."""
+        lit = self._beamer_mode() in self._BEAMER_LIT_MODES
+        self._beamer_bg_w.setVisible(lit)
+        self._update_contrast_warning()
+
+        # In shadow mode the target is a hole punched in the field, so its colour and
+        # brightness are not used — grey them out rather than let them look live.
+        shadow = self._beamer_mode() == "shadow"
+        for bright, btn, note in (
+                (self._iti_reg_bright, self._iti_reg_color_btn, self._iti_reg_sphere_note),
+                (self._iti_rnd_bright, self._iti_rnd_color_btn, self._iti_rnd_sphere_note)):
+            if bright is not None:
+                bright.setEnabled(not shadow)
+            if btn is not None:
+                btn.setEnabled(not shadow)
+            if note is not None:
+                note.setVisible(shadow)
+
+    def _update_contrast_warning(self):
+        """Warn when a lit_background sphere would be invisible.
+
+        The projector is additive: the sphere is drawn *on top of* the lit field, so
+        it only reads as a target if it is brighter than the field behind it. This is
+        a live hint, not a save block — the rig, the floor and the camera decide what
+        "visible enough" means, and only the experimenter can judge that.
+        """
+        if self._beamer_mode() != "lit_background":
+            self._beamer_contrast_lbl.setVisible(False)
+            return
+        self._beamer_contrast_lbl.setVisible(True)
+        bg = self._luminance(self._bg_eff_color())
+        # Whichever region menu is up owns the sphere; with none built (fixed-time
+        # ITI) there is no sphere to compare against.
+        sphere = None
+        if self._iti_reg_bright is not None:
+            sphere = self._eff_color(self._reg_color, self._iti_reg_bright)
+        elif self._iti_rnd_bright is not None:
+            sphere = self._eff_color(self._rnd_color, self._iti_rnd_bright)
+        if sphere is None:
+            self._beamer_contrast_lbl.setText(
+                "This ITI projects no sphere — the arena is simply lit for the "
+                "whole session.")
+            self._beamer_contrast_lbl.setStyleSheet("color:#aaa; font-size:10px;")
+            return
+        sph = self._luminance(sphere)
+        if sph <= bg:
+            self._beamer_contrast_lbl.setText(
+                "⚠  The sphere is no brighter than the background — it will be "
+                "invisible. Lower the background brightness or raise the sphere's.")
+            self._beamer_contrast_lbl.setStyleSheet("color:#e06c00; font-size:10px;")
+        else:
+            self._beamer_contrast_lbl.setText(
+                f"✓  Sphere out-shines the background ({sph:.0f} vs {bg:.0f} of 255).")
+            self._beamer_contrast_lbl.setStyleSheet("color:#aaa; font-size:10px;")
+
+    @staticmethod
+    def _luminance(rgb) -> float:
+        """Perceived brightness of an [r, g, b] triple (Rec. 709), 0–255."""
+        return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+
+    @staticmethod
+    def _sphere_appearance_note() -> QtWidgets.QLabel:
+        """The 'sphere colour is unused in shadow mode' hint, shown on both regions."""
+        note = QtWidgets.QLabel(
+            "In Shadow mode the target is a hole in the lit field, so its colour and "
+            "brightness are not used — set the field in the Beamer section instead.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#777; font-size:9px;")
+        return note
 
     @staticmethod
     def _eff_color(base: QtGui.QColor, bright: QtWidgets.QSlider | None) -> list:
@@ -1673,8 +1838,9 @@ class ProtocolPage(QtWidgets.QWidget):
             "x_cm":        self._iti_reg_x_spin.value(),
             "y_cm":        self._iti_reg_y_spin.value(),
             "diameter_cm": self._iti_reg_diam_spin.value(),
-            "shadow":      self._reg_shadow_on(),
+            "mode":        self._beamer_mode(),
             "color":       self._eff_color(self._reg_color, self._iti_reg_bright),
+            "field_color": self._bg_eff_color(),
         })
 
     def _project_rnd_sphere(self):
@@ -1688,8 +1854,9 @@ class ProtocolPage(QtWidgets.QWidget):
             "x_cm":        0.0,
             "y_cm":        0.0,
             "diameter_cm": self._iti_rnd_diam_spin.value(),
-            "shadow":      self._rnd_shadow_on(),
+            "mode":        self._beamer_mode(),
             "color":       self._eff_color(self._rnd_color, self._iti_rnd_bright),
+            "field_color": self._bg_eff_color(),
         })
 
     def _refresh_rnd_beamer(self, *_):
@@ -1698,10 +1865,13 @@ class ProtocolPage(QtWidgets.QWidget):
         if self._iti_rnd_beamer_chk and self._iti_rnd_beamer_chk.isChecked():
             self._project_rnd_sphere()
         else:
-            self._send_beamer({"cmd": "clear"})
+            # Not "clear": in a lit mode the field is what a session shows between
+            # targets, so the preview has to fall back to it rather than go dark.
+            self._send_beamer(self._beamer_baseline_cmd())
 
     def _reg_live(self, *_):
         self._emit_overlay()
+        self._update_contrast_warning()   # sphere brightness feeds the contrast check
         if self._iti_reg_beamer_chk and self._iti_reg_beamer_chk.isChecked():
             self._project_reg_sphere()
 
@@ -1709,7 +1879,7 @@ class ProtocolPage(QtWidgets.QWidget):
         if on:
             self._project_reg_sphere()
         else:
-            self._send_beamer({"cmd": "clear"})
+            self._send_beamer(self._beamer_baseline_cmd())
 
     def _pick_reg_color(self):
         c = QtWidgets.QColorDialog.getColor(self._reg_color, self, "Sphere colour")
@@ -1721,6 +1891,7 @@ class ProtocolPage(QtWidgets.QWidget):
 
     def _rnd_live(self, *_):
         self._emit_overlay()
+        self._update_contrast_warning()   # sphere brightness feeds the contrast check
         self._refresh_rnd_beamer()
 
     def _pick_rnd_color(self):
@@ -1821,9 +1992,6 @@ class ProtocolPage(QtWidgets.QWidget):
         def _color(c):
             return [c.red(), c.green(), c.blue()]
 
-        def _chk(box, fallback):
-            return bool(box.isChecked()) if box is not None else bool(fallback)
-
         iti = {
             "type":      {"Fixed time": "time",
                           "Fixed region": "fixed_region",
@@ -1835,7 +2003,6 @@ class ProtocolPage(QtWidgets.QWidget):
                 "diameter_cm": _get(self._iti_reg_diam_spin, 6.0),
                 "brightness":  _bright(self._iti_reg_bright),
                 "color":       _color(self._reg_color),
-                "shadow":      _chk(self._iti_reg_shadow_chk, self._reg_shadow),
                 "duration_type": ("fixed" if (self._iti_reg_dur_type is None or
                                               self._iti_reg_dur_type.currentText()
                                               == self._DWELL_LABELS[0])
@@ -1847,7 +2014,6 @@ class ProtocolPage(QtWidgets.QWidget):
                 "diameter_cm":   _get(self._iti_rnd_diam_spin, 6.0),
                 "brightness":    _bright(self._iti_rnd_bright),
                 "color":         _color(self._rnd_color),
-                "shadow":        _chk(self._iti_rnd_shadow_chk, self._rnd_shadow),
                 "margin_x_cm":      _get(self._iti_rnd_margin_x_spin, 0.0),
                 "margin_y_cm":      _get(self._iti_rnd_margin_y_spin, 0.0),
                 "margin_radius_cm": _get(self._iti_rnd_margin_radius_spin, 10.0),
@@ -1858,6 +2024,15 @@ class ProtocolPage(QtWidgets.QWidget):
                 "duration_s":     _get(self._iti_rnd_dur_spin, 2.0),
                 "duration_max_s": _get(self._iti_rnd_dur_max_spin, 3.0),
             },
+        }
+
+        # ── Beamer ────────────────────────────────────────────────
+        # The background is written whatever the mode, so switching to Light and back
+        # never loses the field settings.
+        beamer = {
+            "mode":                  self._beamer_mode(),
+            "background_color":      _color(self._bg_color),
+            "background_brightness": _bright(self._beamer_bg_bright, 30),
         }
 
         # ── Screens ───────────────────────────────────────────────
@@ -1937,6 +2112,7 @@ class ProtocolPage(QtWidgets.QWidget):
                 for key, w in self._sound_w.items()
             },
             "intertrial": iti,
+            "beamer": beamer,
             "screens": screens,
             "bnc": bnc,
         }
@@ -1979,11 +2155,14 @@ class ProtocolPage(QtWidgets.QWidget):
         `is not None` widget guards below are a different thing: they test whether
         the sub-widgets for the *selected* ITI type currently exist.
         """
-        # Probe before touching a single widget. This method applies top-down, so a
-        # KeyError partway through used to leave the editor holding a mix of the old
-        # and the new protocol which the user could then Save. Harmless while it was
-        # theoretical; every protocol written before rewards became volumes hits it.
+        # Probed before touching any widget: this method applies top-down, so a
+        # KeyError partway through would otherwise leave the editor holding a mix
+        # of the old and new protocol, which the user could then save.
         self._require_volumes(d)
+        # Unlike volumes, the beamer block *can* be derived from what it replaced, so
+        # older files are upgraded here rather than rejected — also before any
+        # widget is touched, for the same reason.
+        normalise_protocol_beamer(d)
 
         # ── Session ──────────────────────────────────────────────
         sess = d["session"]
@@ -2131,17 +2310,30 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_type_combo.setCurrentText(_iti_label)
         self._iti_type_combo.blockSignals(False)
 
-        # Colour and shadow state persist independently of which region widgets
-        # exist, so a save→load round-trip keeps both regions' settings. These must
-        # be assigned before _rebuild_iti_section, which seeds the widgets from them.
+        # Sphere colours persist independently of which region widgets exist, so a
+        # save→load round-trip keeps both regions' settings. These must be assigned
+        # before _rebuild_iti_section, which seeds the widgets from them.
         reg = iti["region"]
         rnd = iti["random_region"]
         rc = reg["color"]
         nc = rnd["color"]
         self._reg_color = QtGui.QColor(int(rc[0]), int(rc[1]), int(rc[2]))
         self._rnd_color = QtGui.QColor(int(nc[0]), int(nc[1]), int(nc[2]))
-        self._reg_shadow = bool(reg["shadow"])
-        self._rnd_shadow = bool(rnd["shadow"])
+
+        # ── Beamer ───────────────────────────────────────────────
+        # Applied before the ITI rebuild too: the rebuild's tail projects the current
+        # baseline and greys the sphere controls per mode, both of which read these.
+        beamer = d["beamer"]
+        bc = beamer["background_color"]
+        self._bg_color = QtGui.QColor(int(bc[0]), int(bc[1]), int(bc[2]))
+        self._update_swatch(self._beamer_bg_color_btn, self._bg_color)
+        self._beamer_bg_bright.blockSignals(True)
+        self._beamer_bg_bright.setValue(int(beamer["background_brightness"]))
+        self._beamer_bg_bright.blockSignals(False)
+        self._beamer_mode_combo.blockSignals(True)
+        self._beamer_mode_combo.setCurrentText(
+            self._BEAMER_MODE_LABELS[beamer["mode"]])
+        self._beamer_mode_combo.blockSignals(False)
 
         self._rebuild_iti_section()   # builds sub-widgets for the selected type
 
@@ -2154,7 +2346,6 @@ class ProtocolPage(QtWidgets.QWidget):
             self._iti_reg_diam_spin.setValue(float(reg["diameter_cm"]))
             self._iti_reg_bright.setValue(int(reg["brightness"]))
             self._update_swatch(self._iti_reg_color_btn, self._reg_color)
-            self._iti_reg_shadow_chk.setChecked(self._reg_shadow)
             self._iti_reg_dur_type.setCurrentText(
                 self._DWELL_LABELS[0] if reg["duration_type"] == "fixed"
                 else self._DWELL_LABELS[1])
@@ -2165,7 +2356,6 @@ class ProtocolPage(QtWidgets.QWidget):
             self._iti_rnd_diam_spin.setValue(float(rnd["diameter_cm"]))
             self._iti_rnd_bright.setValue(int(rnd["brightness"]))
             self._update_swatch(self._iti_rnd_color_btn, self._rnd_color)
-            self._iti_rnd_shadow_chk.setChecked(self._rnd_shadow)
             self._iti_rnd_margin_x_spin.setValue(float(rnd["margin_x_cm"]))
             self._iti_rnd_margin_y_spin.setValue(float(rnd["margin_y_cm"]))
             self._iti_rnd_margin_radius_spin.setValue(float(rnd["margin_radius_cm"]))
@@ -2175,6 +2365,9 @@ class ProtocolPage(QtWidgets.QWidget):
             self._iti_rnd_dur_spin.setValue(float(rnd["duration_s"]))
             self._iti_rnd_dur_max_spin.setValue(float(rnd["duration_max_s"]))
             self._update_iti_dur_visibility()
+        # Re-run now that the sphere brightnesses are in: _rebuild_iti_section's own
+        # call ran against the widgets' construction defaults.
+        self._update_beamer_mode_visibility()
         self._emit_overlay()
 
     # ── File operations ───────────────────────────────────────────────────────

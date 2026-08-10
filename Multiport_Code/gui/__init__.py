@@ -1,3 +1,4 @@
+"""Re-exports the GUI widgets/pages so callers can `from gui import X`."""
 from .camera_widget import CameraWidget
 from .sensor_widget import SensorWidget
 from .cleaning_page import CleaningPage

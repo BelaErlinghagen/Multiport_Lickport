@@ -1,33 +1,30 @@
-"""camera_calibration.py — the tracking camera's fisheye lens correction.
+"""The tracking camera's fisheye lens correction.
 
-The arena camera looks through a fisheye lens, so a straight line in the arena is a
-curve in the image and a centimetre near the wall covers fewer pixels than one in the
-middle. Everything geometric downstream assumes the opposite: BeamerCalibration maps
-camera coordinates to beamer pixels with a 3-point *affine*, and the state machine's
-ITI dwell test asks "is the mouse inside the projected target" through that mapping.
-Uncorrected, that behavioural criterion is wrong by an amount that depends on where in
-the arena the mouse happens to be — the worst kind of error, because it looks like data.
+The arena camera's fisheye lens distorts straight lines into curves and
+compresses distances near the edges of the frame, which throws off anything
+that maps camera coordinates onto real positions — notably BeamerCalibration
+and the state machine's "is the mouse inside the target" test. This module
+corrects for that.
 
-The correction is applied to the *image*, once, in the camera process, fused into the
-crop that was happening there anyway (see camera_controls.run). Everything that reads a
-frame — DeepLabCut, the MP4, the live preview, and therefore every pose coordinate —
-lives in the same corrected space, so nothing downstream needs to know this module
-exists and no two consumers can drift apart.
+The correction is applied to the image once, in the camera process, fused
+into the crop that already happens there (see camera_controls.py). DeepLabCut,
+the saved video, the live preview, and every pose coordinate downstream all
+read the corrected frame, so nothing else needs to know this module exists.
 
-Calibration is measured against the beamer's own projected dots rather than a printed
-checkerboard: the projection disc is larger than the camera's view of it, so dots can be
-placed across the whole frame including the corners (the wizard on the Cleaning/Testing
-tab). The price of needing no target is that the projector's own (small) lens distortion
-and any unevenness of the arena floor fold into the estimate — which is why every fit
-stores the raw point pairs it came from, so it can be re-solved, and audited, later.
+Calibrated using the beamer's own projected dots rather than a printed
+checkerboard: the projection disc is bigger than the camera's view of it, so
+dots can reach the frame corners (see the wizard on the Cleaning/Testing tab).
+The trade-off is that the projector's own lens distortion and any floor
+unevenness fold into the fit — which is why every saved calibration keeps its
+raw point pairs, so it can be re-solved or audited later.
 
-K and D are always stored in **full-sensor** coordinates, never in cropped ones. The
-crop is a user setting (shared_states.DLC_CROP) and moving it must not silently
-invalidate a calibration — the cropped/virtual camera matrix is derived at load time.
+K/D (lens intrinsics/distortion) are always stored in full-sensor
+coordinates, never cropped ones, so changing shared_states.DLC_CROP can't
+silently invalidate a calibration.
 
-Like PumpCalibration and BeamerCalibration, this class never raises and never blocks
-startup: a missing or unreadable file leaves is_calibrated False, the camera process
-falls back to the plain crop, and the rig still runs.
+Like PumpCalibration and BeamerCalibration, this never raises or blocks
+startup: a missing/unreadable file just leaves is_calibrated False and the
+camera process falls back to a plain crop.
 """
 
 import json
@@ -39,11 +36,10 @@ import numpy as np
 
 import shared_states
 
-# The two distortion models we fit. "fisheye" is OpenCV's equidistant model
-# (cv2.fisheye, coefficients k1..k4), "radial" the standard plumb-bob polynomial
-# (cv2.calibrateCamera, k1,k2,p1,p2,k3). Which one wins depends on the lens, so both
-# are fitted and the better RMS is kept — a moderate wide angle is often described
-# better by the polynomial, a true fisheye almost never is.
+# The two distortion models fit_planar() tries: "fisheye" is OpenCV's
+# equidistant model (cv2.fisheye), "radial" the standard plumb-bob polynomial
+# (cv2.calibrateCamera). Both are fit and the better RMS is kept, since which
+# one suits a given lens isn't known ahead of time.
 MODEL_FISHEYE = "fisheye"
 MODEL_RADIAL = "radial"
 
@@ -67,12 +63,11 @@ class CameraCalibration:
     # ── Loading ───────────────────────────────────────────────────────────────
 
     def reload(self, force=False):
-        """Re-read the calibration JSON. Keeps the rig running on any failure.
+        """Re-read the calibration JSON; keeps the rig running on any failure.
 
-        Cheap to call repeatedly: unless *force*, it returns immediately when the
-        file's mtime has not moved, so the camera process can poll for a wizard run
-        without re-parsing. Any successful read invalidates the cached maps, since
-        they were built from the coefficients that just changed.
+        Cheap to call repeatedly: skips re-parsing unless *force* or the
+        file's mtime changed, so the camera process can poll for a wizard
+        run. Invalidates the cached remap tables on any successful read.
         """
         try:
             mtime = os.path.getmtime(self.path)
@@ -120,9 +115,8 @@ class CameraCalibration:
         rms = data.get("rms_px")
         self.rms_px = float(rms) if rms is not None else None
 
-        # A calibration measured on a different sensor resolution describes different
-        # pixels. Loud, but not fatal: the numbers are still self-consistent, they
-        # just no longer match what the camera is delivering.
+        # A calibration for a different sensor resolution no longer matches
+        # what the camera delivers. Warn loudly, but don't refuse to run.
         if (w, h) != (int(shared_states.IMG_WIDTH), int(shared_states.IMG_HEIGHT)):
             print(f"[CameraCalibration] WARNING: calibrated for {w}×{h} but the camera "
                   f"is configured as {shared_states.IMG_WIDTH}×{shared_states.IMG_HEIGHT}"
@@ -144,19 +138,17 @@ class CameraCalibration:
     # ── Virtual (undistorted) camera ──────────────────────────────────────────
 
     def virtual_matrix(self, crop, zoom=None):
-        """The pinhole matrix the corrected image is rendered through.
+        """The pinhole camera matrix the corrected image is rendered through.
 
-        Focal length is scaled by *zoom* about the optical centre, and the principal
-        point is shifted into crop coordinates, so the corrected frame keeps the same
-        centre and (at zoom 1) the same scale at the centre as the raw one. Anything
-        else would change the arena's apparent size and quietly invalidate the beamer
-        calibration's px/cm every time this file is touched.
+        Scales focal length by *zoom* about the optical centre and shifts the
+        principal point into crop coordinates, so at zoom=1 the corrected
+        frame keeps the same centre and scale as the raw one — changing that
+        would quietly invalidate the beamer calibration's px/cm.
 
-        Straightening barrel distortion pushes the periphery *outward*, so at zoom 1
-        the corners of the raw view fall outside the frame and are lost. zoom < 1
-        shrinks the corrected image until they fit (at the cost of black borders and
-        a smaller arena on screen); zoom > 1 magnifies further. fit_zoom() computes
-        the value that keeps everything.
+        Undistorting pushes the periphery outward, so at zoom=1 the corners
+        of the raw view fall outside the frame. zoom<1 shrinks the result to
+        fit them back in (with black borders); fit_zoom() computes the value
+        that keeps everything.
         """
         y0, _y1, x0, _x1 = crop
         z = float(shared_states.undistort_zoom if zoom is None else zoom) or 1.0
@@ -168,16 +160,13 @@ class CameraCalibration:
         return P
 
     def fit_zoom(self, crop, margin=0.995):
-        """The zoom at which the whole raw crop still fits in the corrected frame.
+        """Return the zoom at which the whole raw crop still fits in the
+        corrected frame, for the wizard to report and the operator to copy
+        into shared_states.undistort_zoom.
 
-        Rectifying barrel distortion moves the periphery outward, so at zoom 1 the
-        edges of the raw view are pushed off the frame — 20-odd percent of the field
-        for a strong fisheye. This returns the scale that pulls all of it back in, for
-        the wizard to report and the operator to put in shared_states.undistort_zoom.
-
-        Exact rather than searched: the virtual matrix scales offsets from the
-        principal point linearly, so a corrected point sits at P + zoom·(p₁ − P) and
-        the limiting zoom is a min over the border samples.
+        Computed exactly, not searched: the virtual matrix scales offsets
+        from the principal point linearly, so the limiting zoom is just a
+        min over sampled border points.
         """
         if not self.is_calibrated:
             return 1.0
@@ -220,19 +209,15 @@ class CameraCalibration:
                 f"to keep all of it")
 
     def build_maps(self, crop, zoom=None):
-        """Remap tables that crop *and* undistort in one pass, or None if uncalibrated.
+        """Remap tables that crop and undistort in one pass, or None if uncalibrated.
 
-        The maps are the size of the crop but index into the **full** sensor frame.
-        Two reasons: cv2.remap's cost is set by the *output* size, so reading from the
-        4K frame is free (measured at 11.1 ms single-threaded either way), and the
-        maps are then free to sample outside the crop rectangle. Barrel distortion
-        mostly reads inward so that rarely happens at zoom 1 — but at the zoom that
-        keeps the full field (fit_zoom) it does, and cropping first would have thrown
-        those pixels away before the remap could ask for them.
+        The maps are crop-sized but index into the full sensor frame — free,
+        since cv2.remap's cost depends on output size, not input — and this
+        lets the remap sample pixels just outside the crop rectangle, which
+        matters at zoom levels that pull the full field back in (see fit_zoom).
 
-        CV_16SC2 (fixed-point) rather than float maps: half the memory traffic per
-        frame for a quarter-pixel interpolation grid, which is far below the accuracy
-        of anything this feeds.
+        Uses CV_16SC2 (fixed-point) maps rather than float ones: half the
+        memory traffic for interpolation precision well beyond what this needs.
         """
         if not self.is_calibrated:
             return None
@@ -253,12 +238,12 @@ class CameraCalibration:
         return maps
 
     def preview_maps(self, crop, preview_shape, zoom=None):
-        """Maps that rectify the GUI's downsampled preview, for a before/after view.
+        """Remap tables that rectify the GUI's downsampled preview, for a
+        before/after view. Only the wizard needs this — the live pipeline
+        always rectifies the full frame via build_maps().
 
-        The preview is a strided subsample of the crop, so its intrinsics are the
-        crop's divided by that stride — the standard way to carry a calibration to a
-        resized image (the distortion coefficients are dimensionless and unchanged).
-        Only the wizard needs this; the live pipeline rectifies the full frame.
+        Scales the crop's intrinsics by the preview's stride, since the
+        distortion coefficients themselves are resolution-independent.
         """
         if not self.is_calibrated:
             return None
@@ -283,11 +268,11 @@ class CameraCalibration:
     # ── Point transforms ──────────────────────────────────────────────────────
 
     def undistort_points(self, pts, crop):
-        """Raw crop-pixel coordinates → corrected crop-pixel coordinates.
+        """Raw crop-pixel coordinates -> corrected crop-pixel coordinates.
 
-        The live pipeline does not need this (it corrects whole frames), but anything
-        re-reading a *raw* recording does — and so does the wizard, which measures dots
-        on uncorrected frames.
+        The live pipeline corrects whole frames and doesn't need this; it's
+        for re-reading raw recordings and for the wizard, which measures
+        calibration dots on uncorrected frames.
         """
         p = np.asarray(pts, dtype=np.float64).reshape(-1, 1, 2)
         if not self.is_calibrated or len(p) == 0:
@@ -302,11 +287,9 @@ class CameraCalibration:
         return out.reshape(-1, 2)
 
     def distort_points(self, pts, crop):
-        """Corrected crop-pixel coordinates → raw crop-pixel coordinates.
-
-        The inverse of undistort_points, for drawing a corrected-space overlay onto a
-        raw frame (the wizard's before/after view).
-        """
+        """Inverse of undistort_points: corrected crop-pixel coordinates ->
+        raw crop-pixel coordinates. Used to draw a corrected-space overlay
+        onto a raw frame (the wizard's before/after view)."""
         p = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
         if not self.is_calibrated or len(p) == 0:
             return p
@@ -329,13 +312,11 @@ class CameraCalibration:
     # ── Writing ───────────────────────────────────────────────────────────────
 
     def save(self, fit, method, raw=None, crop=None):
-        """Write a fit (as returned by fit_planar/fit_checkerboard) to disk.
+        """Write a fit (as returned by fit_planar) to disk.
 
-        *raw* is the measurement data the fit came from — the projected and observed
-        point pairs. It is stored alongside the derived coefficients for the same
-        reason pump_calibration keeps its weigh-ins: a stored result with no way to
-        see what produced it cannot be sanity-checked afterwards, and with the pairs
-        on disk the fit can be redone without putting the rig back in that state.
+        *raw* — the point pairs the fit came from — is stored alongside the
+        derived coefficients, like pump_calibration keeps its weigh-ins, so
+        the fit can be audited or redone later without repeating the capture.
         """
         data = {
             "model":        fit["model"],
@@ -361,13 +342,13 @@ class CameraCalibration:
 # ── Preview geometry ───────────────────────────────────────────────────────────
 
 def preview_step(crop, preview_shape):
-    """(step_x, step_y) between the GUI preview and the cropped frame.
+    """Return (step_x, step_y) between the GUI preview and the cropped frame.
 
-    Mirrors camera_controls' downsample exactly — it strides (`[::step]`), it does
-    not resample, so preview pixel j is crop pixel step·j and nothing in between.
-    Anything converting a preview coordinate back to a sensor pixel (the wizard
-    measuring projected dots) has to use the same integer step or it acquires a
-    half-pixel-per-stride bias that grows across the frame.
+    Matches camera_controls.py's downsampling exactly (`[::step]`, a stride,
+    not a resample), so preview pixel j is crop pixel step*j. Anything
+    converting a preview coordinate back to a sensor pixel — e.g. the wizard
+    reading projected dots — must use this same step or drift accumulates
+    across the frame.
     """
     y0, y1, x0, x1 = crop
     ph, pw = preview_shape[:2]
@@ -395,12 +376,11 @@ def _reprojection_rms(obj, img, K, D, rvec, tvec, model):
 
 
 def _fit_single_view(obj_cm, img_px, image_size, model, focal):
-    """Fit distortion for one planar view at a *fixed* focal length.
+    """Fit distortion for one planar view at a fixed focal length.
 
-    Returns (rms, K, D) or None. Everything but the distortion coefficients and the
-    board pose is held fixed: one view of one plane cannot separate focal length,
-    distance and distortion, so pinning f is what makes the problem well posed. The
-    caller sweeps f and keeps the best.
+    Returns (rms, K, D) or None. Focal length is pinned because a single
+    planar view can't separate focal length, distance, and distortion from
+    each other; the caller (fit_planar) sweeps focal length and keeps the best.
     """
     w, h = image_size
     K = np.array([[focal, 0.0, w / 2.0],
@@ -441,19 +421,18 @@ def _fit_single_view(obj_cm, img_px, image_size, model, focal):
 
 def fit_planar(obj_cm, img_px, image_size, models=(MODEL_FISHEYE, MODEL_RADIAL),
                progress=None):
-    """Fit lens distortion from ONE planar view — the beamer-projected dot grid.
+    """Fit lens distortion from ONE planar view (the beamer-projected dot grid).
 
-    *obj_cm* is (N,2) positions on the arena floor in cm, *img_px* the (N,2) pixel
+    obj_cm is (N,2) arena-floor positions in cm; img_px the (N,2) pixel
     positions they were observed at, in full-sensor coordinates.
 
-    Focal length and distortion trade off against each other in a single view (a
-    longer lens further away looks much like a shorter one closer up), so f is swept
-    — coarsely over a wide geometric range, then finely around the winner — and the
-    lowest reprojection error wins. Both distortion models are tried; the one that
-    describes this lens better is returned and the other is reported as `rejected` so
-    the margin between them is visible.
+    A single view can't separate focal length from distortion (a longer lens
+    further away looks like a shorter one closer up), so focal length is
+    swept — coarse then fine around the best result — for both distortion
+    models, and the better-fitting model is returned. The other is reported
+    under "rejected" so the margin between them is visible.
 
-    Returns a dict {model, K, D, rms_px, focal, rejected} or None if nothing fitted.
+    Returns {model, K, D, rms_px, focal, rejected}, or None if nothing fit.
     """
     obj_cm = np.asarray(obj_cm, dtype=np.float64).reshape(-1, 2)
     img_px = np.asarray(img_px, dtype=np.float64).reshape(-1, 2)
@@ -474,8 +453,8 @@ def fit_planar(obj_cm, img_px, image_size, models=(MODEL_FISHEYE, MODEL_RADIAL),
                 progress(model, i + 1, len(coarse))
         if best is None:
             continue
-        # Refine around the coarse winner: the sweep's own spacing is the dominant
-        # error left in f at this point.
+        # Refine around the coarse winner — the sweep's own spacing is now
+        # the dominant source of error in f.
         span = best[3] * 0.35
         for f in np.linspace(max(1.0, best[3] - span), best[3] + span, 21):
             got = _fit_single_view(obj3, img_px, image_size, model, float(f))

@@ -1,3 +1,8 @@
+"""Serial communication with the two Arduinos (PortMaster boards): sends
+LED/pump/BNC commands and reads back which lickports are active. See
+SerialControls for the connection itself, and sensor_process() below for how
+it runs as a standalone process that drains commands from the GUI/state
+machine and mirrors them into hardware_state for the session CSV."""
 import serial
 import time
 import shared_states
@@ -6,22 +11,21 @@ import queue
 
 
 class _ActuatorTracker:
-    """Mirror the outbound command stream into shared_states-style live state.
+    """Mirrors the outbound command stream into hardware_state.HardwareState.
 
-    Every LED / pump / BNC command — from the state machine *and* from the Cleaning
-    tab — passes through the one command_queue this process drains, so parsing them
-    here is the single place that sees all of them.
+    Every LED/pump/BNC command — from the state machine and the Cleaning tab
+    alike — passes through the one command_queue this process drains, so this
+    is the single place that sees all of them.
 
-    LEDs are levels (ON/OFF) and need no bookkeeping. Pumps and BNCs are *pulses*
-    ("MOS:3:ON:500", "BNC:1:PULSE:5") with a duration and no matching off command,
-    so their bit is latched here and expired by sweep() as the loop runs.
+    LEDs are simple on/off levels. Pumps and BNCs are pulses ("MOS:3:ON:500")
+    with a duration and no matching off command, so their bit is latched here
+    and later cleared by sweep().
     """
 
-    # A BNC pulse can be 5 ms, far shorter than the 50 ms CSV sampling period, so a
-    # pulse could fire and expire entirely between two rows and never be recorded.
-    # Holding every latch for at least one sample period guarantees it shows up in
-    # one row. It widens sub-60 ms pulses in the log, which is the accepted trade:
-    # the CSV answers "when was this line active", not "what were the exact edges".
+    # A pulse can be shorter than the 50 ms CSV sampling period (a BNC pulse
+    # can be 5 ms) and vanish between two rows if not held open. Latching
+    # every pulse for at least one sample period guarantees it's recorded, at
+    # the cost of widening short pulses in the log.
     _MIN_LATCH_S = 0.06
 
     def __init__(self, hw):
@@ -75,24 +79,51 @@ class _ActuatorTracker:
 
 
 class SerialControls:
-    # Protocol BNC id → (board index, board-local BNC id 1-2).
-    # The BNCs are NOT lickports. The lookup tables map the 16 lickports onto the
-    # two boards' 8 channels each; running a BNC id through them turned BNC:2 into
-    # BNC:4 and BNC:4 into BNC:8, both rejected by the firmware, which only knows
-    # ids 1-2. So BNC gets its own straight-through table.
+    """Owns the two serial connections to the Arduinos: a reader thread per
+    board decodes STATUS lines into active lickport ids, and one writer
+    thread drains a queue of outbound LED/pump/BNC commands. See
+    sensor_process() below for how this runs as its own process."""
+
+    # Maps protocol BNC id -> (board index, board-local BNC id 1-2). Kept
+    # separate from the lickport lookup_tables: BNCs aren't lickports, and
+    # routing a BNC id through those tables maps it onto an invalid channel
+    # that the firmware rejects.
     _BNC_MAP = {1: (0, 2), 2: (0, 1), 3: (1, 2), 4: (1, 1)}
+
+    # A board whose USB bridge has crashed still enumerates and still opens, but
+    # never drains its bulk OUT endpoint. Without a write timeout pyserial blocks
+    # forever there, and since one writer thread serves both boards that would
+    # stop every LED/pump/BNC command on the rig, not just the dead board's.
+    _WRITE_TIMEOUT_S = 0.5
+
+    # After this many consecutive write timeouts a board is declared dead and
+    # skipped, so the writer keeps serving the healthy board at full speed
+    # instead of stalling _WRITE_TIMEOUT_S on every command addressed to it.
+    _MAX_WRITE_FAILURES = 3
+
+    # Opening the port asserts DTR, which resets the board into its bootloader
+    # for roughly two seconds. Commands sent during that window are swallowed
+    # silently, so wait for each board's first STATUS line before returning.
+    _READY_TIMEOUT_S = 6.0
 
     def __init__(self, baudrate = 115200, verbose = None):
         print("Initializing Serial Communication.")
-        self.serial_arduino1 = serial.Serial(shared_states.serial_ports[0], baudrate, timeout = 1)
-        self.serial_arduino2 = serial.Serial(shared_states.serial_ports[1], baudrate, timeout = 1)
+        self.serial_arduino1 = serial.Serial(shared_states.serial_ports[0], baudrate,
+                                             timeout=1, write_timeout=self._WRITE_TIMEOUT_S)
+        self.serial_arduino2 = serial.Serial(shared_states.serial_ports[1], baudrate,
+                                             timeout=1, write_timeout=self._WRITE_TIMEOUT_S)
         print("[INFO] Serial connections initialized.")
 
-        # Per-command tracing. Off by default — see shared_states.serial_verbose.
+        # Consecutive write failures per port, and whether we've already said so.
+        self._write_failures = {}
+        self._reported_dead  = set()
+
+        # Per-command tracing, off by default — see shared_states.serial_verbose.
         self.verbose = (bool(getattr(shared_states, "serial_verbose", False))
                         if verbose is None else bool(verbose))
 
         self.latest_active_pins = {0:[], 1:[]}
+        self._seen_status = {0: False, 1: False}   # has this board ever reported?
 
         self.write_queue = queue.Queue()
         self.running = True
@@ -100,11 +131,11 @@ class SerialControls:
 
         self.reader_arduino1 = threading.Thread(
             target=self._reader_loop,
-            args=(self.serial_arduino1, 0), 
+            args=(self.serial_arduino1, 0),
             daemon=True)
         self.reader_arduino2 = threading.Thread(
             target=self._reader_loop,
-            args=(self.serial_arduino2, 1), 
+            args=(self.serial_arduino2, 1),
             daemon=True)
 
         self.writer_thread = threading.Thread(
@@ -115,16 +146,38 @@ class SerialControls:
         self.reader_arduino1.start()
         self.reader_arduino2.start()
         self.writer_thread.start()
-    
+
+        self.wait_until_ready()
+
+    def wait_until_ready(self, timeout=None):
+        """Block until both boards report in, and say which ones didn't.
+
+        A board that never reports is either running no sketch or has a crashed
+        USB bridge. Either way its LEDs/pumps/BNCs are dead, and saying so at
+        start-up beats discovering it mid-session.
+        """
+        deadline = time.monotonic() + (self._READY_TIMEOUT_S if timeout is None else timeout)
+        while time.monotonic() < deadline and not all(self._seen_status.values()):
+            time.sleep(0.05)
+
+        for index, seen in sorted(self._seen_status.items()):
+            port = shared_states.serial_ports[index]
+            if seen:
+                print(f"[INFO] Arduino {index + 1} ready on {port}.")
+            else:
+                ports = "1-8" if index == 0 else "9-16"
+                print(f"[ERROR] Arduino {index + 1} on {port} sent no data within "
+                      f"{self._READY_TIMEOUT_S:.0f} s. Lickports {ports} (LEDs, pumps, "
+                      f"lick sensors) and its two BNC outputs will not work. Unplug "
+                      f"and replug that board's USB cable, then restart.")
+        return all(self._seen_status.values())
+
     def _serial_object_mapping(self, kind, input_id):
         """Return (serial object, board-local id) for one command.
 
-        *kind* is the command's first field ("LED" / "MOS" / "BNC").
-
-        BNC ids 1-4 address the four connectors directly (1-2 on Arduino 1, 3-4 on
-        Arduino 2). LED and MOS ids are global lickport numbers 1-16 and go through
-        the lookup tables, which say which board carries a port and what its local
-        1-8 channel is.
+        BNC ids (1-4) map straight through _BNC_MAP. LED/MOS ids are global
+        lickport numbers (1-16) and go through shared_states.lookup_tables to
+        find which board carries that port and its board-local channel.
         """
         input_id = int(input_id)
 
@@ -143,70 +196,104 @@ class SerialControls:
                 return serial_object, local_id
         raise ValueError(f"{kind} id {input_id} is not in the lookup tables")
 
-    
+
     def _reader_loop(self, serial_object, arduino_index):
-        """Runs in a separate thread: constantly listens for data"""
+        """Runs in a separate thread: parses this Arduino's STATUS lines into
+        the set of currently active lickport ids (self.latest_active_pins)."""
         if serial_object is None:
             return
         while self.running:
-            if serial_object.in_waiting > 0:
-                try:
+            try:
+                if serial_object.in_waiting > 0:
                     line = serial_object.readline().decode('utf-8', errors='ignore').strip()
                     if line.startswith("STATUS:"):
                         parts = line.split(":")
                         if len(parts) >= 3:
                             active_pins_str = parts[2]
-                            
-                            # Parse pins (handle "0" for no pins)
+
+                            # "0" means no pins are active
                             current_pins = []
                             if active_pins_str != "0":
                                 current_pins = [shared_states.lookup_tables[arduino_index][int(p)] for p in active_pins_str.split(",") if p.isdigit()]
-                            
-                            
-                            # Update shared state atomically
+
+
                             with self.lock:
                                 self.latest_active_pins[arduino_index] = current_pins
-                            
+                            self._seen_status[arduino_index] = True
+
                     time.sleep(0.005)
-                                
-                except Exception as e:
-                    print(f"[READ ERROR on Arduino {arduino_index}] {e}")
-                    pass
+                else:
+                    time.sleep(0.005)
+            except Exception as e:
+                # stop() closes the ports underneath us; that is a normal exit,
+                # not a fault worth logging.
+                if not self.running:
+                    return
+                print(f"[READ ERROR on Arduino {arduino_index}] {e}")
+                time.sleep(0.05)
+
+    def _write_to(self, serial_object, final_command):
+        """Send one already-remapped command to a board. Never blocks for long.
+
+        No flush() afterwards: that is tcdrain, which has no timeout at all and
+        never returns on a board whose USB bridge has crashed. The kernel sends
+        a queued write on its own, so waiting for it buys nothing.
+        """
+        port = serial_object.port
+        if self._write_failures.get(port, 0) >= self._MAX_WRITE_FAILURES:
+            return False        # already declared dead — don't stall on it again
+        try:
+            serial_object.write((final_command + '\r\n').encode('utf-8'))
+        except Exception as exc:
+            failures = self._write_failures.get(port, 0) + 1
+            self._write_failures[port] = failures
+            if failures >= self._MAX_WRITE_FAILURES and port not in self._reported_dead:
+                self._reported_dead.add(port)
+                print(f"[ERROR] {port} is not accepting data ({exc}). Every command "
+                      f"for that board will be dropped until the GUI is restarted. "
+                      f"Unplug and replug the Arduino's USB cable — a DTR reset does "
+                      f"not clear this.")
             else:
-                time.sleep(0.005)
-    
+                print(f"[WARN] write to {port} failed ({failures}/"
+                      f"{self._MAX_WRITE_FAILURES}): {exc}")
+            return False
+        self._write_failures[port] = 0
+        return True
+
     def _writer_loop(self):
-        """
-        Runs in a separate thread.
-        Checks write queue and sends commands to the respective Arduino.
-        """
+        """Runs in a separate thread: pulls queued commands and sends each to
+        the Arduino that owns its channel, remapping ids via
+        _serial_object_mapping()."""
         while self.running:
             try:
-                # Try to get an item from the queue without blocking
-                cmd_parts = self.write_queue.get_nowait()
-                
-                # Ensure we have valid data
+                # Blocking get with a short timeout, so a command leaves for the
+                # Arduino as soon as it is queued: polling instead would add up
+                # to a poll interval of jitter to every pump pulse and TTL edge.
+                try:
+                    cmd_parts = self.write_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+
                 if not cmd_parts or len(cmd_parts) < 3:
                     print(f"[WARN] Invalid command format: {cmd_parts}")
                     continue
-                
+
                 command_string = ":".join(cmd_parts)
                 # Tracing is off by default: a BNC train would print two lines per
                 # pulse and drown both the console and the session log.
                 if self.verbose:
                     print(f"Processing: {command_string}")
 
-                # Extract input_id (assuming it's the second element)
                 try:
                     input_id = int(cmd_parts[1])
                 except ValueError:
                     print(f"[ERROR] Invalid input_id: {cmd_parts[1]}")
                     continue
 
-                # Get the correct serial object and mapped ID
                 serial_object, new_id = self._serial_object_mapping(cmd_parts[0], input_id)
 
-                # Reconstruct the command with the NEW mapped ID
+                # Rebuild the command with the board-local id in place of the
+                # global lickport id.
                 if len(cmd_parts) == 3:
                     final_command = f"{cmd_parts[0]}:{new_id}:{cmd_parts[2]}"
                 elif len(cmd_parts) == 4:
@@ -217,25 +304,13 @@ class SerialControls:
 
                 if self.verbose:
                     print(f"Sending to {serial_object.port}: {final_command}")
-                serial_object.write((final_command + '\r\n').encode('utf-8'))
-                serial_object.flush()
-                
-            except queue.Empty:
-                # No items in the queue - just continue the loop
-                # Optional: Add a small sleep to prevent CPU spinning
-                import time
-                time.sleep(0.01)
+                self._write_to(serial_object, final_command)
+
             except Exception as e:
-                # Handle any other unexpected errors
                 print(f"[ERROR] Unexpected error in writer loop: {e}")
-    
+
     def send_command(self, command_string):
-        """
-        Takes command in the format:
-        MODE(LED/MOS):MODULE_ID:ON/OFF:(IF MOS: LENGTH) or
-        BNC:ID:PULSE:DURATION_ms
-        Queues the command to be executed.
-        """
+        """Queue a command, e.g. "LED:3:ON", "MOS:5:ON:10", or "BNC:1:PULSE:5"."""
         if not self.running:
             pass
 
@@ -249,43 +324,54 @@ class SerialControls:
             print(f"[ERROR in send_command] {e}")
 
     def read_serial(self):
-        """
-        Returns a synchronized snapshot of the current state.
-        Returns: [Timestamp, List of all active pins (1-16)]
-        """
+        """Return [timestamp, [active pins on Arduino 1, active pins on Arduino 2]]."""
         timestamp = time.time()
         combined_pins = []
         with self.lock:
             # Get the latest known state from both Arduinos
             combined_pins.append(self.latest_active_pins[0])
             combined_pins.append(self.latest_active_pins[1])
-        
+
         return [timestamp, combined_pins]
-    
+
     def stop(self):
+        """Stop the reader/writer threads and close both serial ports."""
         self.running = False
-        if self.serial_arduino1: self.serial_arduino1.close()
-        if self.serial_arduino2: self.serial_arduino2.close()
+        for serial_object in (self.serial_arduino1, self.serial_arduino2):
+            if not serial_object:
+                continue
+            try:
+                # close() drains pending output first, which never finishes on a
+                # board that stopped accepting data. Dropping the queue makes the
+                # close return instead of hanging shutdown.
+                serial_object.reset_output_buffer()
+            except Exception:
+                pass
+            try:
+                serial_object.close()
+            except Exception as exc:
+                print(f"[WARN] closing {serial_object.port} failed: {exc}")
 
 def sensor_process(sensor_array, timestamp_value, command_queue=None, hw=None):
+    """Process entry point: owns the two Arduino connections. Polls lick
+    sensors into sensor_array, and drains command_queue (written by both the
+    state machine and the Cleaning tab) to forward outbound LED/pump/BNC
+    commands, mirroring each into `hw` via _ActuatorTracker for the CSV."""
     from console_log import tag_process
     tag_process("Serial")
 
-    # Prevent Queue feeder threads from blocking this process's atexit.
-    # Without this, terminating the process while the pipe is full causes a
-    # deadlock: main waits for this process to exit, this process waits for
-    # main to drain the queue.
+    # Prevent Queue feeder threads from blocking this process's exit: without
+    # this, terminating while a queue is full deadlocks against main waiting
+    # to join it.
     timestamp_value.cancel_join_thread()
     if command_queue is not None:
         command_queue.cancel_join_thread()
 
     from serial_controls import SerialControls
     ser_machine = SerialControls()
-    # Mirrors the outbound commands into shared state so the session CSV can record
-    # which pumps, LEDs and BNCs were active (see hardware_state.py).
     tracker = _ActuatorTracker(hw)
     while True:
-        # Drain any pending GUI commands and forward them to the Arduino
+        # Forward any pending GUI/state-machine commands to the Arduino.
         if command_queue is not None:
             while not command_queue.empty():
                 try:
@@ -294,8 +380,8 @@ def sensor_process(sensor_array, timestamp_value, command_queue=None, hw=None):
                     tracker.note(cmd)
                 except Exception:
                     pass
-        # Expire pump/BNC pulse latches. This loop runs at 100 Hz, five times the
-        # CSV sampling rate, so the recorded pulse edges are accurate to ~10 ms.
+        # Runs at 100 Hz (5x the CSV sample rate), so latch expiry is accurate
+        # to about 10 ms.
         tracker.sweep()
         timestamp, active_pin = ser_machine.read_serial()
         active = active_pin[0] + active_pin[1]

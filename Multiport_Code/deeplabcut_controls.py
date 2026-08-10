@@ -1,9 +1,7 @@
-"""deeplabcut_controls.py — DLC inference process for the Multiport setup.
-
-Architecture mirrors camera_controls.py / serial_controls.py:
-  - DLCTracker class         : wraps DLCLive; runs the inference loop.
-  - dlc_process()            : multiprocessing target; initialises DLCLive and
-                               loops until dlc_running is set to False.
+"""DLC (DeepLabCut) inference process, structured like camera_controls.py /
+serial_controls.py: DLCTracker wraps DLCLive and runs the inference loop;
+dlc_process() is the multiprocessing target that initialises DLCLive and
+loops until dlc_running is set False.
 
 Inter-process communication:
   dlc_queue            Queue      — full-res cropped frames from camera_controls.
@@ -21,11 +19,10 @@ import signal
 import time
 
 import numpy as np
-# NOTE: DLCLive / TensorFlow are NOT imported at module level.
-# TF must see TF_FORCE_GPU_ALLOW_GROWTH before it initialises its CUDA
-# context, otherwise it pre-allocates most VRAM and starves Qt's OpenGL.
-# The import is deferred to DLCTracker.__init__() which runs after the env
-# var has been set inside dlc_process().
+# DLCLive/TensorFlow are deliberately not imported at module level: TF must
+# see TF_FORCE_GPU_ALLOW_GROWTH before it initialises CUDA, or it
+# pre-allocates most VRAM and starves Qt's OpenGL. The import is deferred to
+# DLCTracker.__init__(), which runs after dlc_process() sets that env var.
 
 
 class DLCTracker:
@@ -34,13 +31,14 @@ class DLCTracker:
     Produces pose estimates and distributes them to:
       - pose_queue          (consumed by data_saving for CSV storage)
       - pose_display_queue  (consumed by CameraWidget for live overlay)
+      - pose_sm_queue       (consumed by the state machine for ITI dwell checks, if given)
     """
 
     def __init__(self, dlc_queue, pose_queue, pose_display_queue, pose_sm_queue=None):
         # Lazy import: TF_FORCE_GPU_ALLOW_GROWTH must already be set in the
-        # environment before this line, so TF uses on-demand VRAM allocation.
+        # environment before this, so TF allocates VRAM on demand.
         from dlclive import DLCLive, Processor
-        from shared_states import model_path
+        from shared_states import model_path, dlc_resize
 
         self.dlc_queue          = dlc_queue
         self.pose_queue         = pose_queue
@@ -48,9 +46,49 @@ class DLCTracker:
         self.pose_sm_queue      = pose_sm_queue   # optional: state machine ITI checks
 
         print("[DLC] Loading model…")
-        self._dlc         = DLCLive(model_path, processor=Processor())
+        # resize is what sets the tracking rate (see shared_states.dlc_resize).
+        # DLCLive scales the pose back to full-frame coordinates itself, so the
+        # CSV, the live overlay and the state machine's dwell checks all keep
+        # working in DLC_CROP pixels regardless of the value.
+        self._dlc         = DLCLive(model_path, processor=Processor(),
+                                    resize=float(dlc_resize))
         self._initialized = False
+        self._resize      = float(dlc_resize)
+        self._rate_times  = []        # set to None once the rate is reported
         print("[DLC] Model ready — waiting for frames.")
+
+    # Poses to time before reporting, skipping the first few while the GPU
+    # graph is still warming up.
+    _RATE_SKIP, _RATE_N = 5, 25
+
+    def _note_rate(self, seconds, shape):
+        """Report the measured tracking rate once, early in a session.
+
+        Inference cost is the only thing setting the pose rate, and it is
+        invisible otherwise — a model too slow for the camera silently leaves
+        most frames untracked rather than failing.
+        """
+        if self._rate_times is None:
+            return
+        self._rate_times.append(seconds)
+        if len(self._rate_times) < self._RATE_SKIP + self._RATE_N:
+            return
+        import statistics
+        mean = statistics.fmean(self._rate_times[self._RATE_SKIP:])
+        self._rate_times = None       # measured once; stop accumulating
+        h, w = shape[:2]
+        scale = self._resize
+        print(f"[DLC] {mean*1000:.0f} ms per pose ({1/mean:.1f} Hz) on "
+              f"{int(w*scale)}x{int(h*scale)} (resize {scale} of {w}x{h}).")
+        try:
+            import shared_states
+            camera_fps = float(getattr(shared_states, "camera_frame_rate", 20))
+        except Exception:
+            return
+        if 1 / mean < camera_fps * 0.98:
+            print(f"[DLC] NOTE: slower than the camera's {camera_fps:.0f} fps, so "
+                  f"only about 1 frame in {camera_fps*mean:.1f} gets a pose. "
+                  f"Lower shared_states.dlc_resize to track every frame.")
 
     @staticmethod
     def _put_latest(q, item):
@@ -76,7 +114,9 @@ class DLCTracker:
                 if not self._initialized:
                     self._dlc.init_inference(image)
                     self._initialized = True
+                started = time.perf_counter()
                 pose = self._dlc.get_pose(image)
+                self._note_rate(time.perf_counter() - started, image.shape)
             except Exception as exc:
                 print(f"[DLC] Inference error: {exc}")
                 continue
@@ -91,16 +131,13 @@ class DLCTracker:
 
 def dlc_process(dlc_queue, pose_queue, pose_display_queue, dlc_running,
                 pose_sm_queue=None):
-    """Multiprocessing target — hosts DLCTracker until dlc_running=False.
-
-    Called by main.py as a multiprocessing.Process target.
-    """
+    """Process entry point: runs a DLCTracker until dlc_running is set False."""
     from console_log import tag_process
     tag_process("DLC")
 
     import os
-    # Must be set before TF/DLCLive is imported (happens inside DLCTracker.__init__).
-    # Without this TF pre-allocates most VRAM, starving Qt's OpenGL context.
+    # Must be set before TF/DLCLive is imported (inside DLCTracker.__init__),
+    # or TF pre-allocates most VRAM and starves Qt's OpenGL context.
     os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
     dlc_queue.cancel_join_thread()

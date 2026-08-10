@@ -1,4 +1,7 @@
-# main.py
+"""Entry point. Builds the shared queues and state, launches every process
+(camera, DeepLabCut, serial/Arduino, beamer, touch screens, state machine,
+GUI), then tears them down in order when the GUI window closes."""
+import time
 from multiprocessing import Process, Array, Queue, Value
 import numpy as np
 from beamer_controls import beamer_process
@@ -11,9 +14,39 @@ from serial_controls import sensor_process
 from state_machine import state_machine_process
 
 
+def _wait_for_exit(children, grace, label):
+    """Join already-signalled children in parallel, then escalate as one wave.
+
+    Every child here has already been told to stop, so they wind down at the
+    same time and the wait is as long as the slowest one rather than the sum
+    of all of them. Escalation is per wave for the same reason.
+    """
+    deadline = time.monotonic() + grace
+    for _name, proc in children:
+        proc.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    stragglers = [(name, proc) for name, proc in children if proc.is_alive()]
+    if not stragglers:
+        return
+    print(f"[main] {label}: still running after {grace:.0f}s, terminating "
+          f"{', '.join(name for name, _ in stragglers)}")
+    for _name, proc in stragglers:
+        proc.terminate()
+
+    deadline = time.monotonic() + 1.5
+    for _name, proc in stragglers:
+        proc.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    for name, proc in stragglers:
+        if proc.is_alive():
+            print(f"[main] {label}: killing {name}")
+            proc.kill()
+            proc.join()
+
+
 def main():
-    # Before any child is spawned: the children inherit fds 1/2, and that
-    # inheritance is what puts every process's output on one capture pipe.
+    # Must happen before any child process starts: children inherit fds 1/2,
+    # which is how their output ends up on the shared console-log pipe.
     import console_log
     console_log.install_capture()
 
@@ -27,30 +60,28 @@ def main():
     sensor_array       = Array('i', 16)    # shared sensors
     camera_running     = Value('b', True)
     dlc_running        = Value('b', True)
-    # 1000, not 100: a dropped command is an invisible missing TTL edge or a pump
-    # that never fired. sensor_process drains the whole queue at 100 Hz so the
-    # steady-state depth stays below 1 even with four BNC trains running; the
-    # headroom is for the 32-command _all_off() burst landing while it is stalled.
+    # Generous headroom: a dropped command is a silent missed TTL pulse or a pump
+    # that never fires. sensor_process normally drains this quickly, but bursts
+    # like an ALL OFF command need room to queue up.
     command_queue      = Queue(maxsize=1000) # GUI → Arduino commands
     beamer_queue       = Queue(maxsize=8)   # GUI/SM → beamer projection commands
     beamer_running     = Value('b', True)
     screen_queue       = Queue(maxsize=8)   # GUI/SM → touch-screen pattern commands
     screen_running     = Value('b', True)
 
-    # Live actuator state (pumps, LEDs, BNCs, speaker, beamer, screens) for the
-    # session CSV. Built here so every process shares it by inheritance — it must be
-    # passed through Process(args=...), never sent down a Queue.
+    # Actuator state (pumps, LEDs, BNCs, beamer, screens, speaker), shared by
+    # every process and read by the saver for the session CSV. Passed via
+    # Process(args=...) rather than a Queue, since it must be inherited.
     hw = HardwareState()
 
-    # Camera → MP4 recording. The camera process encodes the frames itself (they are
-    # already in that process), so all it needs from the GUI is an on/off flag and
-    # the recording folder the parent created.
+    # Session video: the camera process encodes its own frames, so the GUI only
+    # needs to hand it an on/off flag and the recording path to write to.
     video_running = Value('b', False)
     video_path    = Array('c', 512)
 
-    # Fisheye correction, owned by the camera process. The calibration wizard needs
-    # to measure on *raw* frames, so it lowers undistort_enabled while it captures,
-    # then raises undistort_reload to make the camera pick up what it just saved.
+    # Lens-correction flags for the camera process. The calibration wizard turns
+    # undistort_enabled off while it captures raw frames, then sets
+    # undistort_reload so the camera process picks up what it just saved.
     undistort_enabled = Value('b', True)
     undistort_reload  = Value('b', False)
 
@@ -61,9 +92,9 @@ def main():
     session_done   = Value('b', False)   # SM sets True on natural session end
     protocol_queue = Queue(maxsize=1)    # ExperimentPage puts protocol dict here before sm_active=True
 
-    # Session progress for the GUI's progress bar. The SM posts a wall-clock start
-    # (0.0 = idle) once and the trial number as each trial begins; the GUI
-    # interpolates elapsed time itself, so neither side has to tick in lockstep.
+    # Feeds the GUI's session progress bar: the state machine posts the session
+    # start time once and the trial number at each trial start, and the GUI
+    # interpolates elapsed/remaining time on its own between updates.
     sm_session_start = Value('d', 0.0)
     sm_trial         = Value('i', 0)
 
@@ -80,8 +111,8 @@ def main():
                              pose_sm_queue))
     dlc_proc.start()
 
-    # Start sensor grabbing (also handles outbound commands)
-    # Also mirrors the LED/pump/BNC command stream into `hw` for the session CSV —
+    # Start sensor process: reads the lick sensors and drains command_queue to
+    # send outbound Arduino commands, mirroring each one into `hw` for the CSV —
     # this is the one process every hardware command passes through.
     sensor_proc = Process(target=sensor_process,
                           args=(sensor_array, timestamp_value, command_queue, hw))
@@ -130,68 +161,44 @@ def main():
     run_gui(frame_queue, sensor_array, cam_shape, command_queue, data_sources)
 
     # ── Clean up after GUI closes ─────────────────────────────────────────────
-    # State machine: signal clean exit, then escalate.
-    sm_running.value = False
-    sm_stop.value    = True
-    sm_proc.join(timeout=2)
-    if sm_proc.is_alive():
-        sm_proc.terminate()
-        sm_proc.join(timeout=1)
-    if sm_proc.is_alive():
-        sm_proc.kill()
-        sm_proc.join()
-
-    # DLC: signal clean exit first, then escalate.
-    dlc_running.value = False
-    dlc_proc.join(timeout=3)
-    if dlc_proc.is_alive():
-        dlc_proc.terminate()
-        dlc_proc.join(timeout=1)
-    if dlc_proc.is_alive():
-        dlc_proc.kill()
-        dlc_proc.join()
-
-    # Camera: signal the loop to exit cleanly so Pylon releases the USB device
-    # before we force-kill.  Give it 3 s; escalate to SIGTERM then SIGKILL.
+    # Tell everything to stop before waiting on anything: each process polls its
+    # flag every few ms, so signalling them all up front lets them shut down in
+    # parallel. Signalling one process only after the previous one has been
+    # joined is what used to make closing the GUI take the sum of every timeout.
+    sm_running.value     = False
+    sm_stop.value        = True
+    dlc_running.value    = False
     camera_running.value = False
-    cam_proc.join(timeout=3)
-    if cam_proc.is_alive():
-        cam_proc.terminate()
-        cam_proc.join(timeout=1)
-    if cam_proc.is_alive():
-        cam_proc.kill()
-        cam_proc.join()
-
-    # Sensor: no clean-exit flag, so go straight to SIGTERM then SIGKILL.
-    sensor_proc.terminate()
-    sensor_proc.join(timeout=2)
-    if sensor_proc.is_alive():
-        sensor_proc.kill()
-        sensor_proc.join()
-
-    # Beamer: signal the Qt loop to quit so the fullscreen window closes cleanly,
-    # then escalate to SIGTERM then SIGKILL.
     beamer_running.value = False
-    beamer_proc.join(timeout=3)
-    if beamer_proc.is_alive():
-        beamer_proc.terminate()
-        beamer_proc.join(timeout=1)
-    if beamer_proc.is_alive():
-        beamer_proc.kill()
-        beamer_proc.join()
-
-    # Screens: same clean-quit-then-escalate sequence as the beamer.
     screen_running.value = False
-    screen_proc.join(timeout=3)
-    if screen_proc.is_alive():
-        screen_proc.terminate()
-        screen_proc.join(timeout=1)
-    if screen_proc.is_alive():
-        screen_proc.kill()
-        screen_proc.join()
+
+    # The state machine goes first and on its own: its last act is to switch its
+    # actuators off, and those commands still have to travel through the sensor
+    # process, which is killed below. The others are already winding down while
+    # this waits, so it costs no extra wall-clock time.
+    _wait_for_exit([("state machine", sm_proc)], grace=2.0, label="state machine")
+    time.sleep(0.2)   # let sensor_process drain the last commands to the Arduinos
+
+    # Sensor: no clean-exit flag, so SIGTERM is how it stops.
+    sensor_proc.terminate()
+
+    _wait_for_exit(
+        [("DLC",     dlc_proc),
+         ("sensor",  sensor_proc),
+         ("beamer",  beamer_proc),
+         ("screens", screen_proc)],
+        grace=3.0, label="shutdown")
+
+    # The camera is joined last and on a much longer leash: if a recording was
+    # still running it is finalising the session's video here, and ffmpeg has to
+    # drain a frame backlog before the file is playable. The grace is a ceiling,
+    # not a wait — with no video to finish the camera exits in well under a
+    # second, so this costs an ordinary shutdown nothing.
+    _wait_for_exit([("camera", cam_proc)], grace=60.0, label="camera")
 
     # Last of all: with every child gone, nothing can still be writing into the
-    # capture pipe, so the pump can see EOF, drain the tail and close the log.
+    # capture pipe, so console_log's pump thread can see EOF, drain the tail,
+    # and close the log.
     console_log.shutdown()
 
 if __name__ == "__main__":

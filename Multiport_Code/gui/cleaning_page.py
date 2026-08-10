@@ -1,3 +1,7 @@
+"""Cleaning/Testing tab: manual controls for every actuator (beamer test
+sphere + calibration, speaker tone test, screen patterns, LEDs, pumps, BNC),
+plus an automated pump-flushing cycle. See CleaningPage for the panel and
+BeamerCalibrationDialog for the beamer calibration wizard."""
 import json
 import math
 import os
@@ -8,6 +12,8 @@ import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
 
 import shared_states
+from beamer_controls import BEAMER_MODE_KEYS, BEAMER_MODE_LABELS
+from hardware_state import BEAMER_LIT_MODES
 from pump_calibration import PumpCalibration
 from speaker_controls import SpeakerControls
 from gui.pump_calibration_dialog import PumpCalibrationDialog
@@ -17,30 +23,34 @@ from gui.camera_calibration_dialog import CameraCalibrationDialog
 class CleaningPage(QtWidgets.QWidget):
     """Cleaning / testing panel.
 
-    Section order (top → bottom):
+    Section order (top -> bottom):
       1. Beamer        — Test Sphere controls + Calibration wizard (via beamer_queue)
       2. Speaker       — tone test (frequency / length / overdrive volume)
       3. Screens       — pattern test for the two HDMI screens (via screen_queue)
-      4. ALL OFF safety button  ← sits directly above LED controls
+      4. ALL OFF safety button  <- sits directly above LED controls
       5. LEDs          — manual toggle controls
       6. Pumps         — manual dose in µL + calibration wizard
       7. BNC           — manual pulse controls
       8. Automated Cleaning Cycle
 
-    The pump block asks for a volume, not a duration, and delivers it as the same
-    train of short pulses a session uses — so pressing a port here is a direct test
-    of whether that pump still matches its calibration. The cleaning cycle below it
-    stays in seconds: flushing a line is not a reward and wants the pump simply held
-    open.
+    The pump block asks for a volume, not a duration, and delivers it as the
+    same pulse train a session uses — so pressing a port here directly tests
+    whether that pump still matches its calibration. The cleaning cycle below
+    it stays in seconds, since flushing a line is not a reward.
     """
 
     _BTN_SIZE = 44   # px, square grid buttons
 
+    # Projection modes for the test sphere. Shared with the protocol editor, so a
+    # mode tested here is the same one a protocol stores.
+    _BEAMER_MODE_LABELS = BEAMER_MODE_LABELS
+    _BEAMER_MODE_KEYS   = BEAMER_MODE_KEYS
+
     def __init__(self, command_queue, beamer_queue=None, screen_queue=None,
                  undistort_enabled=None, undistort_reload=None):
         super().__init__()
-        # WA_OpaquePaintEvent: Qt skips its background pre-fill before paintEvent.
-        # Our paintEvent then fills every pixel, so the widget is never uninitialized.
+        # WA_OpaquePaintEvent: Qt skips its background pre-fill; paintEvent
+        # below fills every pixel itself instead.
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
         self.command_queue = command_queue
         self.beamer_queue = beamer_queue   # None if the beamer process isn't wired in
@@ -51,6 +61,7 @@ class CleaningPage(QtWidgets.QWidget):
         self.undistort_reload = undistort_reload
         self.frame_provider = None         # set by run_gui: object with latest_frame()
         self._sphere_color = QtGui.QColor(255, 255, 255)  # Test Sphere colour
+        self._bg_color     = QtGui.QColor(255, 255, 255)  # lit-field colour
         self._sphere_shown = False         # is a Test Sphere currently projected?
         self.led_state = {i: False for i in range(1, 17)}
 
@@ -69,22 +80,20 @@ class CleaningPage(QtWidgets.QWidget):
         self._cleaning_timer = QtCore.QTimer(self)
         self._cleaning_timer.timeout.connect(self._cleaning_tick)
 
-        # Manual dose state. Its own timer and queue, deliberately separate from the
-        # cleaning cycle's: _stop_cleaning stops that timer and clears its queues, so
-        # sharing them would make the two features cancel each other.
+        # Manual dose state, with its own timer/queue — deliberately separate
+        # from the cleaning cycle's, since _stop_cleaning stops that timer and
+        # clears its queues, which would otherwise cancel a manual dose too.
         self.pump_calib = PumpCalibration()
         self._manual_pending: dict = {}   # {pump_id: pulses left to fire}
         self._manual_timer = QtCore.QTimer(self)
         self._manual_timer.timeout.connect(self._manual_tick)
 
-        # Everything scrolls, like the Protocol and Experiment tabs. This is not
-        # cosmetic: with all eight sections laid out at once the page asks for a
-        # ~1080 px minimum height, which put the *window's* minimum above the
-        # control monitor's work area (1200 px monitor − 32 px top bar − 37 px
-        # title bar = 1131 px). A window that cannot fit a monitor's work area is
-        # one the window manager will not place there at all — it silently opened
-        # across the touch panels instead. Adding another section here must never
-        # be able to do that again.
+        # Everything scrolls, like the Protocol and Experiment tabs. Not
+        # cosmetic: laid out flat, all eight sections push the page's minimum
+        # height past the control monitor's work area, and a window that
+        # can't fit its target monitor gets silently placed on another one
+        # (the touch panels) instead. Adding a section here must never
+        # reintroduce that.
         outer = QtWidgets.QVBoxLayout(self)
         outer.setSpacing(0)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -125,7 +134,8 @@ class CleaningPage(QtWidgets.QWidget):
         beamer_status_row.addWidget(lens_btn)
         root.addLayout(beamer_status_row)
 
-        # Test Sphere — project a light/shadow sphere at an arena position (cm).
+        # Test Sphere — project a sphere at an arena position (cm), in any of the
+        # three projection modes a protocol can use.
         sphere_row = QtWidgets.QHBoxLayout()
         sphere_row.addWidget(QtWidgets.QLabel("Sphere  x:"))
         self.beamer_x = QtWidgets.QDoubleSpinBox()
@@ -143,13 +153,20 @@ class CleaningPage(QtWidgets.QWidget):
         self.beamer_diam.setSuffix(" cm")
         self.beamer_diam.setValue(10.0)
         sphere_row.addWidget(self.beamer_diam)
-        self.beamer_shadow = QtWidgets.QCheckBox("Shadow")
-        sphere_row.addWidget(self.beamer_shadow)
         root.addLayout(sphere_row)
 
-        # Brightness + colour of the lit region (applies live while projecting).
+        mode_row = QtWidgets.QHBoxLayout()
+        mode_row.addWidget(QtWidgets.QLabel("Mode:"))
+        self.beamer_mode = QtWidgets.QComboBox()
+        self.beamer_mode.addItems(list(self._BEAMER_MODE_LABELS.values()))
+        self.beamer_mode.currentTextChanged.connect(self._on_beamer_mode_changed)
+        mode_row.addWidget(self.beamer_mode)
+        mode_row.addStretch()
+        root.addLayout(mode_row)
+
+        # Brightness + colour of the sphere (applies live while projecting).
         style_row = QtWidgets.QHBoxLayout()
-        style_row.addWidget(QtWidgets.QLabel("Brightness:"))
+        style_row.addWidget(QtWidgets.QLabel("Sphere:"))
         self.beamer_brightness = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.beamer_brightness.setRange(0, 100)
         self.beamer_brightness.setValue(100)
@@ -158,13 +175,33 @@ class CleaningPage(QtWidgets.QWidget):
         self._bright_label = QtWidgets.QLabel("100 %")
         self._bright_label.setFixedWidth(44)
         style_row.addWidget(self._bright_label)
-        style_row.addWidget(QtWidgets.QLabel("Colour:"))
         self._color_btn = QtWidgets.QPushButton()
         self._color_btn.setFixedWidth(44)
         self._color_btn.clicked.connect(self._pick_beamer_color)
-        self._update_color_swatch()
         style_row.addWidget(self._color_btn)
         root.addLayout(style_row)
+
+        # Same pair for the constant lit field, hidden in Light mode where the
+        # background is always black.
+        self._bg_row_w = QtWidgets.QWidget()
+        bg_row = QtWidgets.QHBoxLayout(self._bg_row_w)
+        bg_row.setContentsMargins(0, 0, 0, 0)
+        bg_row.addWidget(QtWidgets.QLabel("Background:"))
+        self.beamer_bg_brightness = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.beamer_bg_brightness.setRange(0, 100)
+        self.beamer_bg_brightness.setValue(30)
+        self.beamer_bg_brightness.valueChanged.connect(self._on_beamer_style_changed)
+        bg_row.addWidget(self.beamer_bg_brightness)
+        self._bg_bright_label = QtWidgets.QLabel("30 %")
+        self._bg_bright_label.setFixedWidth(44)
+        bg_row.addWidget(self._bg_bright_label)
+        self._bg_color_btn = QtWidgets.QPushButton()
+        self._bg_color_btn.setFixedWidth(44)
+        self._bg_color_btn.clicked.connect(self._pick_beamer_bg_color)
+        bg_row.addWidget(self._bg_color_btn)
+        root.addWidget(self._bg_row_w)
+        self._update_color_swatch()
+        self._on_beamer_mode_changed()
 
         sphere_btn_row = QtWidgets.QHBoxLayout()
         project_btn = QtWidgets.QPushButton("Project")
@@ -289,10 +326,9 @@ class CleaningPage(QtWidgets.QWidget):
         root.addWidget(self._separator())
 
         # ── 5. Pumps — manual dose ────────────────────────────────
-        # In µL, not ms: this is the block used to check whether a pump still
-        # matches its calibration, so it has to ask for a dose the same way a
-        # protocol does. The pump is never held on — the dose is delivered as a
-        # train of short pulses, exactly as a session delivers a reward.
+        # In µL, not ms, so this tests a pump the same way a protocol would
+        # use it: the pump is never held on, only pulsed, exactly as a
+        # session delivers a reward.
         pump_header = QtWidgets.QHBoxLayout()
         pump_header.addWidget(self._section_label("Pumps — Manual Dose"))
         pump_header.addStretch()
@@ -456,17 +492,29 @@ class CleaningPage(QtWidgets.QWidget):
         """Give the calibration dialog a live camera feed (object w/ latest_frame())."""
         self.frame_provider = provider
 
+    @staticmethod
+    def _scaled(color, slider):
+        """A QColor scaled by a 0–100 slider → [r, g, b] (0–255)."""
+        b = slider.value() / 100.0
+        return [int(color.red() * b), int(color.green() * b), int(color.blue() * b)]
+
     def _effective_sphere_color(self):
-        """Base colour scaled by the brightness slider → [r, g, b] (0–255)."""
-        b = self.beamer_brightness.value() / 100.0
-        c = self._sphere_color
-        return [int(c.red() * b), int(c.green() * b), int(c.blue() * b)]
+        """The target sphere's colour, scaled by its brightness slider."""
+        return self._scaled(self._sphere_color, self.beamer_brightness)
+
+    def _effective_bg_color(self):
+        """The constant lit field's colour, scaled by its brightness slider."""
+        return self._scaled(self._bg_color, self.beamer_bg_brightness)
+
+    def _beamer_mode_key(self):
+        return self._BEAMER_MODE_KEYS[self.beamer_mode.currentText()]
 
     def _update_color_swatch(self):
-        c = self._sphere_color
-        self._color_btn.setStyleSheet(
-            f"background: rgb({c.red()},{c.green()},{c.blue()}); border:1px solid #888;"
-        )
+        for btn, c in ((self._color_btn, self._sphere_color),
+                       (self._bg_color_btn, self._bg_color)):
+            btn.setStyleSheet(
+                f"background: rgb({c.red()},{c.green()},{c.blue()}); "
+                f"border:1px solid #888;")
 
     def _pick_beamer_color(self):
         c = QtWidgets.QColorDialog.getColor(self._sphere_color, self, "Sphere colour")
@@ -475,11 +523,24 @@ class CleaningPage(QtWidgets.QWidget):
             self._update_color_swatch()
             self._on_beamer_style_changed()
 
+    def _pick_beamer_bg_color(self):
+        c = QtWidgets.QColorDialog.getColor(self._bg_color, self, "Background colour")
+        if c.isValid():
+            self._bg_color = c
+            self._update_color_swatch()
+            self._on_beamer_style_changed()
+
     def _on_beamer_style_changed(self, *_):
         self._bright_label.setText(f"{self.beamer_brightness.value()} %")
+        self._bg_bright_label.setText(f"{self.beamer_bg_brightness.value()} %")
         # Re-project live only if a sphere is currently on the beamer.
         if self._sphere_shown:
             self._project_test_sphere()
+
+    def _on_beamer_mode_changed(self, *_):
+        # The background only exists in the two lit modes; in Light it is black.
+        self._bg_row_w.setVisible(self._beamer_mode_key() in BEAMER_LIT_MODES)
+        self._on_beamer_style_changed()
 
     def _project_test_sphere(self):
         self._send_beamer({
@@ -487,8 +548,9 @@ class CleaningPage(QtWidgets.QWidget):
             "x_cm":        self.beamer_x.value(),
             "y_cm":        self.beamer_y.value(),
             "diameter_cm": self.beamer_diam.value(),
-            "shadow":      self.beamer_shadow.isChecked(),
+            "mode":        self._beamer_mode_key(),
             "color":       self._effective_sphere_color(),
+            "field_color": self._effective_bg_color(),
         })
         self._sphere_shown = True
 
@@ -567,9 +629,9 @@ class CleaningPage(QtWidgets.QWidget):
     def _pulse_pump(self, pump_id: int):
         """Queue the pulses that deliver the requested volume at *pump_id*.
 
-        No pump is ever held on: the dose is a train of shared_states.pump_pulse_ms
-        pulses at pump_refractory_ms, the same cadence a session uses, so what comes
-        out here is what a mouse would get for that volume in a protocol.
+        The dose is a train of shared_states.pump_pulse_ms pulses at
+        pump_refractory_ms — the same cadence a session uses — so what fires
+        here is exactly what a mouse would get for that volume in a protocol.
         """
         plan = self.pump_calib.pulses_for(pump_id, self.pump_volume.value())
         if plan is None:
@@ -652,9 +714,9 @@ class CleaningPage(QtWidgets.QWidget):
     def _all_off(self):
         """Immediately turn off all LEDs and all pumps.
 
-        This button's whole job is being final, so it cancels the queued work as
-        well as the hardware: without that, a manual dose or a cleaning cycle would
-        switch a pump straight back on a fraction of a second later.
+        Cancels queued work as well as the hardware — otherwise a manual
+        dose or cleaning cycle still in flight would switch a pump straight
+        back on moments later.
         """
         self._stop_manual_doses()
         if self._cleaning_active:
@@ -855,14 +917,14 @@ class BeamerCalibrationDialog(QtWidgets.QDialog):
       2. Centre & orientation — locate the true centre of the projection area
          (the beamer is not screen-centred) and set the axis directions.
       3. Projection area — the max usable radius, sized from the true centre.
-      4. Diameter measurement — circles projected from the true centre → px_per_cm
+      4. Diameter measurement — circles projected from the true centre -> px_per_cm
          via through-origin least squares.
       5. Camera mapping — 2 cm points projected inside the boundary; the user drags
-         colour markers onto them in a live camera feed → a DLC↔beamer affine.
-      6. Finish → writes beamer_calibration.json and reloads the projector.
+         colour markers onto them in a live camera feed -> a DLC<->beamer affine.
+      6. Finish -> writes beamer_calibration.json and reloads the projector.
 
-    The wizard sends raw-pixel ("sphere_px") commands because it runs before any
-    cm scale exists; only the final saved JSON is in cm terms.
+    Sends raw-pixel ("sphere_px") commands throughout, since it runs before
+    any cm scale exists; only the final saved JSON is in cm terms.
     """
 
     _MARKER_PX = 40   # small sphere used as the origin/probe marker
@@ -1137,7 +1199,7 @@ class BeamerCalibrationDialog(QtWidgets.QDialog):
         elif kind == "diameter":
             self._send({"cmd": "sphere_px",
                         "cx": self._origin_px[0], "cy": self._origin_px[1],
-                        "diameter_px": self._diam_presets[meta], "shadow": False})
+                        "diameter_px": self._diam_presets[meta], "mode": "light"})
         elif kind == "dlc":
             self._update_feed()
             self._feed_timer.start(60)
@@ -1164,7 +1226,7 @@ class BeamerCalibrationDialog(QtWidgets.QDialog):
         self._area_label.setText(f"{value} px" + (f"  ≈ {cm:.1f} cm" if cm else ""))
         self._send({"cmd": "sphere_px",
                     "cx": self._origin_px[0], "cy": self._origin_px[1],
-                    "diameter_px": value, "shadow": False})
+                    "diameter_px": value, "mode": "light"})
 
     def _nudge_origin(self, dx, dy):
         step = self._step_spin.value()
@@ -1187,7 +1249,7 @@ class BeamerCalibrationDialog(QtWidgets.QDialog):
         cx = self._origin_px[0] + x_cm * ppc * self._x_sign
         cy = self._origin_px[1] + y_cm * ppc * self._y_sign
         self._send({"cmd": "sphere_px", "cx": cx, "cy": cy,
-                    "diameter_px": self._MARKER_PX, "shadow": False})
+                    "diameter_px": self._MARKER_PX, "mode": "light"})
 
     # ── Camera / DLC mapping ───────────────────────────────────────────────────
 
@@ -1208,14 +1270,14 @@ class BeamerCalibrationDialog(QtWidgets.QDialog):
     def _locate_point(self, k):
         """Light only beamer point k (2 cm) so the user can find it in the feed.
 
-        Projected white (not the marker colour): the tracking camera is grayscale,
-        so white is the most reliably visible, and lighting one point at a time is
-        what disambiguates them — the marker colour only labels the correspondence.
+        Projected white, not the marker colour — the tracking camera is
+        grayscale, so white is most reliably visible. Lighting one point at
+        a time is what disambiguates them; colour only labels the correspondence.
         """
         bx, by = self._dlc_beamer_points()[k]
         diam = max(6.0, 2.0 * (self._px_per_cm or (self._screen_h / 20.0)))
         self._send({"cmd": "sphere_px", "cx": bx, "cy": by,
-                    "diameter_px": diam, "shadow": False})
+                    "diameter_px": diam, "mode": "light"})
 
     def _compute_affine(self):
         """Solve the affine mapping normalised camera coords (u,v) → beamer px."""

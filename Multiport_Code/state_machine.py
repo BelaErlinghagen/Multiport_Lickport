@@ -1,9 +1,8 @@
-"""state_machine.py — Behavioral state machine for the Multiport setup.
-
-Architecture mirrors camera_controls.py / serial_controls.py:
-  - StateMachine class        : all session logic; can be unit-tested standalone.
-  - state_machine_process()   : multiprocessing target; idles until activated,
-                                runs a session from a protocol dict, then resets.
+"""Behavioral state machine for the Multiport setup, structured like
+camera_controls.py / serial_controls.py: StateMachine holds all session logic
+(and can be unit-tested standalone); state_machine_process() is the
+multiprocessing target that idles until activated, runs one session from a
+protocol dict, then resets.
 
 Inter-process communication (all multiprocessing objects):
   sm_active        Value('b') — ExperimentPage sets True to start a session;
@@ -20,24 +19,24 @@ Inter-process communication (all multiprocessing objects):
   screen_queue     Queue      — {"screen_id", "pattern_id"} commands for
                                screen_controls (the two HDMI touch screens).
 
-Trial tones go through a SpeakerControls owned directly by this class rather than a
-queue and a process of its own: it opens no audio device until the first tone and
-plays through a daemon thread, so it never blocks the trial loop.
+Trial tones play through a SpeakerControls this class owns directly, not a
+queue/process pair — it opens no audio device until the first tone and plays
+via a daemon thread, so it never blocks the trial loop.
 
-Rewards are volumes, not durations. A pump held on for more than ~10 ms shoots the
-liquid instead of forming a droplet, so a reward is a train of 10 ms pulses gated by
-the animal's own licking — one pulse per lick until the protocol's µL are delivered.
-The µL/pulse per port comes from pump_calibration.py, and a session refuses to start
-if any of its reward ports is uncalibrated. See _run_trial for the delivery rules and
-shared_states' Pumps block for why the inter-pulse floor is what it is.
+Rewards are volumes, not durations: a pump held on more than ~10 ms shoots
+liquid instead of forming a droplet, so a reward is a train of short pulses
+gated by the animal's own licking, one pulse per lick until the protocol's
+µL are delivered. Per-port µL/pulse comes from pump_calibration.py; a session
+refuses to start if any reward port is uncalibrated. See _run_trial for the
+delivery rules.
 
-The protocol is read strictly — every key ProtocolPage writes must be present, so a
-malformed protocol raises KeyError rather than silently running on defaults. The
-`_meta` block is the exception: the GUI injects it at runtime and a standalone run
-legitimately has none.
+The protocol is read strictly: every key ProtocolPage writes must be
+present, so a malformed protocol raises KeyError rather than silently
+running on defaults. `_meta` is the one exception — the GUI injects it at
+runtime, and a standalone run legitimately has none.
 
 Session flow:
-  IDLE  →  (sm_active=True)  →  [TRIAL → ITI] × N  →  DONE / STOPPED  →  IDLE
+  IDLE  ->  (sm_active=True)  ->  [TRIAL -> ITI] x N  ->  DONE / STOPPED  ->  IDLE
 """
 
 import json
@@ -54,36 +53,34 @@ import shared_states
 _CIRCLE_SIZE  = 16   # total number of ports in the circular array
 _SCREEN_COUNT = 2    # HDMI touch screens driven by screen_controls
 
+# The two modes that keep the arena lit between targets (vs. blanking the projector).
+BEAMER_LIT_MODES = _hw_state.BEAMER_LIT_MODES
+
 # BNC trigger families (mirrors ProtocolPage._BNC_*_TRIGGERS).
 _BNC_TRAIN_TRIGGERS = ("entire_session", "during_trial", "during_intertrial")
 
 # ── Reward delivery (see pump_calibration.py and shared_states' Pumps block) ───
-# Bound once at import: these are rig constants, and re-reading them per pulse
-# inside the trial loop would only invite them changing halfway through a session.
+# Bound once at import, since these are rig constants and re-reading them per
+# pulse would only invite them changing mid-session.
 _PUMP_PULSE_MS      = int(shared_states.pump_pulse_ms)
 _PUMP_REFRACTORY_S  = shared_states.pump_refractory_ms / 1000.0
 _DELIVERY_TIMEOUT_S = float(shared_states.pump_delivery_timeout_s)
 
-# How long a REWARD_BLOCKED code is held before the port reverts to AVAILABLE. A
-# release-delay lick is instantaneous, and the CSV samples every 50 ms, so without a
-# latch the event would fall between two rows and never be recorded. Same reasoning
-# and same value as serial_controls._ActuatorTracker._MIN_LATCH_S.
+# How long a REWARD_BLOCKED code is held before reverting to AVAILABLE. A
+# release-delay lick is instantaneous and the CSV samples every 50 ms, so
+# without a latch it could fall between two rows and never be recorded.
 _BLOCKED_LATCH_S = 0.06
 
 
 class _BncScheduler:
-    """Emits BNC pulse trains from a daemon thread.
+    """Emits BNC pulse trains from a daemon thread, so they keep running while
+    the main thread is between loops (the mouse-log write, a trial-to-ITI
+    transition, a retry inside _assign_locations) instead of pausing. The
+    main thread only says which phase is active.
 
-    The trains have to keep running while the main thread is between loops — during
-    the mouse-log write at session start, between a trial ending and the intertrial
-    starting, inside _assign_locations' retry loop. Weaving pulse deadlines into the
-    three polling loops would leave every one of those as a silent gap, so the
-    trains get a thread of their own and the main thread only says which phase is
-    active.
-
-    Single-shot triggers are NOT handled here — they fire straight from the main
-    thread at their hook point, so their ordering against the LEDs, screens and tone
-    stays deterministic.
+    Single-shot triggers are NOT handled here — they fire inline from the
+    main thread at their hook point, keeping their ordering against LEDs,
+    screens and tone deterministic.
     """
 
     # Wake at least this often, so a phase change or a stop is honoured promptly.
@@ -110,10 +107,10 @@ class _BncScheduler:
                 hz = float(trig["frequency_hz"])
                 period = 1.0 / hz
                 pulse = int(trig["pulse_ms"])
-                # Re-triggering a pin that is already high extends the pulse rather
-                # than making an edge, so a pulse at least as long as the period
-                # would latch the line high for the whole train. The editor refuses
-                # to save that, but a hand-edited file still has to be safe to run.
+                # A pulse as long as (or longer than) its period would latch the
+                # line high for the whole train, since retriggering an already-high
+                # pin extends it rather than making a new edge. The editor blocks
+                # saving that, but a hand-edited file still needs to be clamped.
                 limit = int(period * 1000) - 1
                 if pulse > limit:
                     print(f"[StateMachine] BNC {out['id']}: pulse {pulse} ms is not "
@@ -181,13 +178,12 @@ class _BncScheduler:
                       f"({t['trigger']}) — {t['count']} pulse(s).")
 
     def _publish(self, bnc_id, value):
-        """Record the train's on/off *span* for the session CSV.
+        """Record the train's on/off span for the session CSV.
 
-        The individual pulses are far shorter than the CSV's 50 ms sampling period,
-        so logging them would alias into a meaningless flicker. What the log wants is
-        simply whether this line was running, which is exactly what this method knows
-        — and it is the only writer of bnc_train, so it never races sensor_process's
-        single-pulse latch in bnc_pulse.
+        Individual pulses are far shorter than the CSV's 50 ms sampling period
+        and would alias into a meaningless flicker if logged directly, so this
+        records only whether the line was running. Sole writer of bnc_train,
+        so it never races sensor_process's single-pulse latch in bnc_pulse.
         """
         if self._hw is None:
             return
@@ -209,9 +205,8 @@ class _BncScheduler:
                         t["count"] += 1
                         t["next_at"] += t["period"]
                         if t["next_at"] <= now:
-                            # More than a period behind (a long GC pause, a blocked
-                            # queue). Resync rather than fire a catch-up burst the
-                            # hardware would merge into one pulse anyway.
+                            # More than a period behind: resync rather than fire a
+                            # catch-up burst the hardware would merge into one pulse.
                             t["next_at"] = now + t["period"]
                     next_at = min(next_at, t["next_at"])
             self._stop.wait(max(0.0, min(next_at - time.monotonic(), self._TICK_CAP)))
@@ -234,27 +229,27 @@ class StateMachine:
         self.pose_queue    = pose_queue     # optional Queue for DLC-based ITI
         self.beamer_queue  = beamer_queue   # optional Queue for beamer projection
         self.screen_queue  = screen_queue   # optional Queue for touch-screen patterns
-        # Live actuator state for the session CSV. The beamer, screens and speaker
-        # never touch command_queue, so serial_controls cannot see them — they are
-        # mirrored from this class's own chokepoints instead (hardware_state.py).
+        # Live actuator state for the session CSV: the beamer, screens and speaker
+        # never touch command_queue, so this mirrors them from this class's own
+        # chokepoints instead (see hardware_state.py).
         self.hw            = hw
         # (session_start Value('d'), trial Value('i')) for the GUI progress bar,
         # or None when nothing is watching. See _publish_progress.
         self.progress      = progress
         self._calib        = None           # BeamerCalibration, loaded at run()
         self._pump_calib   = None           # PumpCalibration, loaded at run()
-        self._shadow       = False          # derived from the active ITI region
-        self._field_color  = [255, 255, 255]  # stable shadow-field colour for this session
+        self._beamer_mode  = "light"        # session-wide, from protocol["beamer"]
+        self._field_color  = [255, 255, 255]  # stable lit-field colour for this session
         self._screens      = {}             # protocol["screens"] for this session
 
-        # Live reward layout. Promoted from a local so _screens_apply can follow the
+        # Live reward layout, promoted from a local so _screens_apply can follow
         # rewards around the arena as they swap lickports.
         self._reward_locations: dict = {}     # {reward_id: port}, mutated by switching
         self._screen_anchor_ports: list = []  # port each screen is pinned to (or None)
         self._switch_log: list = []           # [{"trial", "rewards", "ports"}]
-        # One record per reward outcome, written to the mouse log at session end. A
-        # reward is now a volume delivered over several licks, so how much the animal
-        # actually got is no longer implied by "the port was rewarded".
+        # One record per reward outcome, written to the mouse log at session end —
+        # a reward is now a volume over several licks, not a single event, so this
+        # is the only place that records how much the animal actually got.
         self._delivery_log: list = []
         self._reward_latches: dict = {}       # port → monotonic deadline (CSV codes)
 
@@ -275,20 +270,14 @@ class StateMachine:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _send(self, cmd: str) -> bool:
-        """Put a command on the hardware queue; count it if the queue is full.
+        """Put a command on the hardware queue; never blocks.
 
-        Still non-blocking — a stalled serial process must never freeze the trial
-        loop. But a dropped command is an invisible missing TTL edge or a pump that
-        never fired, so the count is reported once at the end of the session.
-
-        Returns whether the command was actually queued. Reward delivery needs the
-        answer: a dropped MOS is a droplet that never left the cannula, and counting
-        it toward the target volume would make the delivery log lie about how much
-        the animal drank.
-
-        Called from the scheduler thread as well as the main one;
-        multiprocessing.Queue.put_nowait is thread-safe and the counter is only a
-        diagnostic, so a lost increment does not matter.
+        Returns whether it was actually queued — reward delivery needs this,
+        since a dropped MOS pulse is a droplet that never left the cannula
+        and must not count toward the target volume. Dropped commands are
+        tallied and reported once at session end. Safe to call from the BNC
+        scheduler thread as well as the main one: Queue.put_nowait is
+        thread-safe, and a lost increment on the counter doesn't matter.
         """
         try:
             self.command_queue.put_nowait(cmd)
@@ -323,9 +312,9 @@ class StateMachine:
                 self._speaker.stop()
             except Exception:
                 pass
-        # The log must match what the hardware is now doing. The beamer and screens
-        # were already cleared through their own chokepoints above, so only the
-        # speaker (silenced out-of-band, behind its timer's back) is left.
+        # Beamer/screens were already cleared above through their own chokepoints;
+        # only the speaker (silenced out-of-band, behind its timer's back) needs
+        # its logged state fixed up here too.
         if self.hw is not None:
             self.hw.speaker.value = 0
         # No trial is running, so no port is offering a reward.
@@ -336,10 +325,9 @@ class StateMachine:
     def _set_reward_state(self, port: int, code: int, latch_until: float = None):
         """Publish one port's REWARD_* code for the session CSV.
 
-        *latch_until* holds a transient code (only REWARD_BLOCKED) for at least one
-        CSV sample period before it reverts to REWARD_AVAILABLE; see
-        _BLOCKED_LATCH_S. Terminal codes are passed without one and simply stand
-        until the trial ends.
+        *latch_until* holds a transient code (REWARD_BLOCKED) for at least one
+        CSV sample period before it reverts to AVAILABLE (see _BLOCKED_LATCH_S).
+        Terminal codes are passed without one and stand until the trial ends.
         """
         _hw_state.set_reward_state(self.hw, port, code)
         if latch_until is not None:
@@ -403,10 +391,9 @@ class StateMachine:
     def _load_pump_calib(self):
         """Load the per-pump µL/pulse table for this session.
 
-        Deliberately not folded into _load_calib below: that method's single
-        try/except would let a beamer import failure silently null the pump
-        calibration too, and the session would then refuse to start for a reason
-        that has nothing to do with the pumps.
+        Kept separate from _load_calib below: sharing one try/except would let
+        a beamer import failure silently null the pump calibration too, and
+        the session would refuse to start for a reason unrelated to pumps.
         """
         try:
             from pump_calibration import PumpCalibration
@@ -429,16 +416,16 @@ class StateMachine:
     def _beamer(self, cmd: dict):
         """Put a command on the beamer queue; drop silently if full/absent.
 
-        The sole funnel for both _beamer_baseline and _beamer_sphere, so mirroring
-        the projection into the shared state here covers everything the session
-        projects. Note a diameter-0 shadow sphere is the "fully lit field" baseline,
-        which is correctly recorded as the beamer being *on*.
+        Sole funnel for both _beamer_baseline and _beamer_sphere, so mirroring
+        the projection into hw here covers everything the session projects. A
+        diameter-0 sphere in a lit mode (the "field lit, no target" baseline)
+        is correctly recorded as the beamer being on.
         """
         if self.hw is not None:
             from hardware_state import write_beamer
             if cmd.get("cmd") == "sphere":
                 write_beamer(self.hw, True,
-                             shadow=bool(cmd.get("shadow", False)),
+                             mode=cmd.get("mode", "light"),
                              x_cm=cmd.get("x_cm", 0.0),
                              y_cm=cmd.get("y_cm", 0.0),
                              diameter_cm=cmd.get("diameter_cm", 0.0))
@@ -452,18 +439,29 @@ class StateMachine:
             pass
 
     @staticmethod
-    def _region_color(region: dict) -> list:
-        """Region colour scaled by its brightness → [r, g, b] (0–255)."""
-        b = float(region["brightness"]) / 100.0
-        c = region["color"]
-        return [int(c[0] * b), int(c[1] * b), int(c[2] * b)]
+    def _scaled_color(color, brightness) -> list:
+        """A colour scaled by a 0–100 brightness → [r, g, b] (0–255)."""
+        b = float(brightness) / 100.0
+        return [int(color[0] * b), int(color[1] * b), int(color[2] * b)]
+
+    @classmethod
+    def _region_color(cls, region: dict) -> list:
+        """The ITI target sphere's colour: region colour scaled by its brightness."""
+        return cls._scaled_color(region["color"], region["brightness"])
+
+    @classmethod
+    def _background_color(cls, beamer: dict) -> list:
+        """The constant lit field's colour, for the two lit projection modes."""
+        return cls._scaled_color(beamer["background_color"],
+                                 beamer["background_brightness"])
 
     @staticmethod
     def _active_iti_region(protocol: dict) -> dict | None:
         """The ITI region in play this session, or None for a fixed-time ITI.
 
-        Light/shadow is a property of the target region, so a fixed-time ITI — which
-        has no region — simply has no shadow mode and runs the beamer dark.
+        Only about the target's geometry/colour — projection mode is
+        session-wide (protocol["beamer"]), so a fixed-time ITI still has one
+        even with no target to project.
         """
         iti = protocol["intertrial"]
         if iti["type"] == "fixed_region":
@@ -472,29 +470,33 @@ class StateMachine:
             return iti["random_region"]
         return None
 
-    def _beamer_baseline(self, shadow: bool):
-        """Trial / fixed-time baseline: dark (Light mode) or a fully lit projection
-        area (Shadow mode — a diameter-0 shadow sphere lights the whole disc).
+    def _beamer_baseline(self, mode: str):
+        """The between-targets frame: what the arena looks like outside an ITI target.
 
-        In Shadow mode the field uses the session-wide _field_color so the lit
-        intensity is identical during trials and ITIs (it never switches — only
-        the dark target hole appears/disappears)."""
-        if shadow:
+        Light mode blanks the projector. The two lit modes hold their field as
+        a diameter-0 sphere, so the field itself never switches — only the
+        target appears/disappears on top of it, at the same _field_color
+        during both trials and ITIs.
+        """
+        if mode in BEAMER_LIT_MODES:
             self._beamer({"cmd": "sphere", "x_cm": 0.0, "y_cm": 0.0,
-                          "diameter_cm": 0.0, "shadow": True,
-                          "color": self._field_color})
+                          "diameter_cm": 0.0, "mode": mode,
+                          "color": self._field_color,
+                          "field_color": self._field_color})
         else:
             self._beamer({"cmd": "clear"})
 
-    def _beamer_sphere(self, region: dict, x_cm: float, y_cm: float, shadow: bool):
-        """Project the ITI target: bright sphere (Light) or dark hole (Shadow)."""
+    def _beamer_sphere(self, region: dict, x_cm: float, y_cm: float, mode: str):
+        """Project the ITI target: a bright sphere (Light), a dark hole (Shadow), or a
+        brighter sphere on top of the lit field (Lit background)."""
         self._beamer({
             "cmd":         "sphere",
             "x_cm":        x_cm,
             "y_cm":        y_cm,
             "diameter_cm": float(region["diameter_cm"]),
-            "shadow":      shadow,
+            "mode":        mode,
             "color":       self._region_color(region),
+            "field_color": self._field_color,
         })
 
     # ── Speaker ───────────────────────────────────────────────────────────────
@@ -502,11 +504,11 @@ class StateMachine:
     def _speaker_obj(self):
         """Lazily build the tone generator; None if it cannot be created.
 
-        SpeakerControls opens no audio device on construction — it only stores a
-        device string — and every tone runs in a daemon thread feeding a short-lived
-        `aplay` child, so this costs nothing until the first tone and never blocks
-        the trial loop. That is why the state machine owns one directly instead of
-        going through a queue and a separate process like the beamer and screens do.
+        SpeakerControls opens no audio device on construction, and every tone
+        runs in a daemon thread feeding a short-lived `aplay` child — so this
+        costs nothing until the first tone and never blocks the trial loop.
+        That's why the state machine owns one directly rather than going
+        through a queue and separate process like the beamer and screens do.
         """
         if not self._speaker_tried:
             self._speaker_tried = True
@@ -538,8 +540,8 @@ class StateMachine:
             print(f"[StateMachine] sound '{key}' failed: {exc}")
             return
         # Mark the speaker active for exactly the tone's length. produce_sound is
-        # non-blocking (it feeds an aplay child from its own thread), so a timer is
-        # what tracks the end — polling it from the trial loop would not.
+        # non-blocking (it feeds an aplay child from its own thread), so a timer
+        # tracks the end instead of the trial loop polling for it.
         if self.hw is not None:
             self.hw.speaker.value = 1
             timer = threading.Timer(length, self._speaker_done)
@@ -554,13 +556,12 @@ class StateMachine:
     # ── Session progress ──────────────────────────────────────────────────────
 
     def _publish_progress(self, session_start=None, trial_num=None):
-        """Publish session progress for the GUI's progress bar.
+        """Publish session progress for the GUI's progress bar. Either
+        argument may be None to leave that value alone.
 
-        *session_start* is a wall-clock time.time() (0.0 = no session running), so
-        the GUI can interpolate elapsed time on its own timer instead of this loop
-        having to keep a counter fresh while it is blocked inside a trial.
-
-        Either argument may be None to leave that value alone.
+        *session_start* is a wall-clock time.time() (0.0 = no session
+        running), so the GUI can interpolate elapsed time on its own timer
+        rather than this loop keeping a counter fresh while blocked in a trial.
         """
         if self.progress is None:
             return
@@ -593,10 +594,10 @@ class StateMachine:
     def _screen(self, screen_id: int, pattern: str):
         """Show *pattern* on one screen; drop silently if the queue is full/absent.
 
-        Sole funnel for the screens (_screens_apply, _all_off and the session-start
-        blank all come through here), so the shared state is mirrored here too. The
-        pattern is normalised with screen_controls' own table so the code stored
-        always matches what the screen actually shows.
+        Sole funnel for the screens (_screens_apply, _all_off, and the
+        session-start blank all come through here), so hw is mirrored here
+        too, normalised through screen_controls' own table so the stored
+        code always matches what the screen actually shows.
         """
         if self.hw is not None:
             from screen_controls import normalize_pattern
@@ -615,15 +616,14 @@ class StateMachine:
 
     def _screens_apply(self, phase: str) -> list:
         """Show the *phase* ("trial" / "iti") patterns on the screens.
-
-        static  — the protocol's per-screen patterns. With "randomize" on, the trial
-                  patterns are shuffled across the screens at the start of every
-                  trial, so which screen carries which cue is unpredictable.
-        dynamic — each screen is pinned to the lickport its reward started on and
-                  shows the pattern of whichever reward currently occupies that
-                  port, so the cues follow the rewards when they swap.
-
         Returns the patterns actually shown (empty in "none" mode).
+
+        static  — the protocol's per-screen patterns. With "randomize" on,
+                  trial patterns are shuffled across screens at the start of
+                  every trial, so which screen carries which cue is unpredictable.
+        dynamic — each screen is pinned to the lickport its reward started
+                  on, and shows the pattern of whichever reward currently
+                  occupies that port — so cues follow the rewards when they swap.
         """
         mode = self._screens["mode"]
         if mode == "none":
@@ -653,9 +653,8 @@ class StateMachine:
     def _mouse_json_path(protocol: dict) -> str | None:
         """Return path to Data/{mouse_id}.json, or None.
 
-        Directly in the Data folder: recordings are stored flat, and this file is
-        also what the GUI enumerates mice and sessions from, since the ids cannot be
-        parsed back out of the flat filenames.
+        This is also what the GUI enumerates mice/sessions from, since ids
+        can't be parsed back out of the flat recording filenames.
         """
         meta = protocol.get("_meta", {})
         mouse = meta.get("mouse_id", "")
@@ -751,11 +750,10 @@ class StateMachine:
     def _maybe_switch_rewards(self, protocol: dict, trial_num: int):
         """Roll once at the start of a trial; on a hit two rewards trade lickports.
 
-        This is a permutation of the ports already in use, never a move to a free
-        one, so the set of occupied ports is invariant. That is what keeps the LED
-        set stable across trials and guarantees every dynamic screen anchor still
-        resolves to some reward — a future "move a reward to a free port" feature
-        would break both and needs more than a swap here.
+        Always a permutation of ports already in use, never a move to a free
+        one — so the occupied-port set is invariant, which is what keeps the
+        LED set stable across trials and every dynamic screen anchor
+        resolving to some reward.
         """
         sw = protocol["rewards"]["switching"]
         # Trial 1 establishes the baseline layout, so rolls start from trial 2.
@@ -792,13 +790,11 @@ class StateMachine:
     def _reward_params(self, cfg: dict) -> tuple:
         """(probability, volume_ul) for one reward.
 
-        Equalise mode replaces both with the delay block's values once the delay
-        has passed; until then each reward keeps its own.
-
-        Called exactly once per port per trial, at first contact — never again while
-        that port is paying out. An equalise delay elapsing mid-delivery would
-        otherwise move the target volume underneath a port that is already
-        delivering, possibly below what it has already given.
+        Equalise mode replaces both with the delay block's values once the
+        delay has passed; until then each reward keeps its own. Called
+        exactly once per port per trial, at first contact — never again
+        while that port is paying out, so an equalise delay elapsing
+        mid-delivery can't move the target volume underneath it.
         """
         d = self._delay_cfg
         if d["enabled"] and d["mode"] == "equalise" and not self._delay_active():
@@ -829,34 +825,29 @@ class StateMachine:
 
     def _run_trial(self, trial_num: int, protocol: dict, sm_stop, sm_active,
                    sess_deadline: float | None = None) -> bool:
-        """Execute one trial.
+        """Execute one trial. Returns True on normal completion, False if stopped early.
 
-        Each rewarded port can be collected at most once per trial, but collecting
-        it is no longer a single event: a reward is a *volume*, delivered as a train
-        of short pulses gated by the animal's own licking (see pump_calibration.py
-        for why a long pulse is not an option — the pump shoots the liquid instead
-        of forming a droplet).
+        Each rewarded port can be collected at most once per trial, but
+        collecting it is a volume delivered as a train of short pulses gated
+        by the animal's own licking (see pump_calibration.py for why a long
+        pulse isn't an option — it shoots the liquid instead of forming a droplet).
 
         Per port, per trial:
-          • First contact rolls the probability once. A miss closes the port out
-            immediately with nothing delivered, exactly as before.
-          • A hit snapshots the target volume and the pulse count it needs, then
-            every subsequent high sensor sample — no sooner than
-            pump_refractory_ms after the last one — buys one more pulse.
-          • The port is collected when the volume is reached, or closed out as
-            "partial" when the animal stops licking for pump_delivery_timeout_s.
+          - First contact rolls the probability once. A miss closes the port
+            immediately with nothing delivered.
+          - A hit snapshots the target volume and pulse count, then every
+            subsequent high sensor sample — no sooner than pump_refractory_ms
+            after the last one — buys one more pulse.
+          - The port is collected when the volume is reached, or closed out
+            as "partial" if the animal stops licking for pump_delivery_timeout_s.
 
-        The refractory is a hard floor, not a preference: sensor_array is a 10 Hz
-        sample-and-hold (the firmware only sends STATUS every 100 ms), so a shorter
-        one would fire several pulses off a single sensor reading and the lick
-        gating would stop meaning anything. See shared_states.pump_refractory_ms.
+        The refractory is a hard floor: sensor_array is a 10 Hz sample-and-hold
+        (the firmware sends STATUS every 100 ms), so anything shorter would
+        fire multiple pulses off one sensor reading (see shared_states.pump_refractory_ms).
 
-        *sess_deadline* is a time.monotonic() stamp for the end of the session. It
-        bounds the "all rewards collected" end type, which otherwise has no time
-        limit at all — a trial would run forever if the mouse never licked, or for
-        the whole of a Release delay regardless of how short the session is.
-
-        Returns True on normal completion, False if stopped early.
+        *sess_deadline*, a time.monotonic() stamp for session end, bounds the
+        "all rewards collected" end type, which otherwise has no time limit —
+        a trial could run forever if the mouse never licked.
         """
         # Roll the port swap first: the reward ports, LEDs and screen cues derived
         # below must all describe the post-swap layout for this trial.
@@ -867,11 +858,11 @@ class StateMachine:
         port_to_rid   = {v: k for k, v in self._reward_locations.items()}
         led_ports     = self._get_led_ports(protocol, reward_ports)
 
-        # Beamer trial baseline: dark (Light mode) or full lit field (Shadow mode).
-        self._beamer_baseline(self._shadow)
+        # Beamer trial baseline: dark (Light mode) or the constant lit field
+        # (the two lit modes), with no ITI target on it.
+        self._beamer_baseline(self._beamer_mode)
 
-        # Touch-screen cues for this trial. Dynamic mode reads the reward layout, so
-        # this has to follow the swap above.
+        # Dynamic screen mode reads the reward layout, so this must follow the swap above.
         screen_patterns = self._screens_apply("trial")
 
         for p in led_ports:
@@ -888,9 +879,9 @@ class StateMachine:
         duration    = float(trial_conf["duration_s"])
 
         collected   = set()
-        # Per-port delivery state for ports that rolled a hit and are paying out.
-        # Everything in here is snapshotted at the roll and never re-read from the
-        # protocol, so nothing can move a target volume under a port mid-delivery.
+        # Per-port delivery state for ports that rolled a hit and are paying
+        # out. Snapshotted at the roll and never re-read from the protocol,
+        # so nothing can move a target volume under a port mid-delivery.
         delivery: dict = {}
         trial_start = time.monotonic()
 
@@ -908,8 +899,8 @@ class StateMachine:
                 # animal actually got rather than losing it.
                 self._close_partials(trial_num, delivery, collected)
                 self._clear_reward_states()
-                # No end-of-trial pulse or tone on an emergency stop, but the
-                # during-trial train must still be switched off.
+                # No end-of-trial pulse/tone on an emergency stop, but the
+                # during-trial BNC train must still be switched off.
                 self._bnc.set_phase(None)
                 return False
 
@@ -953,9 +944,8 @@ class StateMachine:
                     plan = (self._pump_calib.pulses_for(port, vol)
                             if self._pump_calib is not None else None)
                     if plan is None:
-                        # run() refuses to start an uncalibrated session, so this is
-                        # a should-not-happen. Close the port out rather than divide
-                        # by None and take the whole session down with it.
+                        # Should not happen: run() refuses to start an uncalibrated
+                        # session. Close the port out rather than divide by None.
                         print(f"[StateMachine] ERROR: port {port} has no pump "
                               f"calibration — no reward delivered.")
                         self._log_delivery(trial_num, port, rid, vol, 0.0, 0,
@@ -1001,10 +991,9 @@ class StateMachine:
                     collected.add(port)
                     del delivery[port]
                 elif now - state["last_pulse"] >= _DELIVERY_TIMEOUT_S:
-                    # The animal walked away mid-reward. Without this the port never
-                    # becomes collected, and an "all rewards collected" trial in a
-                    # *trials*-type session has no sess_deadline to fall back on —
-                    # the loop would spin until someone hit stop.
+                    # The animal walked away mid-reward. Without this, the port
+                    # never becomes collected — and an "all rewards collected"
+                    # trial has no other deadline to fall back on.
                     self._close_partial(trial_num, port, state, collected)
                     del delivery[port]
 
@@ -1035,8 +1024,8 @@ class StateMachine:
     def _run_iti(self, iti_config: dict, sm_stop, sm_active) -> bool:
         """Run the intertrial interval, with the BNC intertrial phase around it.
 
-        A thin wrapper so the phase is cleared on every one of the body's exit
-        paths — normal completion, a stop flag, or the no-calibration fallback.
+        A thin wrapper so the BNC phase is cleared on every exit path of the
+        body below — normal completion, a stop flag, or the no-calibration fallback.
         """
         self._bnc.set_phase("iti")
         try:
@@ -1045,9 +1034,8 @@ class StateMachine:
             self._bnc.set_phase(None)
 
     def _run_iti_body(self, iti_config: dict, sm_stop, sm_active) -> bool:
-        """Run the intertrial interval between two trials.
-
-        Returns True on normal completion, False if a stop flag fires.
+        """Run the intertrial interval between two trials. Returns True on
+        normal completion, False if a stop flag fires.
 
         Three modes driven by iti_config["type"]:
           "time"          — fixed sleep, beamer holds the trial baseline
@@ -1057,7 +1045,7 @@ class StateMachine:
         """
         import math
         iti_type = iti_config["type"]
-        shadow = self._shadow
+        mode = self._beamer_mode
 
         # Touch screens switch to their ITI patterns for the whole interval.
         self._screens_apply("iti")
@@ -1086,7 +1074,7 @@ class StateMachine:
                       else random.uniform(0, float(region["duration_max_s"])))
 
         # Project the target for the whole ITI.
-        self._beamer_sphere(region, x_cm, y_cm, shadow)
+        self._beamer_sphere(region, x_cm, y_cm, mode)
 
         # Target in beamer pixels; the mouse is mapped DLC → beamer via the affine.
         calib = self._calib
@@ -1097,7 +1085,7 @@ class StateMachine:
             print("[StateMachine] ITI: no camera↔beamer mapping / pose feed — "
                   f"holding the cue for {required_s:.1f} s.")
             ok = self._sleep(required_s, sm_stop, sm_active)
-            self._beamer_baseline(shadow)
+            self._beamer_baseline(mode)
             return ok
 
         bx, by, r_px = calib.cm_to_px(x_cm, y_cm, diameter_cm)
@@ -1137,7 +1125,7 @@ class StateMachine:
                         in_region_since = now
                     elif now - in_region_since >= required_s:
                         print("[StateMachine] ITI complete — mouse in region.")
-                        self._beamer_baseline(shadow)
+                        self._beamer_baseline(mode)
                         return True
                 else:
                     in_region_since = None
@@ -1161,13 +1149,21 @@ class StateMachine:
             from hardware_state import reset as _reset_hw
             _reset_hw(self.hw)
 
-        # Beamer session setup. Light/shadow belongs to the ITI target region, so a
-        # fixed-time ITI (no region) simply runs the beamer dark all session.
-        region = self._active_iti_region(protocol)
-        self._shadow      = bool(region["shadow"]) if region else False
-        self._field_color = self._region_color(region) if region else [255, 255, 255]
+        # The projection mode is session-wide, so it applies even to a
+        # fixed-time ITI, which has no target but can still light the arena
+        # for the whole session. Imported here (not at module scope) since it
+        # pulls in PyQt5, only worth paying for once a session actually starts.
+        from beamer_controls import normalise_protocol_beamer
+        beamer = normalise_protocol_beamer(protocol)["beamer"]
+        self._beamer_mode = beamer["mode"]
+        self._field_color = self._background_color(beamer)
         self._load_calib()
         self._load_pump_calib()
+
+        # Light the field from t=0 — the first per-trial baseline only lands
+        # once trial 1 starts, which would otherwise leave a lit-mode session
+        # dark through _assign_locations, the mouse-log write and any reward delay.
+        self._beamer_baseline(self._beamer_mode)
 
         # Touch-screen patterns for this session. The CSV logs the screens only when
         # they are actually in use — in "none" mode the column stays empty rather
@@ -1201,11 +1197,10 @@ class StateMachine:
             session_done.value = True
             return
 
-        # Every reward port must have a measured µL/pulse or the protocol's volumes
-        # mean nothing. Checked here rather than earlier because a random
-        # distribution does not know its ports until _assign_locations has run.
-        # ExperimentPage gates this too, before it creates any files; this is the
-        # backstop for a session started any other way.
+        # Every reward port needs a measured µL/pulse, checked here (not
+        # earlier) since a random distribution doesn't know its ports until
+        # _assign_locations has run. ExperimentPage gates this too before
+        # creating any files; this is the backstop for a session started any other way.
         missing = (self._pump_calib.uncalibrated_ports(locations.values())
                    if self._pump_calib is not None else sorted(locations.values()))
         if missing:
@@ -1272,11 +1267,11 @@ class StateMachine:
         trial_num   = 0
         stopped     = False
 
-        # Publish the session clock for the GUI's progress bar. A wall-clock start is
-        # posted once rather than an elapsed value on every tick: the GUI can then
-        # interpolate smoothly on its own timer, and this loop — which spends most of
-        # its life blocked inside a trial — never has to keep a counter fresh.
-        # time.time(), not monotonic(): the two processes share a wall clock only.
+        # Publish the session clock once as a wall-clock start rather than an
+        # elapsed value on every tick, so the GUI can interpolate smoothly on
+        # its own timer instead of this loop keeping a counter fresh while
+        # blocked inside a trial. time.time(), not monotonic() — the two
+        # processes only share a wall clock.
         self._publish_progress(time.time(), 0)
 
         # Anchored here rather than where it was sampled, so writing the mouse log
@@ -1339,8 +1334,7 @@ class StateMachine:
             print(f"[StateMachine] WARNING: {self._dropped_cmds} hardware "
                   f"command(s) dropped — the command queue was full.")
 
-        # Session totals. Volume delivered is no longer implied by the reward count,
-        # so it is worth one line rather than making the user open the mouse log.
+        # Session totals, printed as one line rather than making the user open the mouse log.
         if self._delivery_log:
             total_ul = sum(d["delivered_ul"] for d in self._delivery_log)
             counts   = {}
@@ -1376,16 +1370,12 @@ def state_machine_process(sm_active, sm_stop, sm_running, command_queue,
                            sensor_array, protocol_queue, session_done,
                            pose_sm_queue=None, beamer_queue=None,
                            screen_queue=None, hw=None, progress=None):
-    """Long-running process that hosts the StateMachine.
+    """Process entry point: hosts a long-running StateMachine.
 
-    Lifecycle:
-      • Idles (sleep 50 ms) until sm_active becomes True.
-      • Reads the protocol dict from protocol_queue (put there by ExperimentPage
-        before setting sm_active).
-      • Runs a full session, then resets sm_active to False and returns to idle.
-      • Exits when sm_running becomes False.
-
-    Called by main.py as a multiprocessing.Process target.
+    Lifecycle: idles (50 ms poll) until sm_active becomes True, reads the
+    protocol dict from protocol_queue (put there by ExperimentPage before
+    setting sm_active), runs a full session, resets sm_active to False and
+    returns to idle. Exits when sm_running becomes False.
     """
     from console_log import tag_process
     tag_process("StateMachine")

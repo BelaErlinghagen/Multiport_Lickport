@@ -1,42 +1,39 @@
-"""console_log.py — one timestamped console log per recording, across every process.
+"""One timestamped console log per recording, covering every process.
 
-The rig runs eight processes (camera, DLC, serial, beamer, screens, state machine,
-saving, and the GUI in the parent) and they all print into the same terminal. This
-module tees that combined stream into a log file inside the current recording's
-folder, so a session's console narrative becomes part of its data.
+The rig runs several processes (camera, DLC, serial, beamer, screens, state
+machine, saving, and the GUI in the parent), all printing to the same
+terminal. This module tees that combined stream into a log file inside the
+current recording's folder, so a session's console output becomes part of
+its data.
 
 How the capture works
 ---------------------
-`install_capture()` replaces file descriptors 1 and 2 with the write end of a pipe
-and starts a pump thread that reads it. Children inherit fds 1/2 across
-multiprocessing's "spawn" (only fds >= 3 are closed), so this single install in the
-parent captures every process. Being at the fd level it also catches C-level output
-— Pylon, TensorFlow, Qt, ALSA — which a `sys.stdout` swap would miss entirely and
-which spawn would not inherit anyway.
+install_capture() replaces file descriptors 1 and 2 with a pipe and starts a
+pump thread that reads it. Children inherit fds 1/2 across multiprocessing's
+"spawn", so this one install in the parent captures every process — and
+being at the fd level, it also catches C-level output (Pylon, TensorFlow,
+Qt, ALSA) that a `sys.stdout` swap would miss.
 
-One pipe carries both streams. Two would preserve the terminal's stdout/stderr split
-for free, but would also scramble the interleaving of a process's own stdout and
-stderr lines, and faithful global ordering is the point of the file. The stream kind
-travels in a marker instead, so the tee still writes to the right real fd.
+Both stdout and stderr share one pipe, so their lines interleave in the true
+global order; a marker in each write says which stream it came from so the
+tee can still route it to the right real fd.
 
-`tag_process(name)` wraps this process's `sys.stdout`/`sys.stderr` so each line is
-emitted as ONE write carrying a `\\x01<tag>|<o|e>\\x02` marker. That matters twice
-over: it is what gives the log per-process tags, and it is what stops concurrent
-processes shredding each other mid-line — POSIX only guarantees pipe-write atomicity
-up to PIPE_BUF (4096 bytes), and a plain `print()` issues two separate writes.
-The pump strips the marker before the terminal sees it, so the console looks exactly
-as it did before.
+tag_process(name) wraps this process's stdout/stderr so each line is one
+write carrying a `\\x01<tag>|<o|e>\\x02` marker — both to tag the line's
+source and to keep concurrent processes from shredding each other mid-line
+(POSIX only guarantees atomic pipe writes up to PIPE_BUF, 4096 bytes, and
+`print()` alone issues two separate writes). The pump strips the marker
+before the terminal sees it, so the console looks unchanged.
 
 The log window
 --------------
-Lines printed from launch up to the first `start_log()` are kept as a frozen
-preamble and replayed into every session log, so each file opens with the startup
-messages (camera init, calibration, driver warnings). After that a file receives only
-its own recording's lines — a second recording's log never contains the first one's
-trials. Between recordings, output goes to the console only.
+Lines printed before the first start_log() are kept as a frozen preamble and
+replayed into every session log, so each file opens with the startup
+messages. After that, a file receives only its own recording's lines; between
+recordings, output goes to the console only.
 
-Stdlib only, and nothing runs at import: every process imports this module, including
-the DLC one, so it must stay free of numpy and Qt.
+Stdlib only, and nothing runs at import — every process imports this module,
+including the DLC one, so it must stay free of numpy and Qt.
 """
 
 import atexit
@@ -84,8 +81,8 @@ _sync_event = threading.Event()
 class _TaggedStream:
     """Line-assembling wrapper that stamps each line with its process and stream.
 
-    Buffers until a newline and then issues exactly one `write` per line, which is
-    what keeps concurrent processes from interleaving mid-line in the shared pipe.
+    Buffers until a newline, then issues exactly one write per line — what
+    keeps concurrent processes from interleaving mid-line in the shared pipe.
     """
 
     def __init__(self, stream, tag, kind):
@@ -142,9 +139,9 @@ class _TaggedStream:
 def tag_process(name: str) -> None:
     """Prefix this process's Python-level output with a source marker.
 
-    Call as the first statement of a process target, before the heavyweight imports
-    below it, so their output is tagged too. C-level output cannot be tagged this
-    way — the pump labels it "raw".
+    Call as the first statement of a process target, before any heavyweight
+    imports, so their output gets tagged too. C-level output can't be tagged
+    this way — the pump labels it "raw".
     """
     if isinstance(sys.stdout, _TaggedStream):
         return
@@ -178,7 +175,7 @@ def _emit(raw: bytes) -> None:
             _sync_event.set()
         return
 
-    # The terminal keeps exactly the output it had before this module existed.
+    # Write straight to the real fd so the terminal's own output is unchanged.
     fd = _real_err_fd if kind == "e" else _real_out_fd
     if fd is not None:
         try:
@@ -208,13 +205,13 @@ def _emit(raw: bytes) -> None:
 
 
 def _pump(read_fd: int) -> None:
-    """Drain the capture pipe forever.
+    """Drain the capture pipe forever, until every write end is closed.
 
-    This loop must never exit while a process could still write. The pipe holds
-    64 kB; if nobody drains it, every process in the rig blocks on its next print
-    and the whole thing freezes. So every per-line failure is swallowed and the read
-    resumes, and the pump never calls print() — that would recurse into the pipe it
-    is draining.
+    Must never exit while a process could still write: the pipe holds a
+    fixed 64 kB, and if nobody drains it, every process in the rig blocks on
+    its next print. So per-line failures are swallowed rather than raised,
+    and this never calls print() itself — that would recurse into the pipe
+    it's draining.
     """
     buf = b""
     while True:
@@ -255,8 +252,8 @@ def _flush_loop() -> None:
 def install_capture() -> None:
     """Redirect fds 1/2 onto a capture pipe and start the pump. Idempotent.
 
-    MUST run before the first Process.start(): the children inherit fds 1/2, and
-    that inheritance is the whole capture mechanism.
+    Must run before the first Process.start() — child processes inherit fds
+    1/2, and that inheritance is the entire capture mechanism.
     """
     global _installed, _real_out_fd, _real_err_fd, _write_fd, _read_fd
     global _pump_thread, _flush_thread
@@ -267,9 +264,8 @@ def install_capture() -> None:
     _real_err_fd = os.dup(2)
     _read_fd, _write_fd = os.pipe()
 
-    # Children are spawned with a fresh interpreter, and a pipe on fd 1 makes its
-    # stdout block-buffered at 8 kB — a quiet process's output would surface minutes
-    # late. The variable is inherited through the environment.
+    # A pipe on fd 1 makes a fresh child's stdout block-buffered (~8 kB), so a
+    # quiet process's output could surface minutes late without this.
     os.environ["PYTHONUNBUFFERED"] = "1"
 
     os.dup2(_write_fd, 1)
@@ -297,11 +293,11 @@ def install_capture() -> None:
 def _sync(timeout: float = 2.0) -> None:
     """Block until the pump has processed everything written so far.
 
-    The pump runs asynchronously, so without this the lines printed just before a
-    recording stops would still be in the pipe when the file is closed and would be
-    lost — and lines printed just before one starts could land in the wrong file.
-    A pipe is FIFO, so once the sentinel comes out the ordinary output ahead of it
-    has already been handled.
+    Without this, lines printed just before a recording stops could still be
+    in the pipe when the file closes (and be lost), or lines printed just
+    before one starts could land in the wrong file. Works by writing a
+    sentinel and waiting for it to come back out — a pipe is FIFO, so
+    everything ahead of it has been handled by then.
     """
     global _sync_token
     if not _installed:

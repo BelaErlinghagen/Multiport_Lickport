@@ -1,9 +1,9 @@
 """RSpace API client and helpers.
 
-This module is designed to be reused on its own, independently of the bundled GUI.
-The core is the :class:`RSpaceClient` class, which holds a connection (API key +
-server URL) and exposes the RSpace operations as plain methods — no hidden global
-state, so you can create as many clients as you like and test them easily:
+Designed to be reused on its own, independent of the bundled GUI. The core
+is :class:`RSpaceClient`, which holds a connection (API key + server URL)
+and exposes RSpace operations as plain methods — no hidden global state, so
+you can create as many clients as you like and test them easily:
 
     from rspace import RSpaceClient
 
@@ -16,18 +16,18 @@ state, so you can create as many clients as you like and test them easily:
                            tags=["id_OPI111", "m_mea"], content="hello")
     client.project_overview(folder_id=12345, output_dir="~/Desktop")
 
-Stateless helpers (no network) are module-level functions and can be used directly:
+Stateless helpers that need no network call are plain module-level functions:
 ``strip_tag_prefix``, ``current_date_time``, ``parse_entry_name``,
 ``summarize_documents`` / ``create_summary_csv``, ``filepaths_for_rows`` /
 ``generate_filepaths``, ``build_renamed_name`` and ``rename_and_organize_files``.
 
-For applications that want to persist one set of credentials (as the bundled GUI
-does), an optional convenience layer stores them in a config file *next to this
-module* (``config/config.json`` — overridable via the
-``RSPACE_CONFIG_DIR`` environment variable) via ``load_credentials`` /
-``save_credentials``, and offers module-level functions (``get_tags``,
-``list_all_folders``, ``create_entry`` …) that operate through a default client
-built from those saved credentials.
+For an application that wants to persist one set of credentials (as the
+bundled GUI does), an optional convenience layer stores them in
+``config/config.json`` next to this module (override with the
+``RSPACE_CONFIG_DIR`` env var) via ``load_credentials``/``save_credentials``,
+and offers module-level functions (``get_tags``, ``list_all_folders``,
+``create_entry``, …) that operate through a default client built from those
+saved credentials.
 """
 
 import csv
@@ -153,14 +153,12 @@ def filterable_tags(metadata_file):
 def summarize_documents(docs, filter_tags=None):
     """Turn a list of RSpace document dicts into summary rows.
 
-    One row per subject ("id_") tag found on a document. The ``mouseID`` and
-    ``method`` values have their prefixes stripped (they are used for naming),
-    while ``tags`` keeps the raw tag list. Each row is a dict keyed by
-    :data:`SUMMARY_FIELDS`.
+    One row per subject ("id_") tag on a document; ``mouseID``/``method`` have
+    their prefixes stripped (used for naming) while ``tags`` keeps the raw
+    list. Each row is a dict keyed by :data:`SUMMARY_FIELDS`.
 
-    If ``filter_tags`` is a non-empty collection, only documents carrying at least
-    one of those tags are included (an OR filter — e.g. select "preprocessed" and
-    "m_mea" to keep entries that are preprocessed *or* used that method).
+    If ``filter_tags`` is given, only documents carrying at least one of
+    those tags are included (an OR filter).
     """
     keep = set(filter_tags) if filter_tags else None
     rows = []
@@ -221,35 +219,24 @@ def create_summary_csv(metadata_file, output_dir, filter_tags=None):
 
 def filepaths_for_rows(rows, lab_group=LAB_GROUP, *, fmt="full",
                        raw_data_prefix=True, processed_data_prefix=True):
-    """Build organised file paths from summary rows (dicts shaped like
+    """Build organised file paths from summary rows (shaped like
     :func:`summarize_documents` output).
 
-    The **directory** of each entry depends on its tags:
+    Directory depends on tags: ``preprocessed`` -> ``<lab>/<experimenter>/preprocessed/…``,
+    ``results`` -> ``<lab>/<experimenter>/results/…``, otherwise (raw data) ->
+    ``<method>/<experimenter>/…`` (method falls back to "unknown_method"). An
+    entry with both ``preprocessed`` and ``results`` yields a path for each.
 
-      - tagged ``preprocessed`` → ``<lab>/<experimenter>/preprocessed/…``
-      - tagged ``results``      → ``<lab>/<experimenter>/results/…``
-      - otherwise (raw data)    → ``<method>/<experimenter>/…`` (method falls back to
-        "unknown_method").
+    ``raw_data_prefix``/``processed_data_prefix`` (both on by default) prepend
+    a ``raw_data/`` or ``processed_data/`` top-level folder; turn one off if
+    your local top level is named differently.
 
-    An entry carrying both ``preprocessed`` and ``results`` yields one path for each.
-
-    Two optional **top-level folders** are prepended in front of those directories
-    (both on by default — turn one off if your local top-level folder is named
-    differently and you want to add it yourself; everything below it stays fixed):
-
-      - ``raw_data_prefix`` → raw-data paths become ``raw_data/<method>/…``
-      - ``processed_data_prefix`` → preprocessed/results paths become
-        ``processed_data/<lab>/…``
-
-    ``fmt`` chooses the shape of the returned rows:
-
-      - ``"full"`` (default) → ``(mouseID, filepath)`` pairs, where ``filepath`` is the
-        whole path ending in ``mouseID_date_time_extra`` (empty parts omitted — e.g. an
-        ID-less results entry just uses its ``date_time_extra`` / name).
-      - ``"split"`` → ``(id, entry_name, path)`` triples, where ``entry_name`` is the
-        "extra" part of the name and ``path`` is the whole path *without* it (ending in
-        ``mouseID_date_time``). For ``20260601_1030_test`` the entry name is ``test`` and
-        the path ends in ``…/OPI111_20260601_1030``.
+    ``fmt`` shapes the output:
+      - ``"full"`` (default): ``(mouseID, filepath)`` pairs, filepath ending
+        in ``mouseID_date_time_extra`` (empty parts omitted).
+      - ``"split"``: ``(id, entry_name, path)`` triples, where path excludes
+        the trailing entry name (e.g. ``20260601_1030_test`` splits into
+        entry name ``test`` and a path ending ``…/OPI111_20260601_1030``).
     """
     out = []
     for row in rows:
@@ -284,18 +271,15 @@ def filepaths_for_rows(rows, lab_group=LAB_GROUP, *, fmt="full",
 
 def generate_filepaths(summary_csv, output_dir, lab_group=None, *, fmt="full",
                        raw_data_prefix=True, processed_data_prefix=True):
-    """Read a summary CSV, build organised file paths (see :func:`filepaths_for_rows`)
-    and write them to ``filepaths_<stem>.csv`` in output_dir. Returns the written CSV
-    path. ``lab_group`` defaults to the saved setting (``load_lab_group()``).
+    """Read a summary CSV, build organised file paths (see
+    :func:`filepaths_for_rows`) and write them to ``filepaths_<stem>.csv`` in
+    output_dir. Returns the written CSV path.
 
-    ``fmt`` selects the columns written (see :func:`filepaths_for_rows`):
-
-      - ``"full"`` (default) → columns ``mouseID, filepath``.
-      - ``"split"`` → columns ``id, entry name, path`` (the path excludes the trailing
-        entry name).
-
-    ``raw_data_prefix`` / ``processed_data_prefix`` toggle the ``raw_data/`` and
-    ``processed_data/`` top-level folders (both on by default).
+    ``lab_group`` defaults to the saved setting (``load_lab_group()``). ``fmt``
+    selects the columns: ``"full"`` (default) writes ``mouseID, filepath``;
+    ``"split"`` writes ``id, entry name, path``. ``raw_data_prefix``/
+    ``processed_data_prefix`` toggle the top-level folder prefixes (see
+    :func:`filepaths_for_rows`).
     """
     with open(summary_csv, newline="") as f:
         rows = list(csv.DictReader(f))
@@ -315,9 +299,8 @@ def generate_filepaths(summary_csv, output_dir, lab_group=None, *, fmt="full",
 def build_renamed_name(original_name, prefix, strip_front=0, strip_back=0):
     """Return the new file name for `original_name` given `prefix`.
 
-    `strip_front` characters are removed from the start of the original name and
-    `strip_back` characters from its end (the file extension is always kept);
-    both can be applied at once. `prefix` is then prepended. For example,
+    Strips `strip_front` characters from the start and `strip_back` from the
+    end (the extension is always kept), then prepends `prefix`. E.g.
     build_renamed_name("20260101_1200_rec.tif", "OPI111", strip_front=14)
     returns "OPI111_rec.tif".
     """
@@ -338,14 +321,11 @@ def rename_and_organize_files(files, prefix, dest_folder=None, raw_data_folder=N
                               strip_front=0, strip_back=0):
     """Rename files with `prefix_` and optionally move/copy them.
 
-    Steps (in order):
-      1. Rename each file in place to `{prefix}_{original_name}`, after erasing
-         `strip_front` characters from the start and `strip_back` characters from
-         the end of the original name (see :func:`build_renamed_name`).
-      2. If dest_folder given: create it and move renamed files there.
-      3. If raw_data_folder given: copy files (from their post-step-2 location) there.
+    1. Rename each file in place via :func:`build_renamed_name`.
+    2. If dest_folder is given, create it and move the renamed files there.
+    3. If raw_data_folder is given, copy the files there too.
 
-    Returns a list of final Path objects.
+    Returns a list of the final Path objects.
     """
     final_paths = []
     for f in files:
@@ -643,24 +623,16 @@ class RSpaceClient:
     def create_tree(self, folder_id=None, exclude_top=DEFAULT_EXCLUDED_TOP_FOLDERS, max_workers=8):
         """Return the workspace folder structure as a nested list of nodes.
 
-        Starting at the workspace root (folder_id=None), descends into every folder
-        and notebook so the hierarchy is represented at all depths, and lists every
-        entry. Each node is a dict::
+        Descends into every folder/notebook from folder_id (default: the
+        workspace root), so the hierarchy is represented at all depths. Each
+        node is ``{"id", "name", "type", "notebook": bool, "children": [...]}``
+        — folders/notebooks carry children, other items are leaves. Children
+        are sorted folders/notebooks first, then alphabetically.
 
-            {"id": int, "name": str,
-             "type": "folder" | "notebook" | "document" | ...,
-             "notebook": bool, "children": [ ...nodes... ]}
-
-        Folders/notebooks carry a (possibly empty) ``children`` list; documents and
-        other items are leaves. Children are sorted folders/notebooks first, then
-        the rest, alphabetically.
-
-        ``exclude_top`` names top-level folders to skip entirely (default: the large
-        system folders ``Gallery`` and ``Examples``, which slow traversal and aren't
-        useful as entry locations). Pass ``()`` to include everything.
-
-        The folders at each depth are fetched concurrently with up to ``max_workers``
-        threads; set ``max_workers=1`` to fetch sequentially.
+        ``exclude_top`` names top-level folders to skip (default: the large
+        ``Gallery``/``Examples`` system folders); pass ``()`` for everything.
+        Folders at each depth are fetched concurrently with up to
+        ``max_workers`` threads (1 = sequential).
         """
         roots, frontier, visited = [], [], set()
         for rec in self._tree_records(folder_id):
@@ -765,9 +737,8 @@ class RSpaceClient:
 
 
 # ── Drafts / autosave (in-folder JSON) ──────────────────────────────────────────────
-# Stores in-progress entry drafts as JSON files inside the application folder
-# (``Autosaved/`` next to this module), so an unsaved note survives a crash and can
-# be reloaded.
+# Stores in-progress entry drafts as JSON files in Autosaved/ next to this
+# module, so an unsaved note survives a crash and can be reloaded.
 
 def autosave_dir():
     """Return the drafts directory: ``$RSPACE_AUTOSAVE_DIR`` if set, else the
@@ -820,12 +791,12 @@ def delete_draft(path):
 
 
 # ── Stored-credentials convenience layer (optional) ─────────────────────────────────
-# Persists a single set of credentials and exposes module-level functions that operate
-# through a default client built from them. The config lives *inside the application
-# folder* (``config/config.json`` next to this module) so the whole app is self-
-# contained and portable — nothing is written to per-user/system locations (which on
-# Windows domain machines get redirected to network shares and cause trouble).
-# Applications that don't want this can ignore it and use RSpaceClient directly.
+# Persists a single set of credentials and exposes module-level functions
+# that operate through a default client built from them. Config lives in
+# config/config.json next to this module (not a per-user/system location,
+# which on Windows domain machines can be redirected to a network share) so
+# the app stays self-contained and portable. Ignore this and use
+# RSpaceClient directly if you don't want it.
 
 def _config_dir():
     """Return the config directory: ``$RSPACE_CONFIG_DIR`` if set, else the ``config``

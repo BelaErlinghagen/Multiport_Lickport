@@ -1,5 +1,7 @@
-# main_plotting.py — GUI entry point
-# Imports widgets from the gui/ subpackage and builds the main window.
+"""GUI entry point. Builds the main window (tab panel + camera/sensor panels)
+from the widgets in gui/, and installs a guard so an uncaught exception in a
+Qt slot can't crash a running experiment."""
+import re
 import sys
 import traceback
 
@@ -10,13 +12,11 @@ from gui import CameraWidget, SensorWidget, CleaningPage, ExperimentPage, Protoc
 
 
 def _install_exception_guard():
-    """Stop a single Python error from killing the whole GUI process.
+    """Prevent an uncaught exception in a Qt slot from crashing the process.
 
-    PyQt5 (>= 5.5) calls Qt's qFatal() when an exception escapes a slot, which
-    aborts the process with SIGABRT — a bad reply from the RSpace API while the
-    settings dialog is open would take a running experiment down with it.
-    Installing our own sys.excepthook suppresses that abort, so the error is
-    logged and shown instead of being fatal.
+    PyQt5 calls Qt's qFatal() (SIGABRT) when a slot raises, which would kill
+    a running experiment over something as minor as a bad RSpace API reply.
+    This installs a sys.excepthook that logs and displays the error instead.
     """
     reporting = []   # guard: a repeating error must not stack up dialogs
 
@@ -32,9 +32,8 @@ def _install_exception_guard():
         details = "".join(traceback.format_exception(exc_type, exc, tb))
 
         def report():
-            # Shown from a timer, not from here: this hook runs while the stack is
-            # still unwinding out of the failed slot, and opening a modal dialog's
-            # nested event loop at that point is not safe.
+            # Deferred via a timer: this hook runs mid-unwind, and opening a
+            # modal dialog's nested event loop at that point isn't safe.
             try:
                 box = QtWidgets.QMessageBox(
                     QtWidgets.QMessageBox.Warning, "Error",
@@ -50,22 +49,47 @@ def _install_exception_guard():
     sys.excepthook = hook
 
 
-def _control_screen_rect(app):
-    """Resolve where the main window belongs: (QScreen or None, target QRect).
+def _net_work_area():
+    """The desktop work area (_NET_WORKAREA) as a QRect, or None.
 
-    The control monitor is identified by its **hardcoded** position on the X
-    virtual desktop (shared_states.control_screen_geometry), not by a screens()
-    index: indices reshuffle whenever a display is plugged in or wakes up in a
-    different order, and the one window the experimenter has to be able to reach
-    is not the one to leave up to that. The matching QScreen is only used for its
-    availableGeometry, so the GNOME top bar and dock stay usable; if no screen
-    matches, the hardcoded rect is used verbatim.
+    Qt's QScreen.availableGeometry() reports the *full* screen on this rig:
+    _NET_WORKAREA is published as one rect spanning the whole multi-monitor
+    desktop, and Qt cannot split that per screen, so it gives up and omits the
+    dock/top-bar reservation. Asking for a rect that covers reserved space gets
+    silently refused by the window manager, so read the property directly.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["xprop", "-root", "_NET_WORKAREA"],
+                             capture_output=True, text=True, timeout=2).stdout
+        numbers = [int(n) for n in re.findall(r"-?\d+", out.split("=", 1)[1])]
+    except Exception:
+        return None
+    if len(numbers) < 4:
+        return None
+    return QtCore.QRect(*numbers[:4])   # one rect per desktop; they match here
+
+
+def _control_screen_rect(app):
+    """Find which screen the main window should open on.
+
+    Returns (QScreen or None, target QRect). Uses the hardcoded desktop
+    position in shared_states.control_screen_geometry rather than a
+    screens() index, since those indices can reshuffle on replug and this is
+    the one window the experimenter must always be able to find.
+
+    The rect is clipped to the desktop work area, so what we ask for is what
+    the window manager is willing to grant — see _place_on_control_screen.
     """
     x, y, w, h = shared_states.control_screen_geometry
     target = QtCore.QRect(int(x), int(y), int(w), int(h))
     for screen in app.screens():
         if screen.geometry().contains(target.center()):
-            return screen, screen.availableGeometry()
+            rect = screen.availableGeometry()
+            work = _net_work_area()
+            if work is not None and work.intersects(rect):
+                rect = rect.intersected(work)
+            return screen, rect
     print(f"[GUI] no display found at {target.getRect()}; placing the GUI there "
           f"anyway. Check shared_states.control_screen_geometry against "
           f"`xrandr --listmonitors`.")
@@ -75,26 +99,30 @@ def _control_screen_rect(app):
 def _place_on_control_screen(window, screen, rect):
     """Move/resize `window` onto the control monitor.
 
-    Called both before the window is shown and again after it is mapped, because
-    GNOME/Mutter honours an app's requested *size* at map time but overrides its
-    *position*, putting a new window on whichever monitor is "current" — and the
-    touch panels are pointer devices, so that is regularly one of them. Setting
-    the geometry up front only gets the size across; re-asserting it after the
-    map is what actually moves the window back.
+    Called before the window is shown, and again on a retry schedule after it
+    is mapped: Mutter can override the requested position and land a new window
+    on whichever monitor currently has the pointer — often a touch panel.
 
-    The request is only granted if the window *fits* the monitor's work area —
-    Mutter bounces a move that doesn't, which is what _warn_if_misplaced checks.
+    A retry only re-asserts the geometry while the window is on the *wrong*
+    monitor, never to chase an exact rect. The window manager clamps a window
+    to its work area and refuses anything larger, so re-sending a refused
+    request achieves nothing but a re-layout — and CameraWidget (a
+    QOpenGLWidget) repaints on every resize, which is what made start-up flicker.
     """
     window.winId()                          # realize native window
     handle = window.windowHandle()
-    if handle is not None and screen is not None:
+    mapped = window.isVisible()
+
+    if mapped and screen is not None and rect.contains(window.frameGeometry().center()):
+        return                              # already on the control monitor
+
+    if handle is not None and screen is not None and handle.screen() is not screen:
         handle.setScreen(screen)
 
-    # setGeometry positions the *client* area, so asking for the work area
-    # verbatim pushes the title bar off the top of the screen and the window can
-    # no longer be dragged. Subtract whatever the WM's decoration adds. Before the
-    # window is mapped the frame is not known yet and these are all zero — which
-    # is fine, the post-map calls below correct it.
+    # setGeometry positions the client area, not the window frame, so the WM's
+    # title-bar/border size has to be subtracted from the target rect. Frame
+    # size is unknown (zero) before the window is mapped; the post-map calls
+    # correct for that once it is.
     frame, geo = window.frameGeometry(), window.geometry()
     target = QtCore.QRect(
         rect.left()   + (geo.left() - frame.left()),
@@ -102,17 +130,17 @@ def _place_on_control_screen(window, screen, rect):
         rect.width()  - (frame.width()  - geo.width()),
         rect.height() - (frame.height() - geo.height()),
     )
+    if geo == target:
+        return
     window.setGeometry(target)              # after setScreen: that can shift it back
 
 
 def _warn_if_misplaced(window, rect):
-    """Complain in the console log if the GUI did not land on the control monitor.
+    """Log a warning if the GUI window didn't land on the control monitor.
 
-    A window manager will not place a window on a monitor whose work area cannot
-    hold it, and silently drops it on another display instead — no error, the GUI
-    just opens on the touch panels. That is one added GUI section away at any
-    time (the window's minimum height is whatever the tallest tab demands), so
-    the numbers needed to diagnose it are printed rather than left to guesswork.
+    A window manager silently relocates a window to another display if it
+    doesn't fit the intended monitor's work area, rather than raising an
+    error — so this prints the numbers needed to diagnose it.
     """
     frame = window.frameGeometry()
     if rect.contains(frame.center()):
@@ -127,19 +155,14 @@ def _warn_if_misplaced(window, rect):
 
 
 class _OpaqueWidget(QtWidgets.QWidget):
-    """Plain container that always paints its background.
-
-    Setting WA_OpaquePaintEvent prevents Qt/X11 from erasing the window
-    background before painting, eliminating the interaction-triggered flicker
-    visible on the left panel during tab switches and button clicks.
-    """
+    """A QWidget that always paints its own background, avoiding the Qt/X11
+    flicker otherwise visible on tab switches and button clicks."""
     _BG = QtGui.QColor("#2b2b2b")
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # WA_OpaquePaintEvent: Qt skips its own background pre-fill before paintEvent.
-        # WA_NoSystemBackground: X11 server does not clear the window on expose events.
-        # Both are needed — they control two separate layers of the paint pipeline.
+        # Both flags are needed: they suppress two separate background-clear
+        # steps (Qt's own pre-fill, and X11's clear-on-expose).
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent, True)
         self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
 
@@ -152,11 +175,9 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
     _install_exception_guard()
 
     # ── Dark theme via Fusion style + QPalette ────────────────────────────────
-    # Using a global QWidget stylesheet rule ("QWidget { background: ... }") forces
-    # autoFillBackground=True on every widget, which causes Qt/X11 to clear every
-    # container's background before painting its children — the cascade that creates
-    # the visible flicker. The correct approach is to set a dark QPalette and let
-    # the Fusion style handle background fills internally without the cascade.
+    # Uses a QPalette rather than a global stylesheet background rule, since a
+    # stylesheet forces autoFillBackground on every widget and reintroduces the
+    # flicker _OpaqueWidget above works around.
     app.setStyle("Fusion")
     _pal = QtGui.QPalette()
     for _role, _hex in [
@@ -266,9 +287,8 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
             self.setCentralWidget(root)
 
             # ── Style ─────────────────────────────────────────────
-            # Note: QWidget { background } is intentionally absent.
-            # The dark palette set above handles container backgrounds without
-            # triggering autoFillBackground on every widget (the flicker cause).
+            # No QWidget{background} rule here on purpose — see the dark-theme
+            # comment above; a stylesheet background would reintroduce the flicker.
             self.setStyleSheet("""
                 QPushButton {
                     background: #3a3a3a;
@@ -330,19 +350,38 @@ def run_gui(shared_image, sensor_array, shape, command_queue, data_sources=None)
             self.sensor_timer.timeout.connect(self.sensors.update_from_shared)
             self.sensor_timer.start(80)
 
+            self._page_experiment = page_experiment
+
+        def closeEvent(self, event):
+            """Stop a running recording before the event loop ends.
+
+            Without this, closing the window mid-recording leaves the camera
+            process to finalise the video during shutdown, where it is killed
+            part-way through. Stopping here starts that flush while every
+            process is still alive.
+            """
+            self.camera_timer.stop()
+            self.sensor_timer.stop()
+            try:
+                self._page_experiment.shutdown()
+            except Exception:
+                traceback.print_exc()
+            super().closeEvent(event)
+
     window = MainWindow()
     _screen, _rect = _control_screen_rect(app)
     _place_on_control_screen(window, _screen, _rect)
     window.show()
-    # Deliberately not showMaximized(): "maximized" means "fill the monitor the WM
-    # thinks this window is on", which is the decision that was sending the GUI to
-    # a touch panel in the first place. An explicit geometry filling the control
-    # monitor's work area looks the same and cannot be redirected.
+    # Not showMaximized(): that fills whatever monitor the WM thinks the window
+    # is on, which is the placement bug this code works around. An explicit
+    # geometry achieves the same look without that redirect.
     #
-    # Re-assert it a few times rather than once: Mutter places the window when it
-    # maps it, and on a busy start-up (five child processes, three of them opening
-    # fullscreen windows of their own) a single 50 ms callback loses that race.
-    for _delay in (50, 250, 750, 1500):
+    # Placement is re-asserted several times because Mutter can lose the race
+    # on a busy start-up (several child processes, some opening fullscreen
+    # windows of their own). The 0 ms retry corrects the window's size before
+    # the first frame is drawn, so that one is invisible; later retries are
+    # no-ops once the geometry is already correct.
+    for _delay in (0, 50, 250, 750, 1500):
         QtCore.QTimer.singleShot(
             _delay, lambda: _place_on_control_screen(window, _screen, _rect))
     QtCore.QTimer.singleShot(2500, lambda: _warn_if_misplaced(window, _rect))
