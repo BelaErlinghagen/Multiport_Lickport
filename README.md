@@ -112,9 +112,9 @@ The Arduino's job is to register licks via a capacitive sensor — a cannula con
 The MOSFET modules are activated by the master Arduinos on the PORTMASTER and can trigger peristaltic pumps (or valves, etc.). The idea is that lick information is received by the master Arduinos, which then activate the pumps at set timepoints and with set PWM, depending on the needs of the experimenter. This allows for very flexible control of liquid dispensation. The Lick-O-Tron further connects the master Arduinos to an LED, which can be controlled independently.
 
 <p align="center">
-  <img src="Lick-O-Tron/Lick-O-TronFront.png" width="600" alt="Lick-O-Tron front" />
-  <img src="Lick-O-Tron/Lick-O-TronBack.png" width="600" alt="Lick-O-Tron back" />
-  <img src="Lick-O-Tron/Lick-O-TronCase.png" width="600" alt="Lick-O-Tron case" />
+  <img src="Lick-O-Tron/Lick-O-TronFront.png" width="250" alt="Lick-O-Tron front" />
+  <img src="Lick-O-Tron/Lick-O-TronBack.png" width="250" alt="Lick-O-Tron back" />
+  <img src="Lick-O-Tron/Lick-O-TronCase.png" width="250" alt="Lick-O-Tron case" />
 </p>
 
 <p align="center">
