@@ -76,6 +76,7 @@ class ProtocolPage(QtWidgets.QWidget):
                 "fixed_map": {"1": 1, "2": 9},
                 "min_spacing": 4,
                 "exclude_previous": False,
+                "reuse_previous": False,
             },
             "led_mode": "reward_only",
             "led_neighbors": 1,
@@ -281,6 +282,8 @@ class ProtocolPage(QtWidgets.QWidget):
         self._fixed_port_combos: list[QtWidgets.QComboBox] = []
         self._min_spacing_spin: QtWidgets.QSpinBox | None = None
         self._spacing_warn_lbl: QtWidgets.QLabel | None   = None
+        self._exclude_prev_chk: QtWidgets.QCheckBox | None = None
+        self._reuse_prev_chk: QtWidgets.QCheckBox | None   = None
 
         # Sporadic reward switching (static; set once in _build_ui)
         self._switch_enabled_chk: QtWidgets.QCheckBox | None = None
@@ -1123,6 +1126,16 @@ class ProtocolPage(QtWidgets.QWidget):
 
     def _rebuild_dist_section(self):
         """Rebuild the distribution panel (fixed port map OR random spacing)."""
+        # The widgets are destroyed and remade below, so anything the user typed
+        # into them has to be carried over by hand — a rebuild is triggered by
+        # changing the reward count, which must not quietly reset these.
+        prev_spacing = (self._min_spacing_spin.value()
+                        if self._min_spacing_spin is not None else 4)
+        prev_exclude = (self._exclude_prev_chk.isChecked()
+                        if self._exclude_prev_chk is not None else False)
+        prev_reuse   = (self._reuse_prev_chk.isChecked()
+                        if self._reuse_prev_chk is not None else False)
+
         self._clear_widget(self._dist_container)
         dist_layout = self._dist_container.layout()
         n    = int(self._count_combo.currentText())
@@ -1132,6 +1145,7 @@ class ProtocolPage(QtWidgets.QWidget):
         self._min_spacing_spin   = None
         self._spacing_warn_lbl   = None
         self._exclude_prev_chk   = None
+        self._reuse_prev_chk     = None
 
         if mode == "Fixed":
             # One row per reward: "Reward N → Port [combo]"
@@ -1183,7 +1197,7 @@ class ProtocolPage(QtWidgets.QWidget):
             sp_l.addWidget(QtWidgets.QLabel("Min spacing between rewards:"))
             self._min_spacing_spin = QtWidgets.QSpinBox()
             self._min_spacing_spin.setRange(1, 16)
-            self._min_spacing_spin.setValue(4)
+            self._min_spacing_spin.setValue(prev_spacing)
             self._min_spacing_spin.setFixedWidth(60)
             sp_l.addWidget(self._min_spacing_spin)
             sp_l.addStretch()
@@ -1193,10 +1207,38 @@ class ProtocolPage(QtWidgets.QWidget):
             self._spacing_warn_lbl.setStyleSheet("color:#aaa; font-size:10px;")
             dist_layout.addWidget(self._spacing_warn_lbl)
 
+            self._reuse_prev_chk = QtWidgets.QCheckBox(
+                "Use the same reward locations as the last session")
+            self._reuse_prev_chk.setStyleSheet("font-size:10px;")
+            dist_layout.addWidget(self._reuse_prev_chk)
+
+            reuse_note = QtWidgets.QLabel(
+                "Resolved per mouse when the session starts, from that mouse's last "
+                "logged session. Only the lickports are reused — volumes, "
+                "probabilities and the reward count come from this protocol. Falls "
+                "back to a fresh random layout if the mouse has no usable previous "
+                "session.")
+            reuse_note.setWordWrap(True)
+            reuse_note.setStyleSheet("color:#888; font-size:10px; margin-left:18px;")
+            dist_layout.addWidget(reuse_note)
+
             self._exclude_prev_chk = QtWidgets.QCheckBox(
                 "Exclude reward locations used in previous sessions")
             self._exclude_prev_chk.setStyleSheet("font-size:10px;")
             dist_layout.addWidget(self._exclude_prev_chk)
+
+            # The two are opposites — reusing last session's ports while excluding
+            # them is unsatisfiable, so ticking one clears and disables the other.
+            self._reuse_prev_chk.toggled.connect(
+                lambda on: (self._exclude_prev_chk.setChecked(False) if on else None,
+                            self._exclude_prev_chk.setEnabled(not on)))
+            self._exclude_prev_chk.toggled.connect(
+                lambda on: (self._reuse_prev_chk.setChecked(False) if on else None,
+                            self._reuse_prev_chk.setEnabled(not on)))
+
+            # Set after wiring, so ticking one still clears/disables the other.
+            self._reuse_prev_chk.setChecked(prev_reuse)
+            self._exclude_prev_chk.setChecked(prev_exclude and not prev_reuse)
 
             self._min_spacing_spin.valueChanged.connect(self._update_spacing_warning)
             self._update_spacing_warning()
@@ -1959,18 +2001,23 @@ class ProtocolPage(QtWidgets.QWidget):
                 str(i + 1): int(combo.currentText())
                 for i, combo in enumerate(self._fixed_port_combos)
             }
-            # min_spacing / exclude_previous only apply to a random distribution, but
-            # both are written either way so switching type and back keeps the values.
+            # min_spacing / exclude_previous / reuse_previous only apply to a random
+            # distribution, but all are written either way so switching type and
+            # back keeps the values.
             dist = {"type": "fixed", "fixed_map": fixed_map,
-                    "min_spacing": 4, "exclude_previous": False}
+                    "min_spacing": 4, "exclude_previous": False,
+                    "reuse_previous": False}
         else:
             spacing          = self._min_spacing_spin.value() if self._min_spacing_spin else 4
             exclude_previous = (self._exclude_prev_chk.isChecked()
                                 if self._exclude_prev_chk else False)
+            reuse_previous   = (self._reuse_prev_chk.isChecked()
+                                if self._reuse_prev_chk else False)
             dist = {
                 "type":             "random",
                 "min_spacing":      spacing,
                 "exclude_previous": exclude_previous,
+                "reuse_previous":   reuse_previous,
             }
 
         led_key = self._LED_MODE_KEYS[self._led_mode_combo.currentText()]
@@ -2213,6 +2260,10 @@ class ProtocolPage(QtWidgets.QWidget):
                 self._min_spacing_spin.setValue(int(dist["min_spacing"]))
             if self._exclude_prev_chk is not None:
                 self._exclude_prev_chk.setChecked(bool(dist["exclude_previous"]))
+            if self._reuse_prev_chk is not None:
+                # .get(): protocols saved before this option existed have no such
+                # key, and they are still perfectly valid files.
+                self._reuse_prev_chk.setChecked(bool(dist.get("reuse_previous", False)))
             self._update_spacing_warning()
 
         # ── LED ──────────────────────────────────────────────────

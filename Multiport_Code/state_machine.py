@@ -71,6 +71,14 @@ _DELIVERY_TIMEOUT_S = float(shared_states.pump_delivery_timeout_s)
 # without a latch it could fall between two rows and never be recorded.
 _BLOCKED_LATCH_S = 0.06
 
+# ── Region-ITI safety valves ──────────────────────────────────────────────────
+# A region ITI waits for the mouse to dwell in the projected target, so it needs
+# a way out when the mouse never gets there or the pose feed dies.
+# DLC publishes at ~20-25 Hz, so several seconds of silence means it has stopped,
+# not that it is slow.
+_POSE_STALE_S  = 5.0
+_ITI_REPORT_S  = 15.0   # heartbeat, so a long wait isn't a silent gap in the log
+
 
 class _BncScheduler:
     """Emits BNC pulse trains from a daemon thread, so they keep running while
@@ -298,6 +306,17 @@ class StateMachine:
             time.sleep(0.02)
         return True
 
+    @staticmethod
+    def _clamp_to_deadline(duration: float, sess_deadline: float | None) -> float:
+        """Shorten *duration* to whatever is left before *sess_deadline*.
+
+        Keeps a fixed-time session from overrunning its length by a whole
+        intertrial interval, since the session-end check only runs between trials.
+        """
+        if sess_deadline is None:
+            return duration
+        return max(0.0, min(duration, sess_deadline - time.monotonic()))
+
     def _all_off(self):
         """Safety: silence every LED and pump, blank the beamer and the screens."""
         for i in range(1, _CIRCLE_SIZE + 1):
@@ -317,8 +336,10 @@ class StateMachine:
         # its logged state fixed up here too.
         if self.hw is not None:
             self.hw.speaker.value = 0
-        # No trial is running, so no port is offering a reward.
+        # No trial is running, so no port is offering a reward — and with the
+        # session over, no port holds one either.
         self._clear_reward_states()
+        _hw_state.set_reward_layout(self.hw, {})
 
     # ── Reward state → CSV ────────────────────────────────────────────────────
 
@@ -347,6 +368,15 @@ class StateMachine:
         """Back to REWARD_NONE everywhere — the trial is over, no port is rewarded."""
         self._reward_latches.clear()
         _hw_state.clear_reward_states(self.hw)
+
+    def _publish_reward_layout(self):
+        """Mirror which reward sits on which port into the CSV's Rewards column.
+
+        Called at assignment and after every switch: with switching enabled the
+        port no longer identifies the reward, so the layout has to be recorded
+        as it changes rather than inferred from the protocol afterwards.
+        """
+        _hw_state.set_reward_layout(self.hw, self._reward_locations)
 
     # ── Reward delivery bookkeeping ───────────────────────────────────────────
 
@@ -699,6 +729,18 @@ class StateMachine:
             return {rid: int(dist["fixed_map"][str(rid)])
                     for rid in range(1, int(protocol["rewards"]["count"]) + 1)}
 
+        count = int(protocol["rewards"]["count"])
+
+        # "Use the same locations as the last session" — resolved here rather than
+        # in the editor so one protocol file follows every mouse to its own history.
+        # .get(): protocols saved before this option existed have no such key.
+        if dist.get("reuse_previous", False):
+            previous = self._previous_locations(protocol, count)
+            if previous is not None:
+                return previous
+            # Falling through to a fresh random layout: a missing history is not
+            # a reason to refuse to run the session.
+
         # Collect ports to exclude when the user enabled "exclude previous locations"
         excluded: set[int] = set()
         if dist["exclude_previous"]:
@@ -711,10 +753,53 @@ class StateMachine:
                     print(f"[StateMachine] Excluding previously used ports: {sorted(excluded)}")
 
         return self._random_locations(
-            protocol["rewards"]["count"],
+            count,
             int(dist["min_spacing"]),
             excluded,
         )
+
+    def _previous_locations(self, protocol: dict, count: int) -> dict | None:
+        """Return the last logged session's {reward_id: port} layout, or None.
+
+        None whenever it can't be honoured — no mouse log, no session with reward
+        ports, or a session whose reward count differs from this protocol's — and
+        the caller falls back to a fresh random assignment. Says why either way,
+        since "same ports as last time" silently not happening is worse than the
+        layout changing.
+        """
+        json_path = self._mouse_json_path(protocol)
+        if not json_path:
+            print("[StateMachine] Reuse previous locations: no mouse log — "
+                  "assigning fresh random locations.")
+            return None
+
+        log = self._load_mouse_log(json_path)
+        for sess in reversed(log.get("sessions", [])):
+            # reward_port_map keeps the id→port pairing; reward_ports is the sorted
+            # port list older logs carry, where reward i can only be given the i-th
+            # port. Either restores the same set of lickports, which is the point.
+            port_map = sess.get("reward_port_map")
+            if port_map:
+                ports = {int(rid): int(p) for rid, p in port_map.items()}
+            elif sess.get("reward_ports"):
+                ports = {i + 1: int(p) for i, p in enumerate(sess["reward_ports"])}
+            else:
+                continue    # a session that never got as far as assigning ports
+
+            if len(ports) != count:
+                print(f"[StateMachine] Reuse previous locations: last session "
+                      f"({sess.get('date', '?')} {sess.get('session_id', '?')}) used "
+                      f"{len(ports)} reward(s), this protocol asks for {count} — "
+                      "assigning fresh random locations.")
+                return None
+
+            print(f"[StateMachine] Reusing reward locations from "
+                  f"{sess.get('date', '?')} {sess.get('session_id', '?')}: {ports}")
+            return ports
+
+        print("[StateMachine] Reuse previous locations: no previous session with "
+              "reward ports — assigning fresh random locations.")
+        return None
 
     def _random_locations(self, count: int, min_spacing: int,
                           excluded: set | None = None) -> dict | None:
@@ -770,6 +855,7 @@ class StateMachine:
             "rewards": [a, b],
             "ports":   [self._reward_locations[a], self._reward_locations[b]],
         })
+        self._publish_reward_layout()
         print(f"[StateMachine] Trial {trial_num}: rewards {a} and {b} swapped ports "
               f"→ {self._reward_locations}")
 
@@ -1021,7 +1107,8 @@ class StateMachine:
 
     # ── Intertrial interval ───────────────────────────────────────────────────
 
-    def _run_iti(self, iti_config: dict, sm_stop, sm_active) -> bool:
+    def _run_iti(self, iti_config: dict, sm_stop, sm_active,
+                 sess_deadline: float | None = None) -> bool:
         """Run the intertrial interval, with the BNC intertrial phase around it.
 
         A thin wrapper so the BNC phase is cleared on every exit path of the
@@ -1029,11 +1116,12 @@ class StateMachine:
         """
         self._bnc.set_phase("iti")
         try:
-            return self._run_iti_body(iti_config, sm_stop, sm_active)
+            return self._run_iti_body(iti_config, sm_stop, sm_active, sess_deadline)
         finally:
             self._bnc.set_phase(None)
 
-    def _run_iti_body(self, iti_config: dict, sm_stop, sm_active) -> bool:
+    def _run_iti_body(self, iti_config: dict, sm_stop, sm_active,
+                      sess_deadline: float | None = None) -> bool:
         """Run the intertrial interval between two trials. Returns True on
         normal completion, False if a stop flag fires.
 
@@ -1042,6 +1130,11 @@ class StateMachine:
           "fixed_region"  — project a cm-defined target sphere; wait until the DLC
                             centroid dwells inside it (checked in beamer-pixel space)
           "random_region" — same but the target centre is drawn from a cm margin disc
+
+        *sess_deadline*, a time.monotonic() stamp for session end, bounds every
+        wait below. Without it a region ITI runs until the mouse dwells in the
+        target — which for a fixed-time session means the session never ends on
+        its own if the mouse simply never goes there.
         """
         import math
         iti_type = iti_config["type"]
@@ -1052,7 +1145,9 @@ class StateMachine:
 
         if iti_type == "time":
             # Beamer stays at the trial baseline for the fixed duration.
-            return self._sleep(float(iti_config["duration_s"]), sm_stop, sm_active)
+            return self._sleep(
+                self._clamp_to_deadline(float(iti_config["duration_s"]), sess_deadline),
+                sm_stop, sm_active)
 
         # ── Region-based ITI (target specified in cm) ─────────────────────────
         if iti_type == "fixed_region":
@@ -1084,7 +1179,8 @@ class StateMachine:
             # time instead of true dwell detection so the session can't hang.
             print("[StateMachine] ITI: no camera↔beamer mapping / pose feed — "
                   f"holding the cue for {required_s:.1f} s.")
-            ok = self._sleep(required_s, sm_stop, sm_active)
+            ok = self._sleep(self._clamp_to_deadline(required_s, sess_deadline),
+                             sm_stop, sm_active)
             self._beamer_baseline(mode)
             return ok
 
@@ -1098,9 +1194,24 @@ class StateMachine:
         print(f"[StateMachine] ITI ({iti_type}): waiting for mouse at "
               f"({x_cm:.1f}, {y_cm:.1f}) cm for {required_s:.1f} s")
 
+        wait_start = time.monotonic()
+        last_pose_t = wait_start
+        next_report = wait_start + _ITI_REPORT_S
+
         while True:
             if sm_stop.value or not sm_active.value:
                 return False   # run()/_all_off blanks the beamer
+
+            now = time.monotonic()
+
+            # The session's own clock outranks the dwell condition: a mouse that
+            # never visits the target must not hold a fixed-time session open.
+            # True (not False) so run()'s top-of-loop time check ends the session
+            # normally and the GUI auto-stops the recording.
+            if sess_deadline is not None and now >= sess_deadline:
+                print("[StateMachine] ITI cut short — session time is up.")
+                self._beamer_baseline(mode)
+                return True
 
             pose = None
             try:
@@ -1108,7 +1219,24 @@ class StateMachine:
             except Exception:
                 pass
 
+            # can_track above only proves the queue object exists. If DLC has
+            # actually stopped publishing, fall back to the same timed hold the
+            # no-calibration path uses rather than waiting for a pose forever.
+            if pose is None and now - last_pose_t >= _POSE_STALE_S:
+                print(f"[StateMachine] ITI: no DLC pose for {_POSE_STALE_S:.0f} s — "
+                      f"holding the cue for {required_s:.1f} s instead.")
+                ok = self._sleep(self._clamp_to_deadline(required_s, sess_deadline),
+                                 sm_stop, sm_active)
+                self._beamer_baseline(mode)
+                return ok
+
+            if now >= next_report:
+                next_report = now + _ITI_REPORT_S
+                print(f"[StateMachine] ITI: still waiting for the mouse "
+                      f"({now - wait_start:.0f} s so far).")
+
             if pose is not None:
+                last_pose_t = now
                 pts = [(float(kp[0]), float(kp[1]))
                        for kp in pose if float(kp[2]) > _THRESH]
                 in_r = False
@@ -1119,7 +1247,6 @@ class StateMachine:
                     if mapped is not None:
                         in_r = ((mapped[0] - bx) ** 2 + (mapped[1] - by) ** 2) ** 0.5 <= r_px
 
-                now = time.monotonic()
                 if in_r:
                     if in_region_since is None:
                         in_region_since = now
@@ -1211,6 +1338,7 @@ class StateMachine:
             return
 
         self._reward_locations = dict(locations)
+        self._publish_reward_layout()
         # Each screen is pinned to the port its reward starts on. Captured before any
         # switch roll, and padded with None so a screen without an anchoring reward
         # deterministically stays black rather than keeping a stale pattern.
@@ -1248,6 +1376,10 @@ class StateMachine:
             # The initial assignment. Switching permutes which reward sits where but
             # never changes the port set, so this stays the session's port list.
             "reward_ports":  reward_ports,
+            # Sorted above, which loses which reward sat where — kept as the id→port
+            # map too, so "reuse the last session's locations" can restore the layout
+            # rather than just the port set.
+            "reward_port_map": {str(rid): port for rid, port in locations.items()},
             "reward_switches": [],
             "reward_deliveries": [],
             "reward_delay_s":  round(delay_s, 3) if self._delay_cfg["enabled"] else None,
@@ -1314,7 +1446,8 @@ class StateMachine:
                     (sess_type == "trials" and trial_num < sess_length)
                 )
                 if session_continues:
-                    if not self._run_iti(protocol["intertrial"], sm_stop, sm_active):
+                    if not self._run_iti(protocol["intertrial"], sm_stop, sm_active,
+                                         sess_deadline):
                         stopped = True
                         break
 

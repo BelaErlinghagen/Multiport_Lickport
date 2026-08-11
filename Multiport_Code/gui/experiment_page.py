@@ -1539,8 +1539,16 @@ class ExperimentPage(QtWidgets.QWidget):
         # Volumes are the parameter most worth a second look before pressing Start,
         # so they are spelled out rather than left to the reward count.
         vols = ", ".join(f"{cfg['volume_ul']:g} µL" for cfg in rew["configs"])
+        # Where the rewards land is decided per mouse at session start under these
+        # two options, so it is worth naming here — the protocol alone won't say.
+        dist = rew["distribution"]
+        dist_note = ""
+        if dist.get("reuse_previous"):
+            dist_note = ", same ports as last session"
+        elif dist.get("exclude_previous"):
+            dist_note = ", excluding previously used ports"
         self._sum_rewards.setText(
-            f"Rewards: {rew['count']}  ({rew['distribution']['type']} distribution)"
+            f"Rewards: {rew['count']}  ({dist['type']} distribution{dist_note})"
             f"  —  {vols}{suffix}")
 
         trial  = d["trial"]
@@ -1580,6 +1588,19 @@ class ExperimentPage(QtWidgets.QWidget):
         calib = PumpCalibration()
         return calib.uncalibrated_ports(ports)
 
+    def _dead_boards(self) -> list:
+        """Indices of Arduinos that are not currently reporting sensor status.
+
+        Read from hardware_state.boards_ok, which serial_controls.sensor_process
+        refreshes continuously — so this catches a board that died since launch,
+        not only one that never came up. Empty if there is no hardware state to
+        read (sensor_test and other harnesses that build ExperimentPage without it).
+        """
+        hw = self._data_sources.get("hw")
+        if hw is None:
+            return []
+        return [index for index in range(len(hw.boards_ok)) if not hw.boards_ok[index]]
+
     def _set_id_widgets_enabled(self, enabled: bool):
         for w in (self._mouse_cb, self._session_cb,
                   self._cam_chk, self._sensor_chk, self._dlc_chk):
@@ -1615,6 +1636,25 @@ class ExperimentPage(QtWidgets.QWidget):
             return
         if self._loaded_protocol is None:
             self._rec_status.setText("Load a protocol first.")
+            return
+
+        # A silent board means no licks, no LEDs and no pumps on half the rig, and
+        # nothing downstream notices — a session recorded that way looks normal and
+        # is simply wrong. Blocked here rather than warned about.
+        dead = self._dead_boards()
+        if dead:
+            detail = "\n".join(
+                f"  • Arduino {index + 1} — lickports {'1-8' if index == 0 else '9-16'} "
+                f"and BNC {'1 and 2' if index == 0 else '3 and 4'}"
+                for index in dead)
+            QtWidgets.QMessageBox.warning(
+                self, "Arduino not responding",
+                f"These boards are not reporting:\n\n{detail}\n\n"
+                "Their LEDs, pumps and lick sensors will not work. Unplug and "
+                "replug that board's USB cable, then restart the GUI — a DTR "
+                "reset does not clear it.")
+            self._rec_status.setText(
+                "Arduino " + ", ".join(str(i + 1) for i in dead) + " not responding.")
             return
 
         # Reward volumes are meaningless without a µL/pulse for the pump that has to

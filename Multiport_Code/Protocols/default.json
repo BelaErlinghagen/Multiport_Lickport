@@ -24,7 +24,8 @@
         "2": 9
       },
       "min_spacing": 4,
-      "exclude_previous": false
+      "exclude_previous": false,
+      "reuse_previous": false
     },
     "led_mode": "reward_only",
     "led_neighbors": 1,

@@ -2,7 +2,15 @@ from pathlib import Path
 
 ### Serial Controls
 
-serial_ports = ['/dev/ttyACM0', '/dev/ttyACM1']
+# Addressed by USB serial number (the /dev/serial/by-id symlinks), not by
+# /dev/ttyACM*: those are handed out in plug order, so replugging the boards can
+# swap them and send every lickport 1-8 command to the board wired to 9-16 with
+# no error anywhere. Same reasoning as camera_serial below.
+# Run `ls -l /dev/serial/by-id/` to read these off after swapping a board.
+serial_ports = [
+    '/dev/serial/by-id/usb-Arduino__www.arduino.cc__0042_9503531393535160B051-if00',  # board 1, lickports 1-8
+    '/dev/serial/by-id/usb-Arduino__www.arduino.cc__0042_9503531393535190A061-if00',  # board 2, lickports 9-16
+]
 # Maps lickport id -> (Arduino board, board-local channel). BNC ids use a
 # separate mapping in SerialControls._BNC_MAP, not this table.
 lookup_tables= [{1:1,2:3,3:5,4:2,5:6,6:7,7:8,8:4},{1:16,2:13,3:15,4:9,5:12,6:11,7:10,8:14}]

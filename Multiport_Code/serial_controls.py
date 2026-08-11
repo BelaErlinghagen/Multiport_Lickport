@@ -106,6 +106,11 @@ class SerialControls:
     # silently, so wait for each board's first STATUS line before returning.
     _READY_TIMEOUT_S = 6.0
 
+    # A board reports STATUS every few tens of ms, so this much silence means it
+    # has died, not that it is busy. Past it the board counts as not alive and its
+    # last sensor reading is dropped — see read_serial().
+    _STATUS_STALE_S = 2.0
+
     def __init__(self, baudrate = 115200, verbose = None):
         print("Initializing Serial Communication.")
         self.serial_arduino1 = serial.Serial(shared_states.serial_ports[0], baudrate,
@@ -124,6 +129,8 @@ class SerialControls:
 
         self.latest_active_pins = {0:[], 1:[]}
         self._seen_status = {0: False, 1: False}   # has this board ever reported?
+        # Monotonic stamp of each board's last STATUS line, for board_alive().
+        self._last_status_t = {0: 0.0, 1: 0.0}
 
         self.write_queue = queue.Queue()
         self.running = True
@@ -220,6 +227,7 @@ class SerialControls:
                             with self.lock:
                                 self.latest_active_pins[arduino_index] = current_pins
                             self._seen_status[arduino_index] = True
+                            self._last_status_t[arduino_index] = time.monotonic()
 
                     time.sleep(0.005)
                 else:
@@ -323,14 +331,33 @@ class SerialControls:
         except Exception as e:
             print(f"[ERROR in send_command] {e}")
 
+    def board_alive(self, arduino_index: int) -> bool:
+        """True if this board is reporting sensor status and still takes commands.
+
+        Goes False on a board that dies mid-session, not just one that never
+        started — which is what makes it safe to gate a recording on.
+        """
+        port = shared_states.serial_ports[arduino_index]
+        if port in self._reported_dead:
+            return False
+        return (time.monotonic() - self._last_status_t[arduino_index]
+                < self._STATUS_STALE_S)
+
     def read_serial(self):
-        """Return [timestamp, [active pins on Arduino 1, active pins on Arduino 2]]."""
+        """Return [timestamp, [active pins on Arduino 1, active pins on Arduino 2]].
+
+        A board that has gone silent reports no active pins rather than its last
+        reading: a lick latched at "active" when the board died would otherwise
+        keep the state machine pulsing that pump against a sensor value that can
+        never change back.
+        """
         timestamp = time.time()
         combined_pins = []
         with self.lock:
             # Get the latest known state from both Arduinos
-            combined_pins.append(self.latest_active_pins[0])
-            combined_pins.append(self.latest_active_pins[1])
+            for index in (0, 1):
+                combined_pins.append(self.latest_active_pins[index]
+                                     if self.board_alive(index) else [])
 
         return [timestamp, combined_pins]
 
@@ -368,7 +395,20 @@ def sensor_process(sensor_array, timestamp_value, command_queue=None, hw=None):
         command_queue.cancel_join_thread()
 
     from serial_controls import SerialControls
-    ser_machine = SerialControls()
+    try:
+        ser_machine = SerialControls()
+    except Exception as exc:
+        # Unguarded, this took the whole process down and every lick sensor read
+        # zero for the rest of the run with no further warning. Usually a board
+        # that isn't plugged in: shared_states.serial_ports addresses them by USB
+        # serial number, so a missing board means a missing /dev path.
+        print(f"[ERROR] Could not open the Arduino serial ports: {exc}")
+        print("[ERROR] Check that both boards are plugged in and that "
+              "shared_states.serial_ports matches `ls /dev/serial/by-id/`. "
+              "No lickport hardware will work until this is fixed and the GUI "
+              "is restarted.")
+        return
+
     tracker = _ActuatorTracker(hw)
     while True:
         # Forward any pending GUI/state-machine commands to the Arduino.
@@ -383,6 +423,11 @@ def sensor_process(sensor_array, timestamp_value, command_queue=None, hw=None):
         # Runs at 100 Hz (5x the CSV sample rate), so latch expiry is accurate
         # to about 10 ms.
         tracker.sweep()
+        # Publish per-board liveness for the GUI, which refuses to start a
+        # recording on a board that isn't reporting.
+        if hw is not None:
+            for index in (0, 1):
+                hw.boards_ok[index] = 1 if ser_machine.board_alive(index) else 0
         timestamp, active_pin = ser_machine.read_serial()
         active = active_pin[0] + active_pin[1]
         for i in range(16):

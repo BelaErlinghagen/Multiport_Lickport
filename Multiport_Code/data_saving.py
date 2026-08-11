@@ -10,7 +10,7 @@ Reading a session back, the 16-character columns must be read as strings, or
 pandas parses "0010000000000000" as an integer and drops the leading zeros:
 
     df = pd.read_csv(path, dtype={"Sensors": str, "Pumps": str, "LEDs": str,
-                                  "BNCs": str, "Rewards": str})
+                                  "BNCs": str, "RewardStates": str})
     pumps_on = [i + 1 for i, c in enumerate(df.Pumps[0]) if c == "1"]
     beamer   = json.loads(df.Beamer[0]) if pd.notna(df.Beamer[0]) else None
 
@@ -20,11 +20,23 @@ Beamer is compact JSON, empty when nothing is being projected:
 
 (see hardware_state.BEAMER_MODE_NAMES for what each mode means).
 
-Rewards is not a bit-string like the others: each character is a 0-6 code
-(hardware_state.REWARD_*), so read it with `[int(c) for c in s]`, not a "1"
-test. It records how each port's reward ended this trial — complete,
-partial, or a probability miss — which the Pumps column alone can't show,
-since one reward is a train of pulses spread over several licks.
+Two columns describe the rewards, both indexed by lickport 1-16:
+
+    Rewards       which reward (protocol id, 0 = none) sits on each port,
+                  pipe-separated because ids run to 16 and would not fit one
+                  character: "0|1|0|0|0|0|2|0|0|0|0|0|0|0|0|0".
+                  Read with `[int(v) for v in s.split("|")]`. It changes
+                  mid-session when sporadic switching makes two rewards trade
+                  ports, which is why the port alone can't identify a reward.
+    RewardStates  what that port's reward was doing, one 0-6 code per port
+                  (hardware_state.REWARD_*): "0100002000000000". Read with
+                  `[int(c) for c in s]`, not a "1" test. It records how each
+                  port's reward ended this trial — complete, partial, or a
+                  probability miss — which the Pumps column alone can't show,
+                  since one reward is a train of pulses spread over several licks.
+
+So `Rewards[i]` says *which* reward and `RewardStates[i]` says *how it went*,
+for the same port i.
 
 Video frames align by index: row N of {prefix}_frames.csv gives the
 wall-clock timestamp of frame N of the MP4, on the same clock as this
@@ -71,15 +83,16 @@ class data_saver:
         """Snapshot every actuator for one CSV row.
 
         The 16-item states are packed as fixed-width bit-strings
-        ("0010000000000000"); Rewards uses the same shape but with 0-6 codes
-        instead of flags. Beamer is the one structured field, stored as
+        ("0010000000000000"); RewardStates uses the same shape but with 0-6
+        codes instead of flags, and Rewards is pipe-separated since reward ids
+        run past one digit. Beamer is the one structured field, stored as
         compact JSON (mode + target geometry), or None when nothing is projected.
         """
         hw = self.hw
         if hw is None:
             return {'Pumps': None, 'LEDs': None, 'Speakers': None,
                     'Beamer': None, 'Screens': None, 'BNCs': None,
-                    'Rewards': None}
+                    'Rewards': None, 'RewardStates': None}
 
         beamer = hardware_state.read_beamer(hw)
         if beamer is not None:
@@ -94,7 +107,8 @@ class data_saver:
             'Beamer':   beamer,
             'Screens':  hardware_state.screen_names(hw),
             'BNCs':     hardware_state.bnc_bits(hw),
-            'Rewards':  hardware_state.reward_codes(hw),
+            'Rewards':      hardware_state.reward_ids(hw),
+            'RewardStates': hardware_state.reward_codes(hw),
         }
 
     def _latest_timestamp(self):

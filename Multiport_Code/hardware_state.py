@@ -32,12 +32,13 @@ Set only by StateMachine; codes 3-5 persist to the end of the trial.
 
 from multiprocessing import Array, Value
 
-# Channel counts, matching the hardware: 16 lickports (pump + LED each), 4 BNC
-# connectors, 2 HDMI touch screens.
+# Channel counts, matching the hardware: 16 lickports (pump + LED each) split
+# across 2 Arduinos, 4 BNC connectors, 2 HDMI touch screens.
 PUMP_COUNT   = 16
 LED_COUNT    = 16
 BNC_COUNT    = 4
 SCREEN_COUNT = 2
+BOARD_COUNT  = 2
 
 # Touch-screen pattern codes stored in `screens`; names come from
 # screen_controls.PATTERN_* via normalize_pattern().
@@ -101,6 +102,19 @@ class HardwareState:
         self.screens_used  = Value('b', 0)        # True if protocol screens.mode != "none"
         self.screens       = Array('i', SCREEN_COUNT)
         self.reward_state  = Array('b', PUMP_COUNT)  # REWARD_* code per lickport
+        # Which reward (protocol id 1-16, 0 = none) currently sits on each
+        # lickport. Set once the layout is assigned and again on every switch,
+        # so the CSV records *which* reward a port was offering, not just that
+        # one was — the port alone stops identifying the reward as soon as
+        # sporadic switching is enabled.
+        self.reward_id     = Array('b', PUMP_COUNT)
+
+        # Per-Arduino liveness, written by serial_controls.sensor_process: 1 while
+        # that board is reporting sensor status, 0 once it goes silent or stops
+        # accepting commands. Not an actuator, but it rides here because this is
+        # the one object every process already shares — the GUI reads it to refuse
+        # to start a recording on half a rig.
+        self.boards_ok = Array('b', BOARD_COUNT)
 
 
 # ── Beamer seqlock ────────────────────────────────────────────────────────────
@@ -179,6 +193,28 @@ def reward_codes(hw):
     return "".join(str(int(v)) for v in hw.reward_state)
 
 
+def reward_ids(hw):
+    """Which reward sits on each lickport, as "0|1|0|…|2|0" (0 = no reward).
+
+    Pipe-separated rather than one digit per port like reward_codes(): reward
+    ids run to 16, which does not fit in a single character.
+    """
+    if hw is None:
+        return "|".join(["0"] * PUMP_COUNT)
+    return "|".join(str(int(v)) for v in hw.reward_id)
+
+
+def set_reward_layout(hw, locations):
+    """Publish the whole {reward_id: port} layout, clearing any previous one."""
+    if hw is None:
+        return
+    for i in range(PUMP_COUNT):
+        hw.reward_id[i] = 0
+    for rid, port in (locations or {}).items():
+        if 1 <= int(port) <= PUMP_COUNT:
+            hw.reward_id[int(port) - 1] = int(rid)
+
+
 def set_reward_state(hw, port, code):
     """Publish one port's REWARD_* code (1-based port number)."""
     if hw is None or not (1 <= port <= PUMP_COUNT):
@@ -187,7 +223,11 @@ def set_reward_state(hw, port, code):
 
 
 def clear_reward_states(hw):
-    """Reset every port to REWARD_NONE. Called at the end of each trial."""
+    """Reset every port to REWARD_NONE. Called at the end of each trial.
+
+    Leaves reward_id alone: the reward still lives on that port between trials,
+    it just isn't on offer.
+    """
     if hw is None:
         return
     for i in range(PUMP_COUNT):
@@ -201,6 +241,7 @@ def reset(hw):
     for i in range(PUMP_COUNT):
         hw.pumps[i] = 0
         hw.reward_state[i] = REWARD_NONE
+        hw.reward_id[i] = 0
     for i in range(LED_COUNT):
         hw.leds[i] = 0
     for i in range(BNC_COUNT):
