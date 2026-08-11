@@ -128,7 +128,7 @@ The MOSFET modules are activated by the master Arduinos on the PORTMASTER and ca
 | Item | Quantity | Manufactured by | EAN |
 | :--- | ---: | :--- | ---: |
 | Joy It proMicro | 1 | Joy It | 4250236822907 |
-| MOSFET Relay Module | 2 | tbd | tbd |
+| MOSFET Relay Module | 2 | for example GERUI | 0744243396666 |
 | Mini Peristaltic Pump | 1 (up to 2) | Whadda | 5410329730017 |
 | Lick-O-Tron PCB | 1 | Eurocircuits | None: see folder in repo |
 | Lick-O-Tron Case Parts | 1 each | 3D printed | None: see folder in repo |
