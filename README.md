@@ -133,8 +133,8 @@ The MOSFET modules are activated by the master Arduinos on the PORTMASTER and ca
 | Lick-O-Tron PCB | 1 | Eurocircuits | None: see folder in repo |
 | Lick-O-Tron Case Parts | 1 each | 3D printed | None: see folder in repo |
 | LED (white) | 1 | TRU Components | 2050004902785 |
-| 10 MOhm Resistor | 1 | TRU Components | 2050004926057 |
-| 470 Ohm Resistor | 1 | TRU Components | 4016139313023 |
+| 10 MOhm Resistor (R1) | 1 | TRU Components | 2050004926057 |
+| 470 Ohm Resistor (R2) | 1 | TRU Components | 4016139313023 |
 | M3 Screws | 4 | Toolcraft | 4064161107578 |
 | M3 Nuts | 4 | SWG Hox | 4053056028951 |
 | Sterican Cannula | 2 | Roth | - |
