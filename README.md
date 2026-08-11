@@ -118,7 +118,7 @@ The MOSFET modules are activated by the master Arduinos on the PORTMASTER and ca
 </p>
 
 <p align="center">
-  <em><b>Figure 2:</b> 3D CAD models for the Lick-O-Tron (left: front, middle: back, right: case).</em>
+  <em><b>Figure 2:</b> 3D CAD models for the Lick-O-Tron (left: front, middle: back, right: case). Note that the Pin Connectors are not depicted correctly in this Figure: The 8 Pin Header is straight and supposed to be soldered onto the other side of the PCB and the two angular 2 Pin Headers are also depicted on the wrong side of the PCB.</em>
 </p>
 
 ### Assembly
