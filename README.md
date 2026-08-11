@@ -1,6 +1,6 @@
 # The Multiport Setup
 
-**A behavioral setup for mice with 16 reward ports.**
+**A behavioral setup for mice with 16 reward ports, multiple light/sound cues and real time pose estimation.**
 
 <p align="center">
   <img src="MultiportSetup.png" width="1000" alt="Overview of the Multiport Setup" />
