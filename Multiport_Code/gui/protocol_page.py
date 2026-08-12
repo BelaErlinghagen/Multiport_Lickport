@@ -112,6 +112,8 @@ class ProtocolPage(QtWidgets.QWidget):
                 "brightness": 100, "color": [255, 255, 255],
                 "duration_type": "fixed",
                 "duration_s": 2.0,
+                # A random dwell is drawn uniformly from [min, max].
+                "duration_min_s": 0.0,
                 "duration_max_s": 3.0,
             },
             "random_region": {
@@ -120,6 +122,7 @@ class ProtocolPage(QtWidgets.QWidget):
                 "margin_x_cm": 0.0, "margin_y_cm": 0.0, "margin_radius_cm": 10.0,
                 "duration_type": "fixed",
                 "duration_s": 2.0,
+                "duration_min_s": 0.0,
                 "duration_max_s": 3.0,
             },
         },
@@ -202,10 +205,13 @@ class ProtocolPage(QtWidgets.QWidget):
     }
     _DELAY_MODE_KEYS = {v: k for k, v in _DELAY_MODE_LABELS.items()}
 
-    # Fixed/random timing choices, shared by the ITI dwell and the reward delay.
-    # The second entry contains an en-dash (U+2013) — keep it in one place so the
-    # save/load round-trip can never disagree with the widget text.
-    _DWELL_LABELS = ["Fixed", "Random (0 – max)"]
+    # Fixed/random timing choices. The second entry contains an en-dash (U+2013)
+    # — keep it in one place so the save/load round-trip can never disagree with
+    # the widget text. The two lists differ only in that the ITI dwell draws from
+    # a user-set [min, max] while the reward delay still draws from [0, max];
+    # index 0 is "Fixed" in both, which the visibility helpers rely on.
+    _DWELL_LABELS     = ["Fixed", "Random (0 – max)"]
+    _ITI_DWELL_LABELS = ["Fixed", "Random (min – max)"]
 
     _SOUND_KEYS = ("trial_start", "trial_end")
     _SOUND_LABELS = {"trial_start": "Play a tone at trial start",
@@ -327,7 +333,9 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_reg_beamer_chk = self._iti_reg_contour_chk = None
         self._iti_reg_sphere_note = None
         self._iti_reg_dur_type = self._iti_reg_dur_spin = self._iti_reg_dur_max_spin = None
+        self._iti_reg_dur_min_spin = None
         self._iti_reg_dur_fixed_w = self._iti_reg_dur_max_w = None
+        self._iti_reg_dur_min_w = self._iti_reg_dur_range_lbl = None
         # Random region (same sphere fields + margin + toggles + dwell)
         self._iti_rnd_diam_spin = self._iti_rnd_bright = self._iti_rnd_color_btn = None
         self._iti_rnd_margin_x_spin = self._iti_rnd_margin_y_spin = None
@@ -335,7 +343,9 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_rnd_beamer_chk = self._iti_rnd_contour_chk = self._iti_rnd_margin_chk = None
         self._iti_rnd_sphere_note = None
         self._iti_rnd_dur_type = self._iti_rnd_dur_spin = self._iti_rnd_dur_max_spin = None
+        self._iti_rnd_dur_min_spin = None
         self._iti_rnd_dur_fixed_w = self._iti_rnd_dur_max_w = None
+        self._iti_rnd_dur_min_w = self._iti_rnd_dur_range_lbl = None
 
         self._build_ui()
         self._apply_protocol(self.DEFAULT_PROTOCOL)
@@ -1060,6 +1070,27 @@ class ProtocolPage(QtWidgets.QWidget):
                     seen[port] = i
         return errs
 
+    def _iti_errors(self) -> list:
+        """Blocking problems in the ITI block (empty when it is fine)."""
+        errs = []
+        # random.uniform(lo, hi) happily accepts lo > hi and draws from [hi, lo],
+        # so an inverted range would run without complaint and mean the opposite
+        # of what the fields say.
+        for name, dur_type, min_spin, max_spin in (
+            ("Fixed region", self._iti_reg_dur_type,
+             self._iti_reg_dur_min_spin, self._iti_reg_dur_max_spin),
+            ("Random region", self._iti_rnd_dur_type,
+             self._iti_rnd_dur_min_spin, self._iti_rnd_dur_max_spin),
+        ):
+            if dur_type is None or min_spin is None or max_spin is None:
+                continue
+            if dur_type.currentText() == self._ITI_DWELL_LABELS[0]:
+                continue
+            if min_spin.value() > max_spin.value():
+                errs.append(f"{name} dwell time: min ({min_spin.value():g} s) is "
+                            f"longer than max ({max_spin.value():g} s).")
+        return errs
+
     # ── Dynamic section builders ──────────────────────────────────────────────
 
     def _rebuild_reward_section(self):
@@ -1489,9 +1520,12 @@ class ProtocolPage(QtWidgets.QWidget):
         return sb
 
     @staticmethod
-    def _make_dur_spin(val: float = 2.0, suffix: str = " s") -> QtWidgets.QDoubleSpinBox:
+    def _make_dur_spin(val: float = 2.0, suffix: str = " s",
+                       lo: float = 0.1) -> QtWidgets.QDoubleSpinBox:
+        # lo: 0 is meaningful only for the lower end of a random dwell range —
+        # everywhere else a zero-second duration is a mistake, not a setting.
         sb = QtWidgets.QDoubleSpinBox()
-        sb.setRange(0.1, 600)
+        sb.setRange(lo, 600)
         sb.setSingleStep(0.5)
         sb.setDecimals(1)
         sb.setValue(val)
@@ -1551,14 +1585,18 @@ class ProtocolPage(QtWidgets.QWidget):
         self._iti_reg_beamer_chk = self._iti_reg_contour_chk = None
         self._iti_reg_sphere_note = None
         self._iti_reg_dur_type = self._iti_reg_dur_spin = self._iti_reg_dur_max_spin = None
+        self._iti_reg_dur_min_spin = None
         self._iti_reg_dur_fixed_w = self._iti_reg_dur_max_w = None
+        self._iti_reg_dur_min_w = self._iti_reg_dur_range_lbl = None
         self._iti_rnd_diam_spin = self._iti_rnd_bright = self._iti_rnd_color_btn = None
         self._iti_rnd_margin_x_spin = self._iti_rnd_margin_y_spin = None
         self._iti_rnd_margin_radius_spin = None
         self._iti_rnd_beamer_chk = self._iti_rnd_contour_chk = self._iti_rnd_margin_chk = None
         self._iti_rnd_sphere_note = None
         self._iti_rnd_dur_type = self._iti_rnd_dur_spin = self._iti_rnd_dur_max_spin = None
+        self._iti_rnd_dur_min_spin = None
         self._iti_rnd_dur_fixed_w = self._iti_rnd_dur_max_w = None
+        self._iti_rnd_dur_min_w = self._iti_rnd_dur_range_lbl = None
 
         iti_type = self._iti_type_combo.currentText() if self._iti_type_combo else "Fixed time"
 
@@ -1599,16 +1637,23 @@ class ProtocolPage(QtWidgets.QWidget):
 
             layout.addWidget(self._sublabel("Dwell time"))
             self._iti_reg_dur_type = QtWidgets.QComboBox()
-            self._iti_reg_dur_type.addItems(self._DWELL_LABELS)
+            self._iti_reg_dur_type.addItems(self._ITI_DWELL_LABELS)
             self._iti_reg_dur_type.setFixedWidth(160)
             layout.addWidget(self._labeled_row("Duration type:", self._iti_reg_dur_type))
             self._iti_reg_dur_spin     = self._make_dur_spin(2.0)
+            self._iti_reg_dur_min_spin = self._make_dur_spin(0.0, lo=0.0)
             self._iti_reg_dur_max_spin = self._make_dur_spin(3.0)
             self._iti_reg_dur_fixed_w  = self._labeled_row("Duration:", self._iti_reg_dur_spin)
+            self._iti_reg_dur_min_w    = self._labeled_row("Min duration:", self._iti_reg_dur_min_spin)
             self._iti_reg_dur_max_w    = self._labeled_row("Max duration:", self._iti_reg_dur_max_spin)
             layout.addWidget(self._iti_reg_dur_fixed_w)
+            layout.addWidget(self._iti_reg_dur_min_w)
             layout.addWidget(self._iti_reg_dur_max_w)
+            self._iti_reg_dur_range_lbl = self._dwell_range_label()
+            layout.addWidget(self._iti_reg_dur_range_lbl)
             self._iti_reg_dur_type.currentTextChanged.connect(self._update_iti_dur_visibility)
+            for w in (self._iti_reg_dur_min_spin, self._iti_reg_dur_max_spin):
+                w.valueChanged.connect(self._update_iti_dur_visibility)
 
             for w in (self._iti_reg_x_spin, self._iti_reg_y_spin, self._iti_reg_diam_spin):
                 w.valueChanged.connect(self._reg_live)
@@ -1654,16 +1699,23 @@ class ProtocolPage(QtWidgets.QWidget):
 
             layout.addWidget(self._sublabel("Dwell time"))
             self._iti_rnd_dur_type = QtWidgets.QComboBox()
-            self._iti_rnd_dur_type.addItems(self._DWELL_LABELS)
+            self._iti_rnd_dur_type.addItems(self._ITI_DWELL_LABELS)
             self._iti_rnd_dur_type.setFixedWidth(160)
             layout.addWidget(self._labeled_row("Duration type:", self._iti_rnd_dur_type))
             self._iti_rnd_dur_spin     = self._make_dur_spin(2.0)
+            self._iti_rnd_dur_min_spin = self._make_dur_spin(0.0, lo=0.0)
             self._iti_rnd_dur_max_spin = self._make_dur_spin(3.0)
             self._iti_rnd_dur_fixed_w  = self._labeled_row("Duration:", self._iti_rnd_dur_spin)
+            self._iti_rnd_dur_min_w    = self._labeled_row("Min duration:", self._iti_rnd_dur_min_spin)
             self._iti_rnd_dur_max_w    = self._labeled_row("Max duration:", self._iti_rnd_dur_max_spin)
             layout.addWidget(self._iti_rnd_dur_fixed_w)
+            layout.addWidget(self._iti_rnd_dur_min_w)
             layout.addWidget(self._iti_rnd_dur_max_w)
+            self._iti_rnd_dur_range_lbl = self._dwell_range_label()
+            layout.addWidget(self._iti_rnd_dur_range_lbl)
             self._iti_rnd_dur_type.currentTextChanged.connect(self._update_iti_dur_visibility)
+            for w in (self._iti_rnd_dur_min_spin, self._iti_rnd_dur_max_spin):
+                w.valueChanged.connect(self._update_iti_dur_visibility)
 
             # Target appearance (diameter/brightness/colour) re-projects the sphere;
             # the outer-margin controls only redraw the camera overlay — the beamer
@@ -1694,22 +1746,55 @@ class ProtocolPage(QtWidgets.QWidget):
         lay.addStretch()
         return w
 
+    @staticmethod
+    def _dwell_range_label() -> QtWidgets.QLabel:
+        """The line under a random dwell range that spells out what it means."""
+        lbl = QtWidgets.QLabel("")
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color:#777; font-size:9px;")
+        return lbl
+
     def _update_iti_dur_visibility(self):
-        """Show either the fixed or max-duration row based on the dwell-type combo."""
-        # Fixed region
-        if self._iti_reg_dur_type is not None:
-            fixed = self._iti_reg_dur_type.currentText() == "Fixed"
-            if self._iti_reg_dur_fixed_w:
-                self._iti_reg_dur_fixed_w.setVisible(fixed)
-            if self._iti_reg_dur_max_w:
-                self._iti_reg_dur_max_w.setVisible(not fixed)
-        # Random region
-        if self._iti_rnd_dur_type is not None:
-            fixed = self._iti_rnd_dur_type.currentText() == "Fixed"
-            if self._iti_rnd_dur_fixed_w:
-                self._iti_rnd_dur_fixed_w.setVisible(fixed)
-            if self._iti_rnd_dur_max_w:
-                self._iti_rnd_dur_max_w.setVisible(not fixed)
+        """Show the fixed row or the min/max pair, and describe the random range.
+
+        Also the live check on min ≤ max: an inverted range is caught here and
+        again in _iti_errors() at save, rather than silently drawing dwell times
+        from a backwards interval.
+        """
+        for dur_type, fixed_w, min_w, max_w, min_spin, max_spin, range_lbl in (
+            (self._iti_reg_dur_type, self._iti_reg_dur_fixed_w,
+             self._iti_reg_dur_min_w, self._iti_reg_dur_max_w,
+             self._iti_reg_dur_min_spin, self._iti_reg_dur_max_spin,
+             self._iti_reg_dur_range_lbl),
+            (self._iti_rnd_dur_type, self._iti_rnd_dur_fixed_w,
+             self._iti_rnd_dur_min_w, self._iti_rnd_dur_max_w,
+             self._iti_rnd_dur_min_spin, self._iti_rnd_dur_max_spin,
+             self._iti_rnd_dur_range_lbl),
+        ):
+            if dur_type is None:
+                continue
+            fixed = dur_type.currentText() == self._ITI_DWELL_LABELS[0]
+            if fixed_w:
+                fixed_w.setVisible(fixed)
+            if min_w:
+                min_w.setVisible(not fixed)
+            if max_w:
+                max_w.setVisible(not fixed)
+            if range_lbl is None:
+                continue
+            if fixed or min_spin is None or max_spin is None:
+                range_lbl.setVisible(False)
+                continue
+            lo, hi = min_spin.value(), max_spin.value()
+            range_lbl.setVisible(True)
+            if lo > hi:
+                range_lbl.setText(f"Min duration ({lo:g} s) is longer than max "
+                                  f"({hi:g} s) — the protocol cannot be saved.")
+                range_lbl.setStyleSheet("color:#c8963c; font-size:9px;")
+            else:
+                range_lbl.setText(f"Each ITI draws a dwell time uniformly between "
+                                  f"{lo:g} s and {hi:g} s (mean {(lo + hi) / 2:g} s).")
+                range_lbl.setStyleSheet("color:#777; font-size:9px;")
 
     # ── Beamer preview + coordinate mapping ───────────────────────────────────
 
@@ -2052,9 +2137,10 @@ class ProtocolPage(QtWidgets.QWidget):
                 "color":       _color(self._reg_color),
                 "duration_type": ("fixed" if (self._iti_reg_dur_type is None or
                                               self._iti_reg_dur_type.currentText()
-                                              == self._DWELL_LABELS[0])
+                                              == self._ITI_DWELL_LABELS[0])
                                   else "random"),
                 "duration_s":     _get(self._iti_reg_dur_spin, 2.0),
+                "duration_min_s": _get(self._iti_reg_dur_min_spin, 0.0),
                 "duration_max_s": _get(self._iti_reg_dur_max_spin, 3.0),
             },
             "random_region": {
@@ -2066,9 +2152,10 @@ class ProtocolPage(QtWidgets.QWidget):
                 "margin_radius_cm": _get(self._iti_rnd_margin_radius_spin, 10.0),
                 "duration_type": ("fixed" if (self._iti_rnd_dur_type is None or
                                               self._iti_rnd_dur_type.currentText()
-                                              == self._DWELL_LABELS[0])
+                                              == self._ITI_DWELL_LABELS[0])
                                   else "random"),
                 "duration_s":     _get(self._iti_rnd_dur_spin, 2.0),
+                "duration_min_s": _get(self._iti_rnd_dur_min_spin, 0.0),
                 "duration_max_s": _get(self._iti_rnd_dur_max_spin, 3.0),
             },
         }
@@ -2261,9 +2348,7 @@ class ProtocolPage(QtWidgets.QWidget):
             if self._exclude_prev_chk is not None:
                 self._exclude_prev_chk.setChecked(bool(dist["exclude_previous"]))
             if self._reuse_prev_chk is not None:
-                # .get(): protocols saved before this option existed have no such
-                # key, and they are still perfectly valid files.
-                self._reuse_prev_chk.setChecked(bool(dist.get("reuse_previous", False)))
+                self._reuse_prev_chk.setChecked(bool(dist["reuse_previous"]))
             self._update_spacing_warning()
 
         # ── LED ──────────────────────────────────────────────────
@@ -2398,9 +2483,10 @@ class ProtocolPage(QtWidgets.QWidget):
             self._iti_reg_bright.setValue(int(reg["brightness"]))
             self._update_swatch(self._iti_reg_color_btn, self._reg_color)
             self._iti_reg_dur_type.setCurrentText(
-                self._DWELL_LABELS[0] if reg["duration_type"] == "fixed"
-                else self._DWELL_LABELS[1])
+                self._ITI_DWELL_LABELS[0] if reg["duration_type"] == "fixed"
+                else self._ITI_DWELL_LABELS[1])
             self._iti_reg_dur_spin.setValue(float(reg["duration_s"]))
+            self._iti_reg_dur_min_spin.setValue(float(reg["duration_min_s"]))
             self._iti_reg_dur_max_spin.setValue(float(reg["duration_max_s"]))
             self._update_iti_dur_visibility()
         if self._iti_rnd_diam_spin is not None:
@@ -2411,9 +2497,10 @@ class ProtocolPage(QtWidgets.QWidget):
             self._iti_rnd_margin_y_spin.setValue(float(rnd["margin_y_cm"]))
             self._iti_rnd_margin_radius_spin.setValue(float(rnd["margin_radius_cm"]))
             self._iti_rnd_dur_type.setCurrentText(
-                self._DWELL_LABELS[0] if rnd["duration_type"] == "fixed"
-                else self._DWELL_LABELS[1])
+                self._ITI_DWELL_LABELS[0] if rnd["duration_type"] == "fixed"
+                else self._ITI_DWELL_LABELS[1])
             self._iti_rnd_dur_spin.setValue(float(rnd["duration_s"]))
+            self._iti_rnd_dur_min_spin.setValue(float(rnd["duration_min_s"]))
             self._iti_rnd_dur_max_spin.setValue(float(rnd["duration_max_s"]))
             self._update_iti_dur_visibility()
         # Re-run now that the sphere brightnesses are in: _rebuild_iti_section's own
@@ -2457,9 +2544,10 @@ class ProtocolPage(QtWidgets.QWidget):
 
     def _save_protocol(self):
         # A train whose pulse is not shorter than its period would leave the BNC
-        # latched high for the whole train, and two rewards sharing a lickport can
-        # never both be collected — refuse to write either out.
-        errors = self._reward_errors() + self._bnc_errors()
+        # latched high for the whole train, two rewards sharing a lickport can
+        # never both be collected, and an inverted dwell range means the opposite
+        # of what it reads — refuse to write any of them out.
+        errors = self._reward_errors() + self._iti_errors() + self._bnc_errors()
         if errors:
             QtWidgets.QMessageBox.warning(
                 self, "Protocol settings",

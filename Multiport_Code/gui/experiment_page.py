@@ -1543,9 +1543,9 @@ class ExperimentPage(QtWidgets.QWidget):
         # two options, so it is worth naming here — the protocol alone won't say.
         dist = rew["distribution"]
         dist_note = ""
-        if dist.get("reuse_previous"):
+        if dist["reuse_previous"]:
             dist_note = ", same ports as last session"
-        elif dist.get("exclude_previous"):
+        elif dist["exclude_previous"]:
             dist_note = ", excluding previously used ports"
         self._sum_rewards.setText(
             f"Rewards: {rew['count']}  ({dist['type']} distribution{dist_note})"

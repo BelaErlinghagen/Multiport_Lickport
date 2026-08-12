@@ -76,6 +76,7 @@
       ],
       "duration_type": "fixed",
       "duration_s": 2.0,
+      "duration_min_s": 0.0,
       "duration_max_s": 3.0
     },
     "random_region": {
@@ -91,6 +92,7 @@
       "margin_radius_cm": 10.0,
       "duration_type": "fixed",
       "duration_s": 2.0,
+      "duration_min_s": 0.0,
       "duration_max_s": 3.0
     }
   },

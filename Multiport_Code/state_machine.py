@@ -733,8 +733,7 @@ class StateMachine:
 
         # "Use the same locations as the last session" — resolved here rather than
         # in the editor so one protocol file follows every mouse to its own history.
-        # .get(): protocols saved before this option existed have no such key.
-        if dist.get("reuse_previous", False):
+        if dist["reuse_previous"]:
             previous = self._previous_locations(protocol, count)
             if previous is not None:
                 return previous
@@ -1165,8 +1164,15 @@ class StateMachine:
             y_cm = my + dist * math.sin(ang)
 
         diameter_cm = float(region["diameter_cm"])
-        required_s = (float(region["duration_s"]) if region["duration_type"] == "fixed"
-                      else random.uniform(0, float(region["duration_max_s"])))
+        if region["duration_type"] == "fixed":
+            required_s = float(region["duration_s"])
+        else:
+            # sorted(): random.uniform() accepts a reversed range silently, which
+            # would run a hand-edited inverted protocol as if it read the other
+            # way round. The editor blocks min > max at save.
+            lo, hi = sorted((float(region["duration_min_s"]),
+                             float(region["duration_max_s"])))
+            required_s = random.uniform(lo, hi)
 
         # Project the target for the whole ITI.
         self._beamer_sphere(region, x_cm, y_cm, mode)
