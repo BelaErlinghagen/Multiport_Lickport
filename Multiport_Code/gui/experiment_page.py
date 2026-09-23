@@ -279,6 +279,15 @@ def build_entry_html(protocol, meta, reward_ports, comments):
 
 RECORD_SUFFIX = "_rspace.json"
 
+# Per-recording lens calibration copy, written next to the recording by
+# _snapshot_camera_calibration().
+CALIBRATION_SUFFIX = "_camera_calibration.json"
+
+# Every JSON a recording leaves in the Data folder. They share the flat folder
+# with the per-mouse logs (Data/<mouse>.json), so anything that scans the folder
+# for mice has to skip them — otherwise a sidecar shows up as a mouse ID.
+SIDECAR_SUFFIXES = (RECORD_SUFFIX, CALIBRATION_SUFFIX)
+
 
 def build_entry_record(name, tags, content, meta, protocol, reward_ports, comments,
                        notebook_id=None):
@@ -1260,7 +1269,9 @@ class ExperimentPage(QtWidgets.QWidget):
         Recordings are stored flat with no per-mouse folders, and ids can't
         be recovered from filenames (they may themselves contain
         underscores), so the per-mouse log is the only unambiguous record of
-        which mice exist.
+        which mice exist. The recordings' own JSON sidecars share the folder
+        and are skipped by suffix (SIDECAR_SUFFIXES), or their mouse-prefixed
+        names would each read as a mouse of their own.
 
         Also lists mice whose log still sits in the older
         Data/<mouse>/<mouse>.json layout, so they don't vanish from the
@@ -1272,7 +1283,7 @@ class ExperimentPage(QtWidgets.QWidget):
         except OSError:
             return []
         mice = {f[:-5] for f in names
-                if f.endswith(".json") and not f.endswith(RECORD_SUFFIX)
+                if f.endswith(".json") and not f.endswith(SIDECAR_SUFFIXES)
                 and os.path.isfile(os.path.join(path, f))}
         mice |= {d for d in names
                  if os.path.isfile(os.path.join(path, d, f"{d}.json"))}
@@ -1622,7 +1633,7 @@ class ExperimentPage(QtWidgets.QWidget):
             if os.path.exists(src):
                 with open(src, "r") as fh:
                     data = fh.read()
-                with open(f"{file_prefix}_camera_calibration.json", "w") as fh:
+                with open(f"{file_prefix}{CALIBRATION_SUFFIX}", "w") as fh:
                     fh.write(data)
         except Exception as exc:
             print(f"[Experiment] could not save the camera calibration with the "
