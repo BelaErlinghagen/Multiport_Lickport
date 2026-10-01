@@ -38,7 +38,7 @@ class DLCTracker:
         # Lazy import: TF_FORCE_GPU_ALLOW_GROWTH must already be set in the
         # environment before this, so TF allocates VRAM on demand.
         from dlclive import DLCLive, Processor
-        from shared_states import model_path, dlc_resize
+        from shared_states import model_path, dlc_model_type, dlc_resize
 
         self.dlc_queue          = dlc_queue
         self.pose_queue         = pose_queue
@@ -50,7 +50,8 @@ class DLCTracker:
         # DLCLive scales the pose back to full-frame coordinates itself, so the
         # CSV, the live overlay and the state machine's dwell checks all keep
         # working in DLC_CROP pixels regardless of the value.
-        self._dlc         = DLCLive(model_path, processor=Processor(),
+        self._dlc         = DLCLive(model_path, model_type=dlc_model_type,
+                                    processor=Processor(),
                                     resize=float(dlc_resize))
         self._initialized = False
         self._resize      = float(dlc_resize)

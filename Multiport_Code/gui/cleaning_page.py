@@ -31,12 +31,13 @@ class CleaningPage(QtWidgets.QWidget):
       5. LEDs          — manual toggle controls
       6. Pumps         — manual dose in µL + calibration wizard
       7. BNC           — manual pulse controls
-      8. Automated Cleaning Cycle
+      8. Automated Cleaning Cycle — over the ports ticked in its grid
 
     The pump block asks for a volume, not a duration, and delivers it as the
     same pulse train a session uses — so pressing a port here directly tests
     whether that pump still matches its calibration. The cleaning cycle below
-    it stays in seconds, since flushing a line is not a reward.
+    it stays in seconds, since flushing a line is not a reward, and runs only
+    the ports ticked in its own grid.
     """
 
     _BTN_SIZE = 44   # px, square grid buttons
@@ -75,6 +76,7 @@ class CleaningPage(QtWidgets.QWidget):
 
         # Cleaning-cycle state
         self._cleaning_active = False
+        self._cleaning_total = 0        # ports in the run now in progress
         self._pump_queue: deque = deque()
         self._active_pumps: dict = {}   # {pump_id: expected_end_time}
         self._cleaning_timer = QtCore.QTimer(self)
@@ -389,6 +391,47 @@ class CleaningPage(QtWidgets.QWidget):
         # ── 7. Automated Cleaning Cycle ───────────────────────────
         root.addWidget(self._section_label("Automated Cleaning Cycle"))
 
+        # Port selection — only the checked ports are flushed. All 16 start
+        # checked, so pressing START without touching the grid flushes the
+        # whole rig; unchecking is how you flush a subset, e.g. after
+        # swapping the line on one port.
+        select_header = QtWidgets.QHBoxLayout()
+        select_header.addWidget(QtWidgets.QLabel("Ports to clean:"))
+        select_header.addStretch()
+        self._clean_select_all_btn = QtWidgets.QPushButton("All")
+        self._clean_select_all_btn.setFixedHeight(24)
+        self._clean_select_all_btn.clicked.connect(
+            lambda: self._set_clean_selection(True))
+        self._clean_select_none_btn = QtWidgets.QPushButton("None")
+        self._clean_select_none_btn.setFixedHeight(24)
+        self._clean_select_none_btn.clicked.connect(
+            lambda: self._set_clean_selection(False))
+        select_header.addWidget(self._clean_select_all_btn)
+        select_header.addWidget(self._clean_select_none_btn)
+        root.addLayout(select_header)
+
+        clean_grid = self._make_grid()
+        self._clean_port_buttons: dict = {}
+        for i in range(1, 17):
+            btn = QtWidgets.QPushButton(str(i))
+            btn.setFixedSize(self._BTN_SIZE, self._BTN_SIZE)
+            btn.setCheckable(True)
+            btn.setChecked(True)
+            btn.setStyleSheet(
+                "QPushButton:checked { background:#1a6b1a; color:#fff;"
+                " border-radius:4px; font-weight:bold; }"
+                "QPushButton:disabled { color:#666; }"
+            )
+            btn.toggled.connect(lambda _c: self._update_clean_selection_label())
+            self._clean_port_buttons[i] = btn
+            clean_grid.addWidget(btn, (i - 1) // 8, (i - 1) % 8)
+        root.addLayout(clean_grid)
+
+        self._clean_select_label = QtWidgets.QLabel("")
+        self._clean_select_label.setStyleSheet("color:#888; font-size:10px;")
+        self._clean_select_label.setWordWrap(True)
+        root.addWidget(self._clean_select_label)
+
         # Duration slider
         slider_row = QtWidgets.QHBoxLayout()
         slider_row.addWidget(QtWidgets.QLabel("Pump on-time:"))
@@ -441,6 +484,8 @@ class CleaningPage(QtWidgets.QWidget):
         self._clean_status = QtWidgets.QLabel("")
         self._clean_status.setStyleSheet("color:#aaa; font-size:10px;")
         root.addWidget(self._clean_status)
+
+        self._update_clean_selection_label()
 
         root.addStretch()
 
@@ -730,19 +775,63 @@ class CleaningPage(QtWidgets.QWidget):
 
     # ── Automated cleaning cycle ──────────────────────────────────
 
+    def _selected_clean_ports(self) -> list:
+        """The ports the cycle should flush, in ascending order."""
+        return [pid for pid, btn in sorted(self._clean_port_buttons.items())
+                if btn.isChecked()]
+
+    def _set_clean_selection(self, checked: bool):
+        """Check or uncheck every port at once (the All / None buttons)."""
+        if self._cleaning_active:
+            return   # selection is frozen while a cycle runs
+        for btn in self._clean_port_buttons.values():
+            btn.setChecked(checked)
+
+    def _update_clean_selection_label(self):
+        """Show which ports a START would flush, and gate the button on it."""
+        ports = self._selected_clean_ports()
+        if not ports:
+            self._clean_select_label.setText(
+                "No ports selected — nothing to clean.")
+        elif len(ports) == len(self._clean_port_buttons):
+            self._clean_select_label.setText("All 16 ports selected.")
+        else:
+            self._clean_select_label.setText(
+                f"{len(ports)} port(s) selected: "
+                + ", ".join(str(p) for p in ports))
+        # Starting with an empty selection can only be a mistake, so the
+        # button goes dead rather than running a zero-port cycle.
+        if not self._cleaning_active:
+            self._start_clean_btn.setEnabled(bool(ports))
+
+    def _set_clean_selection_enabled(self, enabled: bool):
+        for btn in self._clean_port_buttons.values():
+            btn.setEnabled(enabled)
+        self._clean_select_all_btn.setEnabled(enabled)
+        self._clean_select_none_btn.setEnabled(enabled)
+
     def _start_cleaning(self):
         if self._cleaning_active:
             return
+        ports = self._selected_clean_ports()
+        if not ports:
+            self._clean_status.setText(
+                "Select at least one port before starting.")
+            return
         self._cleaning_active = True
-        self._pump_queue = deque(range(1, 17))
+        self._pump_queue = deque(ports)
+        self._cleaning_total = len(ports)
         self._active_pumps = {}
 
         self._start_clean_btn.setEnabled(False)
         self._stop_clean_btn.setEnabled(True)
         self._clean_slider.setEnabled(False)
+        self._set_clean_selection_enabled(False)
+        self._clean_progress.setRange(0, self._cleaning_total)
         self._clean_progress.setValue(0)
-        self._clean_progress.setFormat("Running…  %v / 16")
-        self._clean_status.setText("Starting cleaning cycle…")
+        self._clean_progress.setFormat(f"Running…  %v / {self._cleaning_total}")
+        self._clean_status.setText(
+            "Cleaning ports " + ", ".join(str(p) for p in ports) + "…")
 
         # Fire immediately, then every 250 ms to poll for pump expiry
         self._cleaning_tick()
@@ -770,7 +859,8 @@ class CleaningPage(QtWidgets.QWidget):
             self._active_pumps[pid] = now + dur_s
 
         # Update UI
-        done = 16 - len(self._pump_queue) - len(self._active_pumps)
+        done = (self._cleaning_total - len(self._pump_queue)
+                - len(self._active_pumps))
         self._clean_progress.setValue(done)
         if self._active_pumps:
             self._clean_status.setText(
@@ -779,14 +869,18 @@ class CleaningPage(QtWidgets.QWidget):
 
         # Finished?
         if not self._pump_queue and not self._active_pumps:
+            total = self._cleaning_total
             self._cleaning_timer.stop()
             self._cleaning_active = False
-            self._clean_progress.setFormat("Complete!  16 / 16")
-            self._clean_progress.setValue(16)
-            self._clean_status.setText("All pumps cleaned.")
-            self._start_clean_btn.setEnabled(True)
+            self._clean_progress.setFormat(f"Complete!  {total} / {total}")
+            self._clean_progress.setValue(total)
+            self._clean_status.setText(
+                f"{total} pump(s) cleaned."
+                if total < len(self._clean_port_buttons) else "All pumps cleaned.")
             self._stop_clean_btn.setEnabled(False)
             self._clean_slider.setEnabled(True)
+            self._set_clean_selection_enabled(True)
+            self._update_clean_selection_label()   # also re-enables START
 
     def _stop_cleaning(self):
         """Emergency stop: halt the cycle and turn off every pump immediately."""
@@ -800,9 +894,10 @@ class CleaningPage(QtWidgets.QWidget):
 
         self._clean_progress.setFormat("Stopped")
         self._clean_status.setText("Cleaning stopped — all pumps off.")
-        self._start_clean_btn.setEnabled(True)
         self._stop_clean_btn.setEnabled(False)
         self._clean_slider.setEnabled(True)
+        self._set_clean_selection_enabled(True)
+        self._update_clean_selection_label()   # also re-enables START
 
 
 class _CalibFeed(QtWidgets.QWidget):

@@ -215,7 +215,12 @@ ffmpeg_path          = ""
 video_concat_on_stop = True
 
 ### Deeplabcut
-model_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/DLCModel"
+# Exported DLC 3.x PyTorch model (ResNet-50, bottom-up; keypoints Snout,
+# ButtLeft, ButtRight, ButtTip, TailTip), trained Sep 2026 on this arena. It is
+# snapshot-best-090 packed as {"config", "pose"}, the single-file format DLCLive
+# loads for model_type "pytorch" (a raw training snapshot will not load).
+model_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/DLCModel/MultiportLiveModelSep24_snapshot-best-090.pt"
+dlc_model_type = "pytorch"
 
 # Scale applied to the frame before inference (1.0 = the full DLC_CROP, 2000x2000).
 # Inference cost is proportional to pixel area, so this is the one lever on
@@ -226,7 +231,7 @@ model_path = "/home/admin1/Documents/GitHub/Multiport_Lickport/Multiport_Code/DL
 # changes. The cost is keypoint precision, which is worth re-checking against a
 # newly trained model: a body-part model tolerates far more downscaling than one
 # resolving something small like a pupil.
-dlc_resize = 0.5
+dlc_resize = 0.45
 
 # Likelihood at or above which a keypoint is drawn solid in the live camera
 # preview. Keypoints below it are still drawn, as faint hollow rings, so the
